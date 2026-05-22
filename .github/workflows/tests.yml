@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main, ethie/faster-tests-fake-main, ethie/faster-tests]
+    branches: [main, ethie/faster-tests-fake-main]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
