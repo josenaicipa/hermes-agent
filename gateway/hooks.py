@@ -17,6 +17,24 @@ Events:
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in hooks are caught and logged but never block the main pipeline.
+
+Context dict passed to ``agent:start`` / ``agent:end`` handlers:
+  platform     -- source platform name (e.g. "telegram", "matrix", "slack")
+  user_id      -- platform user id of the sender
+  chat_id      -- platform chat id (group/DM identifier)
+  thread_id    -- Telegram forum-topic id / Matrix thread root id (string;
+                  empty when not in a thread / topic)
+  chat_type    -- "dm" | "group" | "forum" (empty if unknown)
+  session_id   -- Hermes session id
+  message      -- inbound message text (truncated to 500 chars)
+
+``agent:end`` adds:
+  response     -- agent response text (truncated to 500 chars)
+
+Handlers that need to post a follow-up message into the same Telegram
+forum-topic should include ``message_thread_id=int(thread_id)`` in their
+sendMessage payload when ``chat_type == "forum"`` and ``thread_id`` is
+non-empty.
 """
 
 import asyncio

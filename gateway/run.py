@@ -319,21 +319,6 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
-def render_notice_line(notice) -> str:
-    """Render an AgentNotice to a single plaintext line for messaging platforms.
-
-    Messaging has no persistent status bar (unlike the TUI), so a notice is a
-    one-shot standalone push. The notice policy already bakes the level glyph
-    (⚠ / • / ✕ / ✓) into the text, and the TUI + CLI REPL render that text
-    verbatim — so we emit it as-is here too. Prepending a per-level glyph would
-    DOUBLE it ("⚠ ⚠ Credits 90% used", "⛔ ✕ Credit access paused"). Plaintext
-    only — no markdown — so it renders uniformly across Telegram/Discord/Slack/
-    SMS without per-platform escaping. Fail-soft: a malformed/empty notice
-    degrades to "" rather than raising on the agent's callback path.
-    """
-    return str(getattr(notice, "text", "") or "").strip()
-
-
 async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
     """Route a status message through adapter.send_or_update_status when supported.
 
@@ -1194,7 +1179,6 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
-        _get_model_config,
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
@@ -1216,26 +1200,6 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    model_cfg = _get_model_config()
-    max_tokens = None
-    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-    if _env_mt:
-        try:
-            max_tokens = int(_env_mt)
-        except (ValueError, TypeError):
-            max_tokens = None
-    elif isinstance(model_cfg, dict):
-        mt = model_cfg.get("max_tokens")
-        if isinstance(mt, int):
-            max_tokens = mt
-    # Fall back to a per-provider output cap (custom_providers max_output_tokens)
-    # only when the documented global model.max_tokens isn't set, so the global
-    # key always wins.
-    if max_tokens is None:
-        _runtime_mot = runtime.get("max_output_tokens")
-        if isinstance(_runtime_mot, int) and _runtime_mot > 0:
-            max_tokens = _runtime_mot
-
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
@@ -1244,7 +1208,6 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
-        "max_tokens": max_tokens,
     }
 
 
@@ -2633,7 +2596,6 @@ class GatewayRunner:
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
-                "max_tokens": override.get("max_tokens"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -2731,7 +2693,6 @@ class GatewayRunner:
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
-            "max_tokens": runtime_kwargs.get("max_tokens"),
         }
         route = {
             "model": model,
@@ -7947,8 +7908,6 @@ class GatewayRunner:
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
-                if _cmd_def_inner.name == "version":
-                    return await self._handle_version_command(event)
 
             # Catch-all: any other recognized slash command reached the
             # running-agent guard. Reject gracefully rather than falling
@@ -8304,9 +8263,6 @@ class GatewayRunner:
 
         if canonical == "update":
             return await self._handle_update_command(event)
-
-        if canonical == "version":
-            return await self._handle_version_command(event)
 
         if canonical == "debug":
             return await self._handle_debug_command(event)
@@ -9487,6 +9443,8 @@ class GatewayRunner:
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
                 "chat_id": source.chat_id or "",
+                "thread_id": str(source.thread_id) if getattr(source, "thread_id", None) else "",
+                "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
@@ -10933,12 +10891,6 @@ class GatewayRunner:
         return event.platform_update_id <= recorded_uid
 
 
-    async def _handle_version_command(self, event: MessageEvent) -> str:
-        """Handle /version — show the running Hermes Agent version."""
-        from hermes_cli.banner import format_banner_version_label
-
-        return format_banner_version_label()
-
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from hermes_cli.commands import gateway_help_lines
@@ -12048,24 +12000,13 @@ class GatewayRunner:
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
-                toggle_line = t("gateway.voice.enabled_short")
+                return t("gateway.voice.enabled_short")
             else:
                 self._voice_mode[voice_key] = "off"
                 self._save_voice_modes()
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
-                toggle_line = t("gateway.voice.disabled_short")
-            # Bare /voice still toggles, but append an explainer so users
-            # discover the on/off/tts/status subcommands (and, on Discord,
-            # live voice-channel join/leave). The toggle result is shown
-            # first via the {toggle} placeholder.
-            supports_voice_channels = adapter is not None and hasattr(
-                adapter, "join_voice_channel"
-            )
-            channels = (
-                t("gateway.voice.help_channels") if supports_voice_channels else ""
-            )
-            return t("gateway.voice.help", toggle=toggle_line, channels=channels)
+                return t("gateway.voice.disabled_short")
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
@@ -14113,7 +14054,6 @@ class GatewayRunner:
         # Fetch account usage off the event loop so slow provider APIs don't
         # block the gateway. Failures are non-fatal -- account_lines stays [].
         account_lines: list[str] = []
-        credits_lines: list[str] = []
         if provider:
             try:
                 account_snapshot = await asyncio.to_thread(
@@ -14126,21 +14066,6 @@ class GatewayRunner:
                 account_snapshot = None
             if account_snapshot:
                 account_lines = render_account_usage_lines(account_snapshot, markdown=True)
-
-        # ── Nous credits magnitudes + monthly-grant % gauge ─────────────
-        # Shared with the CLI / TUI /usage block via nous_credits_lines(): a single
-        # auth-gate + portal-fetch + render path (which also honors the dev fixture).
-        # Run off the event loop. The helper gates on "a Nous account is logged in"
-        # — NOT the inference provider and NOT nested under `if provider:` — so a
-        # Nous-credentialled user running inference elsewhere (or with none resident)
-        # still sees their balance. NO recovery trigger: messaging binds no notice
-        # consumer, so /usage only displays. Fail-open: never break /usage.
-        try:
-            from agent.account_usage import nous_credits_lines
-
-            credits_lines = await asyncio.to_thread(nous_credits_lines, markdown=True)
-        except Exception:
-            credits_lines = []  # fail-open: never break /usage
 
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = []
@@ -14202,9 +14127,6 @@ class GatewayRunner:
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
-            if credits_lines:
-                lines.append("")
-                lines.extend(credits_lines)
 
             return "\n".join(lines)
 
@@ -14224,18 +14146,9 @@ class GatewayRunner:
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
-            if credits_lines:
-                lines.append("")
-                lines.extend(credits_lines)
             return "\n".join(lines)
-        if account_lines or credits_lines:
-            # account-only, credits-only, or both — joined with a blank divider.
-            parts = list(account_lines)
-            if credits_lines:
-                if parts:
-                    parts.append("")
-                parts.extend(credits_lines)
-            return "\n".join(parts)
+        if account_lines:
+            return "\n".join(account_lines)
         return t("gateway.usage.no_data")
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
@@ -17113,47 +17026,6 @@ class GatewayRunner:
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
 
-        # ── Discord voice "verbal ack before tool calls" ────────────────
-        # When the bot is in a voice channel with the continuous mixer
-        # installed (discord.voice_fx.enabled), speak a short phrase ("let me
-        # look into that") over the ambient idle bed on the FIRST tool call of
-        # the turn.  Fires from tool_start_callback (independent of the
-        # tool-progress text gate), at most once per turn.  No-op on every
-        # other platform / when not in a voice channel.
-        _voice_ack_fired = [False]
-        _voice_ack_guild: List[Optional[int]] = [None]
-        if source.platform == Platform.DISCORD:
-            _va = self.adapters.get(Platform.DISCORD)
-            # source.chat_id is the linked text channel; resolve the guild whose
-            # voice connection is bound to it (mirrors DiscordAdapter.play_tts).
-            _vtc = getattr(_va, "_voice_text_channels", None)
-            if isinstance(_vtc, dict) and hasattr(_va, "voice_mixer_active"):
-                for _gid, _tc in _vtc.items():
-                    if str(_tc) == str(source.chat_id) and _va.voice_mixer_active(_gid):
-                        _voice_ack_guild[0] = _gid
-                        break
-        _voice_ack_loop = asyncio.get_running_loop()
-
-        def voice_ack_callback(call_id, tool_name, args):
-            """tool_start_callback: speak a one-time ack in the voice channel."""
-            if _voice_ack_fired[0] or _voice_ack_guild[0] is None:
-                return
-            if not _run_still_current():
-                return
-            _voice_ack_fired[0] = True
-            _adapter = self.adapters.get(Platform.DISCORD)
-            if _adapter is None or not hasattr(_adapter, "play_ack_in_voice"):
-                return
-            try:
-                safe_schedule_threadsafe(
-                    _adapter.play_ack_in_voice(_voice_ack_guild[0]),
-                    _voice_ack_loop,
-                    logger=logger,
-                    log_message="voice ack scheduling error",
-                )
-            except Exception as _ack_err:
-                logger.debug("voice ack schedule failed: %s", _ack_err)
-
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
         # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
@@ -17964,47 +17836,10 @@ class GatewayRunner:
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
-            # Discord voice verbal-ack hook (fires once per turn on first tool
-            # call; armed only when in a voice channel with the mixer running).
-            agent.tool_start_callback = (
-                voice_ack_callback if _voice_ack_guild[0] is not None else None
-            )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
-
-            # Credits / out-of-band notices (usage bands, depletion, restored).
-            # Messaging has no persistent status bar, so each notice is a
-            # standalone push: render to a single plaintext line and deliver via
-            # the shared _deliver_platform_notice rail (honors private/public +
-            # thread metadata). Fires from the agent's sync worker thread, so we
-            # hop onto the gateway loop with safe_schedule_threadsafe — same
-            # pattern as _status_callback_sync. The fired-once latch lives on the
-            # cached agent and persists across turns, so a band crosses → one
-            # push (no per-turn re-nag). Recovery ("✓ Credit access restored")
-            # rides the same show path (it's emitted as a success notice, not a
-            # clear). The clear callback is a no-op: a sent platform message
-            # can't be cleanly retracted, and the band already fired once.
-            def _notice_callback_sync(notice) -> None:
-                if not _status_adapter or not _run_still_current():
-                    return
-                try:
-                    line = render_notice_line(notice)
-                except Exception:
-                    logger.debug("render_notice_line failed", exc_info=True)
-                    return
-                if not line:
-                    return
-                safe_schedule_threadsafe(
-                    self._deliver_platform_notice(source, line),
-                    _loop_for_step,
-                    logger=logger,
-                    log_message="notice_callback delivery scheduling error",
-                )
-
-            agent.notice_callback = _notice_callback_sync
-            agent.notice_clear_callback = None
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
