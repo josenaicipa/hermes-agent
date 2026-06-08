@@ -48,6 +48,7 @@ gw.client.on('event', (ev: { type?: string; payload?: Record<string, unknown> })
   if (!ev?.type) {
     return
   }
+
   seen.types.add(ev.type)
 
   if (ev.type === 'gateway.ready') {

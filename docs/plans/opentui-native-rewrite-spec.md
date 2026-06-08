@@ -346,6 +346,44 @@ run it under Bun; capture a frame + a perf number. No Python launcher changes ye
   - **Still untracked (decision for glitch):** `ui-tui-opentui/` + `docs/plans/` remain untracked
     on a detached HEAD; committing them is intentional but pending a branch decision.
 
+- **Phase 4 ✓ (2026-06-08) — native interactive prompts (the deadlock fix).** The 4 BLOCKING
+  gateway requests + the local confirm now render natively and answer via the correct `*.respond`
+  RPC, so any turn needing a tool approval / clarifying question / sudo / secret no longer hangs
+  the Python agent. **Verified end-to-end** (`bun src/demo.prompts.tsx` → 45/45 green; also via the
+  full `bun run check` incl. the real Python gateway PASS).
+  - **eventAdapter.ts:** the 4 `*.request` events moved OUT of the `default:` deadlock branch into
+    real cases that feed a NEW, independent **prompt channel** (`subscribePrompt`/`setPrompt`/
+    `getPrompt`/`emitPrompt`) parallel to the existing `Msg[]` reducer (transcript reducer
+    untouched). The `default:` comment now records the gap as ✅ RESOLVED.
+  - **PromptState union** added to `model.ts` (clarify/approval/sudo/secret/confirm), payload shapes
+    mirroring `ui-tui/src/gatewayTypes.ts` verbatim.
+  - **RealGateway + FakeGateway** both gained the prompt channel + `respond(method,params)` wrapper
+    + `sessionId()` + `onLocalConfirm(ok)` (FakeGateway's `respond`/`onLocalConfirm` are spies the
+    verifier asserts against). RealGateway exposes the real `sid` for `approval.respond`'s
+    `{session_id}`.
+  - **Components** (`src/components/prompts/`): `clarifyPrompt` (native `<select>` of choices + an
+    "Other"→free-text `<input>`, or straight free-text when `choices===null`), `approvalPrompt`
+    (`<select>` once/session/always/deny + 1-4 quick keys), `maskedPrompt` (shared sudo🔐/secret🔑;
+    OpenTUI `<input>` has NO mask option — verified against `InputRenderableOptions` — so it owns a
+    hidden buffer via `useKeyboard` and renders `*`-per-char; plaintext never reaches the frame),
+    `confirmPrompt` (local yes/no, Y/N quick keys), and `promptOverlay` (the dispatcher that wires
+    each answer/cancel to the right RPC and clears the prompt).
+  - **Reply RPC contract (verified `useMainApp.ts` + `gatewayTypes.ts`):** `clarify.respond
+    {answer,request_id}` · `approval.respond {choice,session_id}` · `sudo.respond
+    {password,request_id}` · `secret.respond {value,request_id}`. **Cancel paths (Esc/Ctrl+C)
+    ALWAYS send the deny/cancel reply** (approval→`deny`; sudo/secret→empty; clarify→empty answer;
+    confirm→local `false`) so the agent unblocks.
+  - **app.tsx layout:** the body now `flexGrow`s (was a fixed `bodyH`) so a tall prompt overlay
+    shrinks the transcript instead of overflowing/mangling. The composer is hidden while a prompt is
+    up (mirrors Ink `$isBlocked`), and the global Ctrl+C-quits handler is **gated on `!blocked`** so
+    the prompt owns Ctrl+C (→ deny/cancel) rather than killing the app and stranding the agent.
+  - **Test-renderer gotcha:** `createTestRenderer` defaults `exitOnCtrlC:true`; the verifier must
+    pass `exitOnCtrlC:false` (both real entries already do) or the first simulated Ctrl+C tears the
+    renderer down and every later frame goes blank.
+  - **CI:** `demo.prompts.tsx` added as a HARD gate in `scripts/check.sh` (now 5 steps) +
+    `package.json` `demo:prompts`. `bun run check` fully green (incl. real gateway PASS).
+
+
 ### Subagent workflow note (for future phases)
 OpenTUI implementation subagents MUST get the `skills` toolset AND be told to
 `skill_view(name="opentui", file_path="references/docs/...")` before writing renderable code —

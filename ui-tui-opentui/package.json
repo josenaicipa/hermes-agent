@@ -3,11 +3,12 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Native OpenTUI engine for the Hermes TUI (second engine; Ink stays default). Phases 0–2 complete (native transcript, composer, real gateway).",
+  "description": "Native OpenTUI engine for the Hermes TUI (second engine; Ink stays default). Phases 0–2 complete (native transcript, composer, real gateway) + Phase 4 (native interactive prompts: clarify/approval/sudo/secret/confirm — the deadlock fix).",
   "scripts": {
     "dev": "bun --watch src/entry.opentui.tsx",
     "start": "bun src/entry.opentui.tsx",
     "demo": "bun src/demo.tsx",
+    "demo:prompts": "bun src/demo.prompts.tsx",
     "start:real": "bun src/entry.real.tsx",
     "demo:real": "bun src/demo.real.tsx",
     "type-check": "tsc --noEmit -p tsconfig.json",

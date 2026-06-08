@@ -1,9 +1,20 @@
 // FakeGateway — Phase 0 stand-in for the real gatewayClient/rpc transport.
 // Emits a representative transcript and can stream an assistant reply so the
 // native view can be exercised without a Python tui_gateway behind it.
-import type { Msg } from './model.ts'
+//
+// Phase 4: also implements the prompt channel + a spy `respond` so the headless
+// prompts verifier (src/demo.prompts.tsx) can drive synthetic clarify/approval/
+// sudo/secret/confirm requests and assert the correct *.respond RPC fires.
+import type { Msg, PromptState } from './model.ts'
 
 export type Listener = (msgs: Msg[]) => void
+export type PromptListener = (prompt: PromptState | null) => void
+
+/** A recorded *.respond RPC call, captured by the FakeGateway spy. */
+export interface RespondCall {
+  method: string
+  params: Record<string, unknown>
+}
 
 const SEED: Msg[] = [
   { role: 'user', text: 'how do I switch the TUI to opentui?' },
@@ -25,11 +36,55 @@ export class FakeGateway {
   private msgs: Msg[] = [...SEED]
   private listeners = new Set<Listener>()
 
+  // ── Prompt channel + RPC spy (Phase 4) ────────────────────────────────
+  private prompt: PromptState | null = null
+  private promptListeners = new Set<PromptListener>()
+  /** Every respond() call, in order. The verifier asserts against this. */
+  readonly respondCalls: RespondCall[] = []
+  /** Local confirm resolutions (ok=true on confirm, false on cancel). */
+  readonly confirmResults: boolean[] = []
+
   subscribe(fn: Listener): () => void {
     this.listeners.add(fn)
     fn(this.msgs)
 
     return () => this.listeners.delete(fn)
+  }
+
+  subscribePrompt(fn: PromptListener): () => void {
+    this.promptListeners.add(fn)
+    fn(this.prompt)
+
+    return () => this.promptListeners.delete(fn)
+  }
+
+  getPrompt(): PromptState | null {
+    return this.prompt
+  }
+
+  setPrompt(p: PromptState | null): void {
+    this.prompt = p
+
+    for (const fn of this.promptListeners) {
+      fn(this.prompt)
+    }
+  }
+
+  /** Spy for the *.respond RPCs — records the call and resolves immediately. */
+  respond<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
+    this.respondCalls.push({ method, params })
+
+    return Promise.resolve(undefined as T)
+  }
+
+  /** Synthetic session id (approval.respond carries one). */
+  sessionId(): string | null {
+    return 'fake-session'
+  }
+
+  /** Called by the app when a LOCAL confirm dialog resolves (no RPC). */
+  onLocalConfirm(ok: boolean): void {
+    this.confirmResults.push(ok)
   }
 
   private emit() {

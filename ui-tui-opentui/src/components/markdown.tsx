@@ -23,6 +23,7 @@ function parseInline(line: string): Seg[] {
     if (idx > last) {
       out.push({ text: line.slice(last, idx) })
     }
+
     const tok = m[0]
 
     if (tok.startsWith('**')) {
@@ -54,6 +55,7 @@ function Inline({ segs, t }: { segs: Seg[]; t: Theme }) {
             </span>
           )
         }
+
         const inner = (
           <span fg={t.color.text} key={i}>
             {s.text}

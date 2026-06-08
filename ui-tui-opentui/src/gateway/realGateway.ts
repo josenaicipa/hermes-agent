@@ -14,8 +14,9 @@
 // A session is created first via session.create (useSessionLifecycle.ts:170 —
 //   rpc<SessionCreateResponse>('session.create', { cols })).
 import { GatewayClient } from '../../../ui-tui/src/gatewayClient.ts'
+import type { PromptState } from '../model.ts'
 
-import { EventAdapter, type Listener } from './eventAdapter.ts'
+import { EventAdapter, type Listener, type PromptListener } from './eventAdapter.ts'
 
 export { GatewayClient }
 
@@ -57,6 +58,46 @@ export class RealGateway {
     return this.adapter.subscribe(fn)
   }
 
+  /** Subscribe to the prompt channel (blocking interactive requests). */
+  subscribePrompt(fn: PromptListener): () => void {
+    return this.adapter.subscribePrompt(fn)
+  }
+
+  /** Set or clear the active prompt (used to clear after answering, or to
+   * drive a local confirm dialog). */
+  setPrompt(p: PromptState | null): void {
+    this.adapter.setPrompt(p)
+  }
+
+  getPrompt(): PromptState | null {
+    return this.adapter.getPrompt()
+  }
+
+  /**
+   * Local confirm resolution hook. The /new, /clear confirm dialogs are not
+   * yet wired to real gateway actions in the OpenTUI engine (later phase), so
+   * this is a no-op today — the prompt is simply cleared by the app. Present
+   * for interface parity with FakeGateway.
+   */
+  onLocalConfirm(_ok: boolean): void {
+    void _ok
+  }
+
+  /** The current session id (null before session.create resolves). Needed for
+   * approval.respond's { session_id } reply param. */
+  sessionId(): string | null {
+    return this.sid
+  }
+
+  /**
+   * Thin wrapper over the GatewayClient RPC for the *.respond replies
+   * (clarify/approval/sudo/secret.respond) so callers don't reach into
+   * `.client`. Returns the RPC promise.
+   */
+  respond<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
+    return this.client.request<T>(method, params)
+  }
+
   /** Expose the adapter status (ready flag + last status text). */
   getStatus() {
     return this.adapter.getStatus()
@@ -70,6 +111,7 @@ export class RealGateway {
     if (this.sessionPromise) {
       return this.sessionPromise
     }
+
     this.sessionPromise = this.client.request<SessionCreateResponse>('session.create', { cols: this.cols }).then(r => {
       this.sid = r.session_id
 
@@ -95,6 +137,7 @@ export class RealGateway {
         if (called) {
           return
         }
+
         called = true
         onDone?.()
       }

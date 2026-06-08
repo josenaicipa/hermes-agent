@@ -1,5 +1,5 @@
 import type { GatewayEvent } from '../../../ui-tui/src/gatewayTypes.ts'
-import type { Msg } from '../model.ts'
+import type { Msg, PromptState } from '../model.ts'
 
 // Native event→state adapter for the REAL gateway.
 //
@@ -14,6 +14,7 @@ import type { Msg } from '../model.ts'
 import type { GatewayClient } from './realGateway.ts'
 
 export type Listener = (msgs: Msg[]) => void
+export type PromptListener = (prompt: PromptState | null) => void
 
 /** A tiny status line the adapter exposes alongside the transcript. */
 export interface AdapterStatus {
@@ -29,6 +30,14 @@ export class EventAdapter {
   /** Index of the in-flight assistant message, or -1 when none is open. */
   private liveIdx = -1
   private unsub: (() => void) | null = null
+
+  // ── Prompt channel (Phase 4) ──────────────────────────────────────────
+  // A SECOND, independent subscription channel parallel to the Msg[] one.
+  // The 4 blocking gateway requests + the local confirm flow through here so
+  // the app can render a native prompt overlay and answer via the *.respond
+  // RPCs. Keeping it separate leaves the transcript reducer untouched.
+  private prompt: PromptState | null = null
+  private promptListeners = new Set<PromptListener>()
 
   constructor(private gw: GatewayClient) {}
 
@@ -53,6 +62,37 @@ export class EventAdapter {
     fn(this.snapshot())
 
     return () => this.listeners.delete(fn)
+  }
+
+  /**
+   * Subscribe to the prompt channel. Fires immediately with the current prompt
+   * (null when none pending), then on every change. Returns an unsubscribe fn.
+   */
+  subscribePrompt(fn: PromptListener): () => void {
+    this.promptListeners.add(fn)
+    fn(this.prompt)
+
+    return () => this.promptListeners.delete(fn)
+  }
+
+  getPrompt(): PromptState | null {
+    return this.prompt
+  }
+
+  /**
+   * Set (or clear, with null) the active prompt and notify subscribers. Public
+   * so the app can drive a LOCAL confirm dialog (e.g. /new, /clear) through the
+   * same overlay machinery, and clear a prompt once it's been answered.
+   */
+  setPrompt(p: PromptState | null): void {
+    this.prompt = p
+    this.emitPrompt()
+  }
+
+  private emitPrompt(): void {
+    for (const fn of this.promptListeners) {
+      fn(this.prompt)
+    }
   }
 
   /** Append a locally-known message (e.g. the user's own prompt on submit). */
@@ -126,6 +166,7 @@ export class EventAdapter {
         if (!chunk) {
           break
         }
+
         const i = this.ensureLive()
         this.patchLive({ text: (this.msgs[i]!.text ?? '') + chunk, streaming: true })
         this.emit()
@@ -142,6 +183,7 @@ export class EventAdapter {
         if (typeof finalText === 'string' && finalText.length > 0) {
           patch.text = finalText
         }
+
         this.patchLive(patch)
         this.liveIdx = -1
         this.setStatus({ text: 'ready' })
@@ -157,6 +199,7 @@ export class EventAdapter {
         if (!chunk) {
           break
         }
+
         const i = this.ensureLive()
         this.patchLive({ thinking: (this.msgs[i]!.thinking ?? '') + chunk })
         this.emit()
@@ -234,6 +277,53 @@ export class EventAdapter {
         break
       }
 
+      // ── BLOCKING interactive requests (Phase 4) ──────────────────────────
+      // Previously these 4 fell through the default: branch and the agent hung
+      // forever. Now they raise a native prompt overlay (prompt channel); the
+      // app answers via the matching *.respond RPC (see RealGateway.respond /
+      // App's prompt handlers), which unblocks the Python agent.
+      case 'clarify.request': {
+        this.setPrompt({
+          choices: (p.choices as string[] | null) ?? null,
+          kind: 'clarify',
+          question: (p.question as string) ?? '',
+          requestId: (p.request_id as string) ?? ''
+        })
+        this.setStatus({ text: 'waiting for input…' })
+
+        break
+      }
+
+      case 'approval.request': {
+        this.setPrompt({
+          command: (p.command as string) ?? '',
+          description: (p.description as string) ?? 'dangerous command',
+          kind: 'approval'
+        })
+        this.setStatus({ text: 'approval needed' })
+
+        break
+      }
+
+      case 'sudo.request': {
+        this.setPrompt({ kind: 'sudo', requestId: (p.request_id as string) ?? '' })
+        this.setStatus({ text: 'sudo password needed' })
+
+        break
+      }
+
+      case 'secret.request': {
+        this.setPrompt({
+          envVar: (p.env_var as string) ?? '',
+          kind: 'secret',
+          prompt: (p.prompt as string) ?? '',
+          requestId: (p.request_id as string) ?? ''
+        })
+        this.setStatus({ text: 'secret input needed' })
+
+        break
+      }
+
       default:
         // Minimal Phase-2 reducer: the rest of the GatewayEvent union
         // (../../../ui-tui/src/gatewayTypes.ts) is intentionally dropped here.
@@ -246,16 +336,9 @@ export class EventAdapter {
         //   reasoning.delta — appending it would double the reasoning text, so
         //   the delta path above is authoritative and this variant is dropped).
         //
-        // ⚠️ Needed for a fully usable session — these are the real Phase-4 gap:
-        //   clarify.request / approval.request / sudo.request / secret.request.
-        //   These are interactive REQUESTS: the Python agent blocks until the
-        //   client answers via the matching *.respond RPC (clarify.respond,
-        //   approval.respond, sudo.respond, secret.respond — see
-        //   ../../../ui-tui/src/gatewayClient.ts). With no handler + no UI to
-        //   answer, any turn that triggers a tool approval or a clarifying
-        //   question will hang the agent. The "say hi" demo never triggers them,
-        //   which is why Phase 2 passes; a real agentic task can deadlock.
-        //   Wiring these (prompt overlays + the respond RPCs) is spec §6 Phase 4.
+        // ✅ RESOLVED (Phase 4): clarify.request / approval.request /
+        //   sudo.request / secret.request are now handled above via the prompt
+        //   channel + *.respond RPCs, so interactive turns no longer deadlock.
         break
     }
   }
