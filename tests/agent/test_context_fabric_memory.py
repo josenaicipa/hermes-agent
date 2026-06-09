@@ -71,6 +71,62 @@ def test_infer_project_from_memory_fabric_rendered_scope() -> None:
     assert infer_project_from_payload(payload) == "jarvis-metrics"
 
 
+def test_infer_project_from_memory_fabric_graph_route_for_channel() -> None:
+    payload = {
+        "rendered": "# Context\n(no relevant memories found)",
+        "graph_context": {
+            "semantic_relations": [
+                {"from": "hermes-updates", "relation": "routes_to", "to": "hermes"},
+                {"from": "context-fabric", "relation": "routes_to", "to": "context-fabric"},
+            ]
+        },
+    }
+
+    assert infer_project_from_payload(payload, channel="#hermes-updates") == "hermes"
+
+
+def test_context_fabric_filter_uses_graph_route_before_channel_slug(monkeypatch) -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(platform="discord", chat_id="1505614493932326983", chat_name="Hermes / #hermes-updates")
+    try:
+        raw = "[Memory Fabric scoped context]\n" + json.dumps(
+            {
+                "has_data": False,
+                "rendered": "# Context\n(no relevant memories found)",
+                "graph_context": {
+                    "semantic_relations": [
+                        {"from": "hermes-updates", "relation": "routes_to", "to": "hermes"},
+                    ]
+                },
+            }
+        )
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: hermes\nChannel: #hermes-updates\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        filtered = maybe_filter_memory_context(
+            raw,
+            "query",
+            config={"enabled": True, "command": [sys.executable, "fake.py"], "timeout_seconds": 5},
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Project: hermes" in filtered
+    assert seen["args"][seen["args"].index("--project") + 1] == "hermes"
+    assert seen["args"][seen["args"].index("--channel") + 1] == "#hermes-updates"
+
+
 def test_infer_project_from_current_channel_when_no_route_or_payload_scope(monkeypatch) -> None:
     from gateway.session_context import clear_session_vars, set_session_vars
 

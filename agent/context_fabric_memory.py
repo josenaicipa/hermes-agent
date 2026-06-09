@@ -75,12 +75,43 @@ def _slug(value: str) -> str:
     return cleaned or "default"
 
 
-def infer_project_from_payload(payload: Mapping[str, Any]) -> str | None:
-    """Infer a Memory Fabric project from scoped rendered context when present."""
+def _same_channel(left: str, right: str) -> bool:
+    return _slug(left) == _slug(right)
+
+
+def _infer_project_from_graph(payload: Mapping[str, Any], channel: str = "") -> str | None:
+    graph = payload.get("graph_context")
+    if not isinstance(graph, Mapping):
+        return None
+    relations = graph.get("semantic_relations")
+    if not isinstance(relations, list):
+        return None
+    fallback: str | None = None
+    for rel in relations:
+        if not isinstance(rel, Mapping):
+            continue
+        relation = str(rel.get("relation") or "").strip().lower()
+        if relation not in {"routes_to", "route_to", "maps_to"}:
+            continue
+        source = str(rel.get("from") or "").strip()
+        target = str(rel.get("to") or "").strip()
+        if not target:
+            continue
+        fallback = fallback or target
+        if channel and source and _same_channel(source, channel):
+            return target
+    return fallback
+
+
+def infer_project_from_payload(payload: Mapping[str, Any], *, channel: str = "") -> str | None:
+    """Infer a Memory Fabric project from scoped rendered/graph context when present."""
     for key in ("scope_project", "project"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    inferred = _infer_project_from_graph(payload, channel=channel)
+    if inferred:
+        return inferred
     rendered = payload.get("rendered")
     if isinstance(rendered, str):
         match = _SCOPE_RE.search(rendered)
@@ -114,7 +145,7 @@ def _resolve_project_channel(
     project = str(
         route.get("project")
         or config.get("default_project")
-        or (infer_project_from_payload(payload) if payload is not None else "")
+        or (infer_project_from_payload(payload, channel=resolved_channel) if payload is not None else "")
         or _project_from_channel(resolved_channel)
     )
     workspace = route.get("workspace") or config.get("default_workspace")
