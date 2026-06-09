@@ -4988,6 +4988,42 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    def _code_routing_block_message(
+        self,
+        function_name: str,
+        function_args: dict,
+        messages: list,
+    ) -> Optional[str]:
+        """Return a block message when the hard code-routing guard fires.
+
+        Enforces Jose's standing directive at the tool-execution layer: code
+        implementation/debug/refactor/deploy/technical-audit work routes to
+        Claude (Fable) first; direct code-tool calls are blocked unless a
+        delegation was attempted this turn, Jose explicitly asked for a direct
+        edit, or Claude/Fable failed after a real attempt.  Subagents (the
+        delegated implementers) are exempt.  Returns ``None`` to allow.
+        """
+        try:
+            from agent.code_routing_guard import (
+                CodeRoutingGuardConfig,
+                evaluate_code_routing_guard,
+            )
+            config = getattr(self, "_code_routing_guard_config", None)
+            if config is None:
+                config = CodeRoutingGuardConfig()
+            decision = evaluate_code_routing_guard(
+                tool_name=function_name,
+                args=function_args,
+                messages=messages,
+                config=config,
+                is_subagent=bool(getattr(self, "_delegate_depth", 0)),
+            )
+        except Exception as exc:
+            # Never let the guard crash tool execution; fail open.
+            logging.debug("Code-routing guard evaluation failed: %s", exc)
+            return None
+        return decision.message if decision.blocked else None
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 

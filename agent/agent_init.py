@@ -431,6 +431,9 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    # Default-on code-routing guard config; overridden from config.yaml below.
+    from agent.code_routing_guard import CodeRoutingGuardConfig as _CRGuardConfigDefault
+    agent._code_routing_guard_config = _CRGuardConfigDefault()
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
@@ -1253,6 +1256,25 @@ def init_agent(
     agent._implementation_delegation_guidance = bool(
         _agent_section.get("implementation_delegation_guidance", True)
     )
+
+    # Hard code-routing guard (Phase 2 enforcement of the directive above).
+    # Default ON.  When the active request looks like code implementation/
+    # debug/refactor/deploy/technical-audit work, this BLOCKS direct use of
+    # code-mutation/execution tools (write_file, patch, execute_code,
+    # build/deploy terminal commands, …) at the tool-execution layer unless a
+    # Claude/Fable delegation has been attempted this turn, Jose explicitly
+    # asked for a direct edit, or Claude/Fable failed after a real attempt.
+    # Subagents (the delegated implementers) are never guarded.  Gated by
+    # config.yaml ``agent.hard_code_routing_guard`` (bool or mapping).
+    try:
+        from agent.code_routing_guard import CodeRoutingGuardConfig as _CRGuardConfig
+        agent._code_routing_guard_config = _CRGuardConfig.from_value(
+            _agent_section.get("hard_code_routing_guard", True)
+        )
+    except Exception as _crg_err:
+        _ra().logger.warning("Code-routing guard config ignored: %s", _crg_err)
+        from agent.code_routing_guard import CodeRoutingGuardConfig as _CRGuardConfig
+        agent._code_routing_guard_config = _CRGuardConfig()
 
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt

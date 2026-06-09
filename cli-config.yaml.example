@@ -609,7 +609,26 @@ agent:
   # primaries (default 3). The OpenAI SDK does its own low-level retries
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
-  
+
+  # Implementation-delegation guidance (prompt-level, Phase 1).  Default true.
+  # Injects the "delegate code work to Claude/Fable first" directive into every
+  # session's stable system prompt.
+  # implementation_delegation_guidance: true
+
+  # Hard code-routing guard (tool-level enforcement, Phase 2).  Default true.
+  # When the active request looks like code implementation/debug/refactor/
+  # deploy/technical-audit work, BLOCKS direct use of code-mutation/execution
+  # tools (write_file, patch, execute_code, build/deploy terminal commands, …)
+  # unless: (a) a Claude/Fable delegation/audit was attempted this turn, (b)
+  # Jose explicitly asked for a direct edit / skip Fable / emergency, or (c)
+  # Claude/Fable failed after a real attempt.  Subagents (delegated
+  # implementers) are never guarded.  Set false to disable, or use a mapping
+  # for finer control:
+  #   hard_code_routing_guard:
+  #     enabled: true
+  #     guarded_tools: [write_file, patch, execute_code, terminal, process]
+  hard_code_routing_guard: true
+
   # Enable verbose logging
   verbose: false
   

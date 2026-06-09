@@ -357,6 +357,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception:
                 block_message = None
 
+            # Hard code-routing guard (Phase 2): block direct code-tool use
+            # when the request is code work and no Claude/Fable delegation was
+            # attempted.  Runs after plugin blocks, before the loop guardrail.
+            _block_error_type = "plugin_block"
+            if block_message is None:
+                _crg_msg = agent._code_routing_block_message(
+                    function_name, function_args, messages
+                )
+                if _crg_msg is not None:
+                    block_message = _crg_msg
+                    _block_error_type = "code_routing_block"
+
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
                 _emit_terminal_post_tool_call(
@@ -367,7 +379,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
+                    error_type=_block_error_type,
                     error_message=block_message,
                     middleware_trace=list(middleware_trace),
                 )
@@ -847,6 +859,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception:
                 pass
+
+        # Hard code-routing guard (Phase 2): block direct code-tool use when
+        # the request is code work and no Claude/Fable delegation was attempted.
+        if _block_msg is None:
+            _crg_msg = agent._code_routing_block_message(
+                function_name, function_args, messages
+            )
+            if _crg_msg is not None:
+                _block_msg = _crg_msg
+                _block_error_type = "code_routing_block"
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
