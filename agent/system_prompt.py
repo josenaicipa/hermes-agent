@@ -30,6 +30,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
+    IMPLEMENTATION_DELEGATION_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -110,6 +111,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Implementation-delegation guardrail (Jose's standing directive): code
+    # implementation/debug/refactor/deploy/technical-audit work routes to
+    # Claude (Fable) via the Claude Agent SDK first; Hermes orchestrates and
+    # verifies, editing directly only as an explicit/emergency exception that
+    # must be reported.  Lives in the stable tier so it is present on EVERY
+    # channel and thread (not just one) and persists across gateway restarts.
+    # Gated by config.yaml ``agent.implementation_delegation_guidance``
+    # (default True); only relevant when the session actually has tools that
+    # could touch code.
+    if getattr(agent, "_implementation_delegation_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(IMPLEMENTATION_DELEGATION_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

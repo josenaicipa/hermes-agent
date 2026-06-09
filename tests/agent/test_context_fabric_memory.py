@@ -85,6 +85,55 @@ def test_infer_project_from_memory_fabric_graph_route_for_channel() -> None:
     assert infer_project_from_payload(payload, channel="#hermes-updates") == "hermes"
 
 
+def test_context_fabric_filter_passes_route_skills_and_toolsets(monkeypatch) -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(platform="discord", chat_id="n8n-channel-id", chat_name="Hermes / #n8n")
+    try:
+        raw = "[Memory Fabric scoped context]\n" + json.dumps({"has_data": True, "rendered": "# Context\n- workflow facts"})
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: n8n\nChannel: #n8n\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        maybe_filter_memory_context(
+            raw,
+            "debug workflow failure",
+            config={
+                "enabled": True,
+                "command": [sys.executable, "fake.py"],
+                "timeout_seconds": 5,
+                "channel_routes": {
+                    "#n8n": {
+                        "project": "n8n",
+                        "channel": "#n8n",
+                        "required_skills": ["n8n-operations"],
+                        "fallback_skills": ["terminal-ops", "github-ops"],
+                        "enabled_toolsets": ["terminal", "n8n"],
+                        "task_type": "automation-debug",
+                        "budget_profile": "deep",
+                    }
+                },
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert seen["args"][seen["args"].index("--required-skills") + 1] == "n8n-operations"
+    assert seen["args"][seen["args"].index("--fallback-skills") + 1] == "terminal-ops,github-ops"
+    assert seen["args"][seen["args"].index("--enabled-toolsets") + 1] == "terminal,n8n"
+    assert seen["args"][seen["args"].index("--task-type") + 1] == "automation-debug"
+    assert seen["args"][seen["args"].index("--budget-profile") + 1] == "deep"
+
+
 def test_context_fabric_filter_uses_graph_route_before_channel_slug(monkeypatch) -> None:
     from gateway.session_context import clear_session_vars, set_session_vars
 

@@ -304,6 +304,31 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Implementation-delegation guardrail.  Jose's standing directive: for ANY
+# code implementation, debugging, refactor, deploy, or technical audit, the
+# coding engine of record is Claude (Fable) via the Claude Agent SDK — Hermes
+# orchestrates, reviews, and verifies rather than editing code itself.  This is
+# injected into the STABLE tier so it appears for every channel and thread, not
+# just #general or a single workspace, and survives gateway restarts because it
+# is rebuilt into every session's system prompt.  Gated by config.yaml
+# ``agent.implementation_delegation_guidance`` (default True).
+IMPLEMENTATION_DELEGATION_GUIDANCE = (
+    "# Implementation routing (delegate code work to Claude/Fable first)\n"
+    "For any code implementation, debugging, refactor, deploy, or technical "
+    "audit — on ANY channel or thread, not just one — delegate the actual "
+    "coding to Claude (Fable) via the Claude Agent SDK first. That is the "
+    "implementation/coding engine of record.\n"
+    "Your role is to orchestrate, review, and verify: scope the work, hand "
+    "implementation to Claude/Fable, then check and report the result. Do NOT "
+    "directly edit code, write/patch files, or run build/deploy commands "
+    "yourself as the primary path.\n"
+    "Direct edits by you are allowed ONLY when (a) Claude/Fable is genuinely "
+    "unavailable or failing after a real attempt, or (b) Jose explicitly asks "
+    "you to make the edit yourself (an emergency/explicit exception). Whenever "
+    "you take that exception, say so plainly in your reply — state that you "
+    "edited directly and why delegation was skipped."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

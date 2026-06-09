@@ -130,7 +130,7 @@ def _project_from_channel(channel: str) -> str:
 def _resolve_project_channel(
     config: Mapping[str, Any],
     payload: Mapping[str, Any] | None = None,
-) -> tuple[str, str, str | None]:
+) -> tuple[str, str, str | None, Mapping[str, Any]]:
     channel = _current_channel(config)
     chat_id = _session_value("HERMES_SESSION_CHAT_ID")
     routes = config.get("channel_routes")
@@ -140,7 +140,7 @@ def _resolve_project_channel(
         if isinstance(maybe, Mapping):
             route = maybe
     if not route and _truthy(config.get("restrict_to_routes")):
-        return "", "", None
+        return "", "", None, route
     resolved_channel = str(route.get("channel") or config.get("default_channel") or channel or "")
     project = str(
         route.get("project")
@@ -149,7 +149,7 @@ def _resolve_project_channel(
         or _project_from_channel(resolved_channel)
     )
     workspace = route.get("workspace") or config.get("default_workspace")
-    return project, resolved_channel, str(workspace) if workspace else None
+    return project, resolved_channel, str(workspace) if workspace else None, route
 
 
 def _command_from_config(config: Mapping[str, Any]) -> list[str]:
@@ -162,6 +162,32 @@ def _command_from_config(config: Mapping[str, Any]) -> list[str]:
     if script:
         return [sys.executable, str(script)]
     return []
+
+
+def _csv_route_values(route: Mapping[str, Any], key: str) -> str:
+    values = route.get(key)
+    if isinstance(values, str):
+        return values.strip()
+    if isinstance(values, (list, tuple)):
+        return ",".join(str(value).strip() for value in values if str(value).strip())
+    return ""
+
+
+def _append_route_options(args: list[str], route: Mapping[str, Any]) -> None:
+    for key, flag in (
+        ("required_skills", "--required-skills"),
+        ("fallback_skills", "--fallback-skills"),
+        ("enabled_toolsets", "--enabled-toolsets"),
+    ):
+        value = _csv_route_values(route, key)
+        if value:
+            args.extend([flag, value])
+    task_type = str(route.get("task_type") or "").strip()
+    if task_type:
+        args.extend(["--task-type", task_type])
+    budget_profile = str(route.get("budget_profile") or "").strip()
+    if budget_profile:
+        args.extend(["--budget-profile", budget_profile])
 
 
 def maybe_filter_memory_context(
@@ -185,7 +211,7 @@ def maybe_filter_memory_context(
     command = _command_from_config(cf_config)
     if not command:
         return raw_context
-    project, channel, workspace = _resolve_project_channel(cf_config, payload)
+    project, channel, workspace, route = _resolve_project_channel(cf_config, payload)
     if not project or not channel:
         return raw_context
     timeout = float(cf_config.get("timeout_seconds") or 10)
@@ -207,6 +233,7 @@ def maybe_filter_memory_context(
             ]
             if workspace:
                 args.extend(["--workspace", workspace])
+            _append_route_options(args, route)
             completed = subprocess.run(
                 args,
                 check=False,

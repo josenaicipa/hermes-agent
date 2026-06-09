@@ -1245,6 +1245,15 @@ def init_agent(
     # targets.
     agent._task_completion_guidance = bool(_agent_section.get("task_completion_guidance", True))
 
+    # Implementation-delegation guardrail toggle.  Default True.  Keeps the
+    # standing directive — delegate code implementation/debug/refactor/deploy/
+    # technical-audit work to Claude (Fable) via the Claude Agent SDK first,
+    # Hermes orchestrates/verifies, direct edits only as a reported exception —
+    # present in every session's stable system prompt regardless of channel.
+    agent._implementation_delegation_guidance = bool(
+        _agent_section.get("implementation_delegation_guidance", True)
+    )
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
