@@ -427,6 +427,30 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         assert "backend-skill" in result
 
+    def test_context_fabric_rule_present_with_workspace_skill(self, monkeypatch, tmp_path):
+        """The Skills prompt must tell the agent that Context Fabric / AGENT_CONTEXT
+        is the primary source for channel-context questions, and that broad
+        workspace skills like jose-workspace-context are fallback/additional only."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill = tmp_path / "skills" / "workspace" / "jose-workspace-context"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: jose-workspace-context\n"
+            "description: Broad workspace and channel routing context\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        # The fake workspace skill is indexed
+        assert "jose-workspace-context" in result
+        # The new precedence rule appears alongside the Skills section
+        assert "Context Fabric" in result
+        assert "AGENT_CONTEXT" in result
+        assert "Context Fabric governs channel-context questions" in result
+        # Workspace skills must be framed as fallback/additional, not primary
+        assert "fallback" in result
+        assert "additional source" in result
+
 
 class TestBuildNousSubscriptionPrompt:
     def test_includes_active_subscription_features(self, monkeypatch):
