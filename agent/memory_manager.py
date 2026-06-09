@@ -387,7 +387,15 @@ class MemoryManager:
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
+        combined = "\n\n".join(parts)
+        if combined:
+            try:
+                from agent.context_fabric_memory import maybe_filter_memory_context
+
+                return maybe_filter_memory_context(combined, query)
+            except Exception:
+                pass
+        return combined
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
