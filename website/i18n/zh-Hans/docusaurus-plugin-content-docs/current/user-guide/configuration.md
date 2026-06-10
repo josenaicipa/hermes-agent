@@ -554,7 +554,7 @@ compression:
   enabled: true                                     # 开启/关闭压缩
   threshold: 0.50                                   # 在上下文限制的此百分比时压缩
   target_ratio: 0.20                                # 保留为最近尾部的阈值分数
-  protect_last_n: 20                                # 保持未压缩的最少最近消息数
+  protect_last_n: 10                                # 保持未压缩的最少最近消息数
   hygiene_hard_message_limit: 400                   # Gateway 安全阀 —— 见下文
 
 # 摘要模型/provider 在 auxiliary: 下配置：
@@ -819,7 +819,8 @@ auxiliary:
 
   # 上下文压缩超时（与 compression.* 配置分开）
   compression:
-    timeout: 120               # 秒 —— 压缩摘要长对话，需要更多时间
+    timeout: 300               # 秒 —— 压缩需要摘要阈值大小的上下文窗口；
+                               # 慢速或推理类辅助模型可能需要数分钟
 
   # 技能中心 —— 技能匹配和搜索
   skills_hub:
@@ -851,7 +852,7 @@ auxiliary:
 ```
 
 :::tip
-每个辅助任务都有可配置的 `timeout`（秒）。默认值：vision 120s、web_extract 360s、approval 30s、compression 120s。如果您为辅助任务使用慢速本地模型，请增加这些值。Vision 还有单独的 `download_timeout`（默认 30s）用于 HTTP 图像下载 —— 对于慢速连接或自托管图像服务器，请增加此值。
+每个辅助任务都有可配置的 `timeout`（秒）。默认值：vision 120s、web_extract 360s、approval 30s、compression 300s。如果您为辅助任务使用慢速本地模型，请增加这些值。Vision 还有单独的 `download_timeout`（默认 30s）用于 HTTP 图像下载 —— 对于慢速连接或自托管图像服务器，请增加此值。
 :::
 
 :::info

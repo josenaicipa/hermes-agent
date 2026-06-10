@@ -86,6 +86,42 @@ def _build_codex_gpt55_autoraise_notice(autoraise: Dict[str, float]) -> str:
     )
 
 
+def _resolve_compression_threshold(
+    user_threshold: float,
+    model: Optional[str],
+    provider: Optional[str],
+    *,
+    codex_gpt55_autoraise: bool = True,
+) -> "tuple[float, Optional[Dict[str, float]]]":
+    """Resolve the effective compaction threshold for a model/route.
+
+    Returns ``(threshold, autoraised)`` where ``autoraised`` is the
+    ``{"from": <old_ratio>, "to": <new_ratio>}`` payload for the one-time
+    Codex gpt-5.5 notice, or ``None`` when nothing changed for the user.
+
+    The Codex gpt-5.5 override is a floor, not a replacement: a user/global
+    threshold that already meets or exceeds it survives unchanged, and the
+    notice fires only when the threshold actually went up. The Arcee Trinity
+    override keeps its long-standing behavior of silently replacing the
+    global threshold.
+    """
+    from agent.auxiliary_client import (
+        _compression_threshold_for_model,
+        _is_codex_gpt55,
+    )
+
+    model_threshold = _compression_threshold_for_model(
+        model, provider, allow_codex_gpt55_autoraise=codex_gpt55_autoraise
+    )
+    if model_threshold is None:
+        return user_threshold, None
+    if _is_codex_gpt55(model, provider):
+        if model_threshold > user_threshold + 1e-9:
+            return model_threshold, {"from": user_threshold, "to": model_threshold}
+        return user_threshold, None
+    return model_threshold, None
+
+
 def _normalized_custom_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -1270,46 +1306,32 @@ def init_agent(
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
-    # Per-model/route compaction-threshold override. Codex gpt-5.5 raises to
-    # 85% (the Codex backend caps the window at 272K, so the default 50% would
-    # compact at ~136K — half the usable context). Gated by an opt-out config
-    # flag so the user can fall back to the global threshold; when the override
-    # fires we stash a one-time notification (replayed on the first turn) that
-    # tells the user what changed and how to revert.
+    # Per-model/route compaction-threshold override. Codex gpt-5.5 floors the
+    # threshold at 60% (the Codex backend caps the window at 272K, so the
+    # default 50% would compact at ~136K — half the usable context) but never
+    # lowers a user-set threshold that already meets or exceeds it. Gated by
+    # an opt-out config flag so the user can fall back to the global
+    # threshold; when a raise actually happens we stash a one-time
+    # notification (replayed on the first turn) that tells the user what
+    # changed and how to revert.
     _codex_gpt55_autoraise = str(
         _compression_cfg.get("codex_gpt55_autoraise", True)
     ).lower() in {"true", "1", "yes"}
     agent._compression_threshold_autoraised = None
     try:
-        from agent.auxiliary_client import (
-            _compression_threshold_for_model as _cthresh_fn,
-            _is_codex_gpt55 as _is_codex_gpt55_fn,
+        compression_threshold, agent._compression_threshold_autoraised = (
+            _resolve_compression_threshold(
+                compression_threshold,
+                agent.model,
+                agent.provider,
+                codex_gpt55_autoraise=_codex_gpt55_autoraise,
+            )
         )
-        _model_cthresh = _cthresh_fn(
-            agent.model,
-            agent.provider,
-            allow_codex_gpt55_autoraise=_codex_gpt55_autoraise,
-        )
-        if _model_cthresh is not None:
-            _prev_threshold = compression_threshold
-            compression_threshold = _model_cthresh
-            # Notify only for the Codex gpt-5.5 autoraise (the Arcee Trinity
-            # override is a long-standing silent default). Skip the notice when
-            # the user's global threshold already meets/exceeds the raised
-            # value, since nothing actually changed for them.
-            if (
-                _is_codex_gpt55_fn(agent.model, agent.provider)
-                and _model_cthresh > _prev_threshold + 1e-9
-            ):
-                agent._compression_threshold_autoraised = {
-                    "from": _prev_threshold,
-                    "to": _model_cthresh,
-                }
     except Exception:
         pass
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
-    compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+    compression_protect_last = int(_compression_cfg.get("protect_last_n", 10))
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of

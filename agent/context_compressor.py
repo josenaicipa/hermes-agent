@@ -25,6 +25,10 @@ from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error
 from agent.context_engine import ContextEngine
+from agent.tool_output_precompaction import (
+    build_tool_output_digest,
+    extract_failure_lines,
+)
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
@@ -110,6 +114,14 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
+
+# When the LLM summary fails and the deterministic fallback handoff is used,
+# tool outputs that survived in the protected head/tail are themselves shrunk
+# to bounded digests.  Without this, a single CI/CodeQL log in the tail keeps
+# the "compressed" transcript at 100K+ tokens after a summarizer outage.
+# Trigger ≈ 2K tokens; each digest is capped at ≈ 1K tokens.
+_FALLBACK_TOOL_DIGEST_TRIGGER_CHARS = 8_000
+_FALLBACK_TOOL_DIGEST_MAX_CHARS = 4_000
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
@@ -602,7 +614,7 @@ class ContextCompressor(ContextEngine):
         model: str,
         threshold_percent: float = 0.50,
         protect_first_n: int = 3,
-        protect_last_n: int = 20,
+        protect_last_n: int = 10,
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
         summary_model_override: str = None,
@@ -969,7 +981,23 @@ class ContextCompressor(ContextEngine):
         All content is redacted before serialization to prevent secrets
         (API keys, tokens, passwords) from leaking into the summary that
         gets sent to the auxiliary model and persisted across compactions.
+
+        Oversized tool results are replaced with a deterministic structured
+        digest (head + tail + matched failure/error lines + stats) instead
+        of a blind head/tail slice — a naive slice of a 500K-char CI log
+        loses exactly the failing-test lines the summary needs, and feeding
+        the raw bulk to the summarizer is what makes aux models time out.
         """
+        # tool_call_id -> tool name, so tool-result digests can be labeled.
+        call_id_to_name: Dict[str, str] = {}
+        for msg in turns:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    cid = _extract_tool_call_id(tc)
+                    if cid:
+                        name, _ = _extract_tool_call_name_and_args(tc)
+                        call_id_to_name[cid] = name
+
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
@@ -979,7 +1007,11 @@ class ContextCompressor(ContextEngine):
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
                 if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                    content = build_tool_output_digest(
+                        content,
+                        tool_name=call_id_to_name.get(tool_id, "unknown"),
+                        max_chars=self._CONTENT_MAX,
+                    )
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
@@ -1118,12 +1150,15 @@ class ContextCompressor(ContextEngine):
                 tool_actions.append(
                     _summarize_tool_result(tool_name, tool_args, text or "")
                 )
-                if re.search(
-                    r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b",
-                    text,
-                    re.I,
-                ):
-                    blockers.append(text[:500])
+                # Extract failure lines from the FULL (redacted) tool output,
+                # not the 700-char flattened turn — the failing-test line of
+                # a CI/CodeQL log usually sits deep in the body and would be
+                # lost to the flattening truncation above.
+                full_tool_text = redact_sensitive_text(
+                    _content_text_for_contains(msg.get("content"))
+                )
+                for failure_line in extract_failure_lines(full_tool_text, limit=3):
+                    blockers.append(f"[{tool_name}] {failure_line}")
 
         def _bullets(items: list[str], limit: int = 8) -> str:
             unique: list[str] = []
@@ -1202,6 +1237,54 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
         return summary
+
+    def _shrink_tool_outputs_for_fallback(
+        self, messages: List[Dict[str, Any]]
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Digest oversized tool outputs after a summary-failure fallback.
+
+        When the LLM summarizer fails, the middle window is replaced by the
+        deterministic fallback handoff — but huge tool outputs in the
+        *protected* head/tail survive verbatim and can leave the compacted
+        transcript at 100K+ tokens.  This pass keeps every protected message
+        in place (protect_first_n / protect_last_n semantics are unchanged)
+        but replaces each oversized tool-result body with a bounded
+        structured digest that retains the exit code, head/tail lines, and
+        matched failure/error lines needed for diagnosis.
+
+        Deterministic, no LLM call.  Returns ``(messages, shrunk_count)``;
+        the input list is never mutated.
+        """
+        call_id_to_name: Dict[str, str] = {}
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    cid = _extract_tool_call_id(tc)
+                    if cid:
+                        name, _ = _extract_tool_call_name_and_args(tc)
+                        call_id_to_name[cid] = name
+
+        shrunk = 0
+        result: List[Dict[str, Any]] = []
+        for msg in messages:
+            content = msg.get("content")
+            if (
+                msg.get("role") == "tool"
+                and isinstance(content, str)
+                and len(content) > _FALLBACK_TOOL_DIGEST_TRIGGER_CHARS
+            ):
+                digest = build_tool_output_digest(
+                    content,
+                    tool_name=call_id_to_name.get(
+                        str(msg.get("tool_call_id") or ""), "unknown"
+                    ),
+                    max_chars=_FALLBACK_TOOL_DIGEST_MAX_CHARS,
+                )
+                result.append({**msg, "content": digest})
+                shrunk += 1
+            else:
+                result.append(msg)
+        return result, shrunk
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -2157,6 +2240,27 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # past the provider's body-size limit and wedge the session.
         # Port of Kilo-Org/kilocode#9434.
         compressed = _strip_historical_media(compressed)
+
+        # Summary-failure fallback: the LLM handoff is gone, so oversized tool
+        # outputs that survived in the protected head/tail must be shrunk
+        # deterministically — otherwise a single CI/test log keeps the
+        # "compressed" transcript far above the threshold and the next turn
+        # immediately re-triggers compaction against a failing summarizer.
+        if self._last_summary_fallback_used:
+            _pre_shrink_estimate = estimate_messages_tokens_rough(compressed)
+            compressed, _shrunk_count = self._shrink_tool_outputs_for_fallback(compressed)
+            if _shrunk_count and not self.quiet_mode:
+                logger.warning(
+                    "Compression fallback engaged (reason=%s): summary model "
+                    "unavailable — digested %d oversized protected tool "
+                    "output(s) deterministically; ~%d -> ~%d rough tokens "
+                    "across %d messages",
+                    self._last_summary_error or "summary unavailable",
+                    _shrunk_count,
+                    _pre_shrink_estimate,
+                    estimate_messages_tokens_rough(compressed),
+                    len(compressed),
+                )
 
         new_estimate = estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate

@@ -645,7 +645,7 @@ compression:
   enabled: true                                     # Toggle compression on/off
   threshold: 0.50                                   # Compress at this % of context limit
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
-  protect_last_n: 20                                # Min recent messages to keep uncompressed
+  protect_last_n: 10                                # Min recent messages to keep uncompressed
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
   hygiene_hard_message_limit: 400                   # Gateway safety valve — see below
 
@@ -913,7 +913,8 @@ auxiliary:
 
   # Context compression timeout (separate from compression.* config)
   compression:
-    timeout: 120               # seconds — compression summarizes long conversations, needs more time
+    timeout: 300               # seconds — compression summarizes a threshold-sized window;
+                               # can take minutes on slow or reasoning aux models
 
   # Skills hub — skill matching and search
   skills_hub:
@@ -945,7 +946,7 @@ auxiliary:
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, web_extract 360s, approval 30s, compression 300s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info

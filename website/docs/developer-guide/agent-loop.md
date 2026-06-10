@@ -207,7 +207,7 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 
 1. Memory is flushed to disk first (preventing data loss)
 2. Middle conversation turns are summarized into a compact summary
-3. The last N messages are preserved intact (`compression.protect_last_n`, default: 20)
+3. The last N messages are preserved intact (`compression.protect_last_n`, default: 10)
 4. Tool call/result message pairs are kept together (never split)
 5. A new session lineage ID is generated (compression creates a "child" session)
 
