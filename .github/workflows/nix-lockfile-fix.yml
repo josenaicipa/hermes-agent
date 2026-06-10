@@ -39,8 +39,13 @@ jobs:
   #   3. Job-level concurrency with cancel-in-progress: true ensures
   #      back-to-back pushes collapse to the newest; ref: main checkout
   #      always operates on the latest branch state.
-  #   4. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
-  #      triggers downstream nix.yml verification.
+  #   4. Uses a GitHub App token (not GITHUB_TOKEN) when APP_ID /
+  #      APP_PRIVATE_KEY secrets exist, so the fix commit triggers
+  #      downstream nix.yml verification. In forks without those secrets
+  #      the job falls back to the default GITHUB_TOKEN: it still runs
+  #      and pushes fixes, but fallback commits will NOT trigger
+  #      downstream workflows (GitHub suppresses workflow runs for
+  #      GITHUB_TOKEN pushes).
   auto-fix-main:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -48,9 +53,14 @@ jobs:
     concurrency:
       group: auto-fix-main
       cancel-in-progress: true
+    env:
+      # `secrets` is not available in step `if:` expressions, so surface
+      # the presence check as an env flag (no secret values are exposed).
+      HAS_APP_CREDS: ${{ secrets.APP_ID != '' && secrets.APP_PRIVATE_KEY != '' }}
     steps:
       - name: Generate GitHub App token
         id: app-token
+        if: env.HAS_APP_CREDS == 'true'
         uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00  # v1.9.3
         with:
           app-id: ${{ secrets.APP_ID }}
@@ -59,7 +69,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: main
-          token: ${{ steps.app-token.outputs.token }}
+          # App token when available; otherwise the default workflow token
+          # (a skipped app-token step yields an empty output, so `||` falls
+          # through). permissions.contents: write keeps the push working.
+          token: ${{ steps.app-token.outputs.token || github.token }}
 
       - uses: ./.github/actions/nix-setup
         with:
