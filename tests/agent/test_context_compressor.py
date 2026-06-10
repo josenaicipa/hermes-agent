@@ -1591,11 +1591,16 @@ class TestSummaryTargetRatio:
         # 50% of 200K = 100K, which is above the 64K floor
         assert c.threshold_tokens == 100_000
 
-    def test_default_protect_last_n_is_20(self):
-        """Default protect_last_n should be 20."""
+    def test_default_protect_last_n_is_10(self):
+        """Default protect_last_n should be 10.
+
+        Lowered from 20: a smaller protected tail keeps the summarizer
+        payload bounded so compaction stays reliable on slow aux models.
+        Users can raise it back via compression.protect_last_n in config.
+        """
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.protect_last_n == 20
+        assert c.protect_last_n == 10
 
     def test_default_protect_first_n_is_3(self):
         """Default protect_first_n is 3 (system + 3 extra non-system messages =

@@ -209,9 +209,16 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
 # ``context_length_exceeded`` while ~250K succeeds). With a 272K ceiling the
 # default 50% compaction trigger fires at ~136K — wasteful, since the model
 # can hold far more raw context before summarization actually buys anything.
-# We raise the trigger to 85% (~231K) on this exact route so Codex gpt-5.5
-# sessions use the window they actually have.
-_CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
+# We raise the trigger to 60% (~163K) on this exact route so Codex gpt-5.5
+# sessions use more of the window they actually have.
+#
+# Why 60% and not the 85% this shipped with: at 85% compaction only fired at
+# ~231K tokens, which made the summarizer input so large that the auxiliary
+# compression model routinely hit its timeout, exhausted its fallbacks, and
+# left sessions stuck in preflight compression. 60% keeps a meaningful raise
+# over the 50% default while leaving the summarizer a window it can actually
+# digest before the hard 272K ceiling is in sight.
+_CODEX_GPT55_COMPACTION_THRESHOLD = 0.60
 
 
 def _is_codex_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
@@ -267,10 +274,14 @@ def _compression_threshold_for_model(
 
     Per-model/route overrides:
       - Arcee Trinity Large Thinking → 0.75 (preserve reasoning context).
-      - gpt-5.5 on the Codex OAuth route → 0.85, because Codex caps the window
-        at 272K and the default 50% trigger would compact at ~136K. Gated by
-        ``allow_codex_gpt55_autoraise`` so the user can opt back down to the
-        global default (the caller passes the config flag through here).
+      - gpt-5.5 on the Codex OAuth route → 0.60, because Codex caps the window
+        at 272K and the default 50% trigger would compact at ~136K (see
+        ``_CODEX_GPT55_COMPACTION_THRESHOLD`` for why this is no longer 0.85).
+        Gated by ``allow_codex_gpt55_autoraise`` so the user can opt back down
+        to the global default (the caller passes the config flag through here).
+        The caller treats this value as a floor — it takes
+        ``max(user_threshold, 0.60)`` so a higher user-set threshold survives
+        (see ``agent.agent_init._resolve_compression_threshold``).
 
     Returns a float in (0, 1] to override the global ``compression.threshold``
     config value, or ``None`` to leave the user's config value unchanged.

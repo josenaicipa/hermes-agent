@@ -80,7 +80,7 @@ compression:
   enabled: true              # Enable/disable compression (default: true)
   threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
-  protect_last_n: 20         # Minimum protected tail messages (default: 20)
+  protect_last_n: 10         # Minimum protected tail messages (default: 10)
 
 # Summarization model/provider configured under auxiliary:
 auxiliary:
@@ -96,7 +96,7 @@ auxiliary:
 |-----------|---------|-------|-------------|
 | `threshold` | `0.50` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × context_length` 时触发压缩 |
 | `target_ratio` | `0.20` | 0.10-0.80 | 控制尾部保护 token 预算：`threshold_tokens × target_ratio` |
-| `protect_last_n` | `20` | ≥1 | 始终保留的最近消息最小数量 |
+| `protect_last_n` | `10` | ≥1 | 始终保留的最近消息最小数量 |
 | `protect_first_n` | `3` | （硬编码）| 系统提示词 + 首次交互始终保留 |
 
 ### 计算值（200K 上下文模型，默认参数）

@@ -358,7 +358,7 @@ tool_loop_guardrails:
 # 1. Tracks actual token usage from API responses (not estimates)
 # 2. When prompt_tokens >= threshold% of model's context_length, triggers compression
 # 3. Protects first 3 turns (system prompt, initial request, first response)
-# 4. Protects last N turns (default 20 messages = ~10 full turns of recent context)
+# 4. Protects last N turns (default 10 messages = ~5 full turns of recent context)
 # 5. Summarizes middle turns using a fast/cheap model
 # 6. Inserts summary as a user message, continues conversation seamlessly
 #
@@ -381,10 +381,10 @@ compression:
   # Range: 0.10 - 0.80
   target_ratio: 0.20
 
-  # Number of most-recent messages to always preserve (default: 20 ≈ 10 full turns)
+  # Number of most-recent messages to always preserve (default: 10 ≈ 5 full turns)
   # Higher values keep more recent conversation intact at the cost of more aggressive
   # compression of older turns.
-  protect_last_n: 20
+  protect_last_n: 10
 
   # Number of non-system messages to protect at the head of the transcript, in
   # ADDITION to the system prompt (which is always implicitly protected).

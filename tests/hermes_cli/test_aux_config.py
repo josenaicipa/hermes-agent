@@ -206,7 +206,7 @@ def test_reset_aux_to_auto_clears_routing_preserves_timeouts(tmp_path, monkeypat
     from hermes_cli.config import save_config
 
     cfg = load_config()
-    cfg["auxiliary"]["vision"]["timeout"] = 300  # user-tuned
+    cfg["auxiliary"]["vision"]["timeout"] = 240  # user-tuned (default is 120)
     save_config(cfg)
 
     n = _reset_aux_to_auto()
@@ -220,9 +220,9 @@ def test_reset_aux_to_auto_clears_routing_preserves_timeouts(tmp_path, monkeypat
         assert v["base_url"] == ""
         assert v["api_key"] == ""
     # User-tuned timeout survives reset
-    assert cfg["auxiliary"]["vision"]["timeout"] == 300
+    assert cfg["auxiliary"]["vision"]["timeout"] == 240
     # Default compression timeout preserved
-    assert cfg["auxiliary"]["compression"]["timeout"] == 120
+    assert cfg["auxiliary"]["compression"]["timeout"] == 300
 
 
 def test_reset_aux_to_auto_idempotent(tmp_path, monkeypatch):

@@ -1124,7 +1124,11 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        "protect_last_n": 10,         # minimum recent messages to keep uncompressed
+                                      # (lowered from 20 — a smaller protected tail
+                                      # keeps the summarizer payload bounded and
+                                      # compaction reliable; raise it back via
+                                      # config.yaml if you want a longer verbatim tail)
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
@@ -1144,15 +1148,19 @@ DEFAULT_CONFIG = {
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
         "codex_gpt55_autoraise": True,  # When True, gpt-5.5 on the ChatGPT Codex OAuth
-                                      # route raises its compaction trigger to 85% (vs the
+                                      # route raises its compaction trigger to 60% (vs the
                                       # global `threshold` above). Codex hard-caps gpt-5.5
                                       # at a 272K window, so the default 50% would compact
-                                      # at ~136K and waste half the usable context. Set to
-                                      # False to opt back down to the global threshold
-                                      # (e.g. 0.50) for Codex gpt-5.5 sessions. Only this
-                                      # exact route is affected — gpt-5.5 on OpenAI's
-                                      # direct API, OpenRouter, and Copilot keep the
-                                      # global threshold regardless.
+                                      # at ~136K and waste usable context. The trigger was
+                                      # previously raised all the way to 85% (~231K), but
+                                      # summarizing a window that large routinely timed out
+                                      # the auxiliary compression model and exhausted its
+                                      # fallbacks — 60% (~163K) balances window use against
+                                      # compaction reliability. Set to False to opt back
+                                      # down to the global threshold (e.g. 0.50) for Codex
+                                      # gpt-5.5 sessions. Only this exact route is affected
+                                      # — gpt-5.5 on OpenAI's direct API, OpenRouter, and
+                                      # Copilot keep the global threshold regardless.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -1251,7 +1259,9 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "timeout": 300,        # seconds — compression summarises large contexts (a
+                                   # threshold-sized window can take minutes on slow or
+                                   # reasoning aux models; 120s caused timeouts mid-compaction)
             "extra_body": {},
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
@@ -5964,7 +5974,7 @@ def show_config():
     if enabled:
         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
         print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
-        print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
+        print(f"  Protect last: {compression.get('protect_last_n', 10)} messages")
         print(f"  Protect first: {compression.get('protect_first_n', 3)} non-system head messages")
         _aux_comp = config.get('auxiliary', {}).get('compression', {})
         _sm = _aux_comp.get('model', '') or '(auto)'

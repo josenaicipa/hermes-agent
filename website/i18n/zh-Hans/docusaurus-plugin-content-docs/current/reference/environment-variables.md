@@ -601,7 +601,7 @@ compression:
   enabled: true
   threshold: 0.50
   target_ratio: 0.20         # fraction of threshold to preserve as recent tail
-  protect_last_n: 20         # minimum recent messages to keep uncompressed
+  protect_last_n: 10         # minimum recent messages to keep uncompressed
 ```
 
 :::info 旧版迁移

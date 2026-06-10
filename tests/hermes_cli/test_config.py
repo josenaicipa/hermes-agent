@@ -1056,3 +1056,41 @@ class TestEnvWriteDenylist:
         # But the write path still refuses to update it
         with pytest.raises(ValueError, match="denylist"):
             save_env_value("LD_PRELOAD", "/tmp/evil.so")
+
+
+class TestCompactionReliabilityDefaults:
+    """Defaults retuned for compaction reliability.
+
+    A protected tail of 20 messages plus an 85% Codex compaction trigger
+    produced summarizer payloads large enough to time out the auxiliary
+    model (120s) and strand sessions in preflight compression. The retuned
+    defaults: protect_last_n 10, Codex gpt-5.5 autoraise threshold 0.60,
+    auxiliary compression timeout 300s.
+    """
+
+    def test_compression_protect_last_n_default_is_10(self):
+        assert DEFAULT_CONFIG["compression"]["protect_last_n"] == 10
+
+    def test_global_compression_threshold_default_is_50_percent(self):
+        # The global trigger stays at 0.50 — only the Codex gpt-5.5 route
+        # autoraises (to 0.60, see below).
+        assert DEFAULT_CONFIG["compression"]["threshold"] == pytest.approx(0.50)
+
+    def test_codex_gpt55_autoraise_compaction_threshold_is_60_percent(self):
+        # Lowered from 0.85: compacting at ~231K of the 272K Codex window
+        # made the summarizer input itself too large to digest reliably.
+        from agent.auxiliary_client import (
+            _CODEX_GPT55_COMPACTION_THRESHOLD,
+            _compression_threshold_for_model,
+        )
+
+        assert _CODEX_GPT55_COMPACTION_THRESHOLD == pytest.approx(0.60)
+        assert _compression_threshold_for_model(
+            "gpt-5.5", "openai-codex"
+        ) == pytest.approx(0.60)
+
+    def test_codex_gpt55_autoraise_enabled_by_default(self):
+        assert DEFAULT_CONFIG["compression"]["codex_gpt55_autoraise"] is True
+
+    def test_auxiliary_compression_timeout_default_is_300(self):
+        assert DEFAULT_CONFIG["auxiliary"]["compression"]["timeout"] == 300
