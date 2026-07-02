@@ -145,6 +145,13 @@ def _route_lookup(routes: Mapping[str, Any], key: str | None) -> tuple[Mapping[s
         maybe = routes.get(candidate)
         if isinstance(maybe, Mapping):
             return maybe, candidate
+    if candidates[0].isdigit():
+        for route_key, maybe in routes.items():
+            if not isinstance(maybe, Mapping):
+                continue
+            route_channel_id = maybe.get("channel_id") or maybe.get("channelId")
+            if route_channel_id is not None and str(route_channel_id).strip() == candidates[0]:
+                return maybe, str(route_key)
     return {}, None
 
 
@@ -291,6 +298,15 @@ def maybe_filter_memory_context(
     if not command:
         return raw_context
     project, channel, workspace, route, resolved_channel_id, resolved_channel_name = _resolve_project_channel(cf_config, payload, query=query)
+    logger.debug(
+        "Context Fabric memory route decision: project=%s channel=%s workspace=%s route_matched=%s channel_id_present=%s bare_query_route_enabled=%s",
+        project,
+        channel,
+        workspace or "",
+        bool(route),
+        bool(resolved_channel_id),
+        _truthy(cf_config.get("allow_bare_query_channel_route")),
+    )
     if not project or not channel:
         return raw_context
     # This runs synchronously on the turn preflight path. Keep it deliberately

@@ -225,7 +225,7 @@ def test_context_fabric_filter_uses_graph_route_before_channel_slug(monkeypatch)
     assert seen["args"][seen["args"].index("--channel") + 1] == "#hermes-updates"
 
 
-def test_context_fabric_filter_routes_explicit_discord_channel_mention(monkeypatch) -> None:
+def test_context_fabric_filter_routes_explicit_discord_channel_mention(monkeypatch, caplog) -> None:
     from gateway.session_context import clear_session_vars, set_session_vars
 
     tokens = set_session_vars(
@@ -236,6 +236,7 @@ def test_context_fabric_filter_routes_explicit_discord_channel_mention(monkeypat
     )
     try:
         target_id = "1521226961756749825"
+        caplog.set_level("DEBUG", logger="agent.context_fabric_memory")
         raw = "[Memory Fabric scoped context]\n" + json.dumps(
             {
                 "query": f"audita Context Fabric para <#{target_id}>",
@@ -267,8 +268,7 @@ def test_context_fabric_filter_routes_explicit_discord_channel_mention(monkeypat
                 "channel_routes": {
                     "#context-fabric": {"project": "context-fabric", "channel": "#context-fabric"},
                     "1513706178843115660": {"project": "context-fabric", "channel": "#context-fabric"},
-                    "#vexa": {"project": "vexa", "channel": "#vexa"},
-                    target_id: {"project": "vexa", "channel": "#vexa"},
+                    "#vexa": {"project": "vexa", "channel": "#vexa", "channel_id": target_id},
                 },
             },
         )
@@ -280,6 +280,10 @@ def test_context_fabric_filter_routes_explicit_discord_channel_mention(monkeypat
     assert seen["args"][seen["args"].index("--channel") + 1] == "#vexa"
     assert seen["args"][seen["args"].index("--channel-id") + 1] == target_id
     assert seen["args"][seen["args"].index("--channel-name") + 1] == "#vexa"
+    assert "Context Fabric memory route decision" in caplog.text
+    assert "project=vexa" in caplog.text
+    assert "route_matched=True" in caplog.text
+    assert "bare_query_route_enabled=False" in caplog.text
 
 
 def test_incidental_bare_channel_name_in_prose_does_not_reroute(monkeypatch) -> None:
