@@ -225,6 +225,291 @@ def test_context_fabric_filter_uses_graph_route_before_channel_slug(monkeypatch)
     assert seen["args"][seen["args"].index("--channel") + 1] == "#hermes-updates"
 
 
+def test_context_fabric_filter_routes_explicit_discord_channel_mention(monkeypatch) -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="1513706178843115660",
+        chat_name="Hermes / #context-fabric",
+        guild_id="guild-1",
+    )
+    try:
+        target_id = "1521226961756749825"
+        raw = "[Memory Fabric scoped context]\n" + json.dumps(
+            {
+                "query": f"audita Context Fabric para <#{target_id}>",
+                "has_data": False,
+                "rendered": "# Context\n(no relevant memories found)",
+                "memory_ids": [],
+            }
+        )
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: vexa\nChannel: #vexa\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        filtered = maybe_filter_memory_context(
+            raw,
+            f"audita Context Fabric para <#{target_id}>",
+            config={
+                "enabled": True,
+                "command": [sys.executable, "fake.py"],
+                "timeout_seconds": 5,
+                "channel_routes": {
+                    "#context-fabric": {"project": "context-fabric", "channel": "#context-fabric"},
+                    "1513706178843115660": {"project": "context-fabric", "channel": "#context-fabric"},
+                    "#vexa": {"project": "vexa", "channel": "#vexa"},
+                    target_id: {"project": "vexa", "channel": "#vexa"},
+                },
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Project: vexa" in filtered
+    assert seen["args"][seen["args"].index("--project") + 1] == "vexa"
+    assert seen["args"][seen["args"].index("--channel") + 1] == "#vexa"
+    assert seen["args"][seen["args"].index("--channel-id") + 1] == target_id
+    assert seen["args"][seen["args"].index("--channel-name") + 1] == "#vexa"
+
+
+def test_incidental_bare_channel_name_in_prose_does_not_reroute(monkeypatch) -> None:
+    """Blocker #2 guard: a bare ``#name`` in ordinary conversation must NOT hijack
+    routing away from a valid session channel. Only the explicit Discord ``<#id>``
+    mention (or an opt-in flag) may override the current chat's scope. Otherwise a
+    sentence like "reminds me of #control" would silently inject another project's
+    memory into the turn — the exact cross-project contamination Jose forbids.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="ecom-session-id",
+        chat_name="Hermes / #ecommerce360",
+        guild_id="guild-1",
+    )
+    try:
+        raw = "[Memory Fabric scoped context]\n" + json.dumps(
+            {
+                "query": "esto me recuerda al issue que tuvimos en #control la semana pasada",
+                "has_data": False,
+                "rendered": "# Context\n(no relevant memories found)",
+                "memory_ids": [],
+            }
+        )
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: ecommerce360\nChannel: #ecommerce360\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        filtered = maybe_filter_memory_context(
+            raw,
+            "esto me recuerda al issue que tuvimos en #control la semana pasada",
+            config={
+                "enabled": True,
+                "command": [sys.executable, "fake.py"],
+                "timeout_seconds": 5,
+                # NOTE: allow_bare_query_channel_route intentionally NOT set (default off).
+                "channel_routes": {
+                    "#ecommerce360": {"project": "ecommerce360", "channel": "#ecommerce360"},
+                    "#control": {"project": "torre-de-control", "channel": "#control"},
+                },
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    # Routing must stay on the session channel, not the channel named in prose.
+    assert seen["args"][seen["args"].index("--project") + 1] == "ecommerce360"
+    assert seen["args"][seen["args"].index("--channel") + 1] == "#ecommerce360"
+    assert "torre-de-control" not in seen["args"]
+    assert "#control" not in seen["args"]
+
+
+def test_bare_channel_name_reroutes_only_when_explicitly_opted_in(monkeypatch) -> None:
+    """Counterpart to the guard above: when an operator explicitly opts in via
+    ``allow_bare_query_channel_route``, a bare ``#name`` that keys into a configured
+    route MAY scope the preflight. This keeps the audit ergonomics available without
+    making bare-name rerouting the unsafe default.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="cf-session-id",
+        chat_name="Hermes / #context-fabric",
+        guild_id="guild-1",
+    )
+    try:
+        raw = "[Memory Fabric scoped context]\n" + json.dumps(
+            {
+                "query": "audita #vexa",
+                "has_data": False,
+                "rendered": "# Context\n(no relevant memories found)",
+                "memory_ids": [],
+            }
+        )
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: vexa\nChannel: #vexa\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        filtered = maybe_filter_memory_context(
+            raw,
+            "audita #vexa",
+            config={
+                "enabled": True,
+                "command": [sys.executable, "fake.py"],
+                "timeout_seconds": 5,
+                "allow_bare_query_channel_route": True,
+                "channel_routes": {
+                    "#context-fabric": {"project": "context-fabric", "channel": "#context-fabric"},
+                    "#vexa": {"project": "vexa", "channel": "#vexa"},
+                },
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Project: vexa" in filtered
+    assert seen["args"][seen["args"].index("--project") + 1] == "vexa"
+    assert seen["args"][seen["args"].index("--channel") + 1] == "#vexa"
+
+
+def test_context_fabric_filter_does_not_route_incidental_discord_channel_mention(monkeypatch) -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="1513706178843115660",
+        chat_name="Hermes / #context-fabric",
+        guild_id="guild-1",
+    )
+    try:
+        target_id = "1521226961756749825"
+        raw = "[Memory Fabric scoped context]\n" + json.dumps(
+            {
+                "query": f"esto se parece a <#{target_id}> pero no es una petición de contexto",
+                "has_data": False,
+                "rendered": "# Context\n(no relevant memories found)",
+                "memory_ids": [],
+            }
+        )
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: context-fabric\nChannel: #context-fabric\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        filtered = maybe_filter_memory_context(
+            raw,
+            f"esto se parece a <#{target_id}> pero no es una petición de contexto",
+            config={
+                "enabled": True,
+                "command": [sys.executable, "fake.py"],
+                "timeout_seconds": 5,
+                "channel_routes": {
+                    "#context-fabric": {"project": "context-fabric", "channel": "#context-fabric"},
+                    "1513706178843115660": {"project": "context-fabric", "channel": "#context-fabric"},
+                    target_id: {"project": "vexa", "channel": "#vexa"},
+                },
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Project: context-fabric" in filtered
+    assert seen["args"][seen["args"].index("--project") + 1] == "context-fabric"
+    assert seen["args"][seen["args"].index("--channel") + 1] == "#context-fabric"
+
+
+
+def test_context_fabric_filter_does_not_route_incidental_bare_channel_name(monkeypatch) -> None:
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="1513706178843115660",
+        chat_name="Hermes / #context-fabric",
+        guild_id="guild-1",
+    )
+    try:
+        raw = "[Memory Fabric scoped context]\n" + json.dumps(
+            {
+                "query": "esto se parece a #vexa pero no cambies de canal",
+                "has_data": False,
+                "rendered": "# Context\n(no relevant memories found)",
+                "memory_ids": [],
+            }
+        )
+        seen: dict[str, list[str]] = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = args
+
+            class Completed:
+                returncode = 0
+                stdout = "# AGENT_CONTEXT\nProject: context-fabric\nChannel: #context-fabric\n"
+                stderr = ""
+
+            return Completed()
+
+        monkeypatch.setattr("agent.context_fabric_memory.subprocess.run", fake_run)
+        filtered = maybe_filter_memory_context(
+            raw,
+            "esto se parece a #vexa pero no cambies de canal",
+            config={
+                "enabled": True,
+                "command": [sys.executable, "fake.py"],
+                "timeout_seconds": 5,
+                "channel_routes": {
+                    "#context-fabric": {"project": "context-fabric", "channel": "#context-fabric"},
+                    "1513706178843115660": {"project": "context-fabric", "channel": "#context-fabric"},
+                    "#vexa": {"project": "vexa", "channel": "#vexa"},
+                },
+            },
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Project: context-fabric" in filtered
+    assert seen["args"][seen["args"].index("--project") + 1] == "context-fabric"
+    assert seen["args"][seen["args"].index("--channel") + 1] == "#context-fabric"
+
+
+
 def test_infer_project_from_current_channel_when_no_route_or_payload_scope(monkeypatch) -> None:
     from gateway.session_context import clear_session_vars, set_session_vars
 

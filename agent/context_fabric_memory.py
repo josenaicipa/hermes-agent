@@ -19,6 +19,11 @@ from typing import Any, Mapping
 logger = logging.getLogger(__name__)
 _MARKER = "[Memory Fabric scoped context]"
 _CHANNEL_RE = re.compile(r"#[\w-]+")
+_CHANNEL_MENTION_RE = re.compile(r"<#(?P<id>\d+)>")
+_CHANNEL_SCOPE_INTENT_RE = re.compile(
+    r"\b(context\s*fabric|memory|memoria|scoped?|scope|canal|channel|audita|audit|revisa|review|diagn[oó]stic|fix|arregl|para|for)\b",
+    re.IGNORECASE,
+)
 _SCOPE_RE = re.compile(r"^##\s+scope:\s*([^\n\r]+)", re.IGNORECASE | re.MULTILINE)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -127,25 +132,91 @@ def _project_from_channel(channel: str) -> str:
     return _slug(channel)
 
 
+def _route_lookup(routes: Mapping[str, Any], key: str | None) -> tuple[Mapping[str, Any], str | None]:
+    """Return a route mapping for ``key`` without inventing a fallback route."""
+    if not key:
+        return {}, None
+    candidates = [str(key).strip()]
+    if candidates[0].startswith("#"):
+        candidates.append(candidates[0].lstrip("#"))
+    elif not candidates[0].isdigit():
+        candidates.append(f"#{candidates[0]}")
+    for candidate in candidates:
+        maybe = routes.get(candidate)
+        if isinstance(maybe, Mapping):
+            return maybe, candidate
+    return {}, None
+
+
+def _route_from_query_mentions(query: str, routes: Mapping[str, Any], *, allow_bare_channel_names: bool = False) -> tuple[Mapping[str, Any], str | None]:
+    """Resolve an explicitly mentioned Discord channel in the user query.
+
+    The active session channel is not always the channel being audited. A user may
+    ask from #context-fabric about ``<#123>``; in that case Context Fabric must
+    scope the Memory Fabric preflight to the mentioned channel's configured route
+    instead of the current chat. Bare ``#name`` routing is opt-in only because it
+    is common incidental prose and can otherwise create silent cross-project
+    scope bleed. Only configured routes are honored, so arbitrary text cannot
+    create a new scope.
+    """
+    if not query:
+        return {}, None
+    for match in _CHANNEL_MENTION_RE.finditer(query):
+        # Explicit Discord mentions are only scope selectors when the nearby text
+        # shows the user is asking about channel-scoped context. Pasted quotes or
+        # casual references to another channel must not silently hijack this
+        # turn's Memory Fabric scope.
+        window = query[max(0, match.start() - 80) : min(len(query), match.end() + 80)]
+        if not _CHANNEL_SCOPE_INTENT_RE.search(window):
+            continue
+        channel_id = match.group("id")
+        route, _key = _route_lookup(routes, channel_id)
+        if route:
+            return route, channel_id
+    if not allow_bare_channel_names:
+        return {}, None
+    for match in _CHANNEL_RE.finditer(query):
+        route, key = _route_lookup(routes, match.group(0))
+        if route:
+            channel_id = route.get("channel_id") or route.get("channelId")
+            return route, str(channel_id) if channel_id else (key if key and key.isdigit() else None)
+    return {}, None
+
+
 def _resolve_project_channel(
     config: Mapping[str, Any],
     payload: Mapping[str, Any] | None = None,
-) -> tuple[str, str, str | None, Mapping[str, Any]]:
+    *,
+    query: str = "",
+) -> tuple[str, str, str | None, Mapping[str, Any], str | None, str | None]:
     channel = _current_channel(config)
     chat_id = _session_value("HERMES_SESSION_CHAT_ID")
+    session_channel_name = _session_value("HERMES_SESSION_CHAT_NAME")
     routes = config.get("channel_routes")
     route: Mapping[str, Any] = {}
+    resolved_channel_id: str | None = chat_id or None
+    resolved_channel_name: str | None = session_channel_name or None
     if isinstance(routes, Mapping):
-        maybe = None
-        if channel in routes:
-            maybe = routes.get(channel)
-        elif chat_id in routes:
-            maybe = routes.get(chat_id)
-        if isinstance(maybe, Mapping):
-            route = maybe
+        route_query = query or (str(payload.get("query") or "") if isinstance(payload, Mapping) else "")
+        route, mentioned_channel_id = _route_from_query_mentions(
+            route_query,
+            routes,
+            allow_bare_channel_names=_truthy(config.get("allow_bare_query_channel_route")),
+        )
+        if route:
+            resolved_channel_id = mentioned_channel_id or None
+            resolved_channel_name = str(route.get("channel") or "") or resolved_channel_name
+        else:
+            route, key = _route_lookup(routes, channel)
+            if not route:
+                route, key = _route_lookup(routes, chat_id)
+            if route:
+                resolved_channel_id = chat_id or (key if key and key.isdigit() else None)
     if not route and _truthy(config.get("restrict_to_routes")):
-        return "", "", None, route
+        return "", "", None, route, None, None
     resolved_channel = str(route.get("channel") or config.get("default_channel") or channel or "")
+    if route and not resolved_channel_name:
+        resolved_channel_name = resolved_channel
     project = str(
         route.get("project")
         or config.get("default_project")
@@ -153,7 +224,7 @@ def _resolve_project_channel(
         or _project_from_channel(resolved_channel)
     )
     workspace = route.get("workspace") or config.get("default_workspace")
-    return project, resolved_channel, str(workspace) if workspace else None, route
+    return project, resolved_channel, str(workspace) if workspace else None, route, resolved_channel_id, resolved_channel_name
 
 
 def _command_from_config(config: Mapping[str, Any]) -> list[str]:
@@ -219,7 +290,7 @@ def maybe_filter_memory_context(
     command = _command_from_config(cf_config)
     if not command:
         return raw_context
-    project, channel, workspace, route = _resolve_project_channel(cf_config, payload)
+    project, channel, workspace, route, resolved_channel_id, resolved_channel_name = _resolve_project_channel(cf_config, payload, query=query)
     if not project or not channel:
         return raw_context
     # This runs synchronously on the turn preflight path. Keep it deliberately
@@ -245,8 +316,8 @@ def maybe_filter_memory_context(
             if workspace:
                 args.extend(["--workspace", workspace])
             guild_id = _session_value("HERMES_SESSION_GUILD_ID")
-            channel_id = _session_value("HERMES_SESSION_CHAT_ID")
-            channel_name = _session_value("HERMES_SESSION_CHAT_NAME")
+            channel_id = resolved_channel_id or _session_value("HERMES_SESSION_CHAT_ID")
+            channel_name = resolved_channel_name or _session_value("HERMES_SESSION_CHAT_NAME")
             if guild_id:
                 args.extend(["--guild-id", guild_id])
             if channel_id:
