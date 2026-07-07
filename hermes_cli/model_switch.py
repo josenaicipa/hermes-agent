@@ -292,8 +292,14 @@ MODEL_ALIASES: dict[str, ModelIdentity] = {
     # Google
     "gemini":    ModelIdentity("google", "gemini"),
 
-    # DeepSeek
-    "deepseek":  ModelIdentity("deepseek", "deepseek-chat"),
+    # DeepSeek — family intentionally NOT "deepseek-chat": that string is a
+    # standalone V3 model id, not a generational prefix, so it could only
+    # ever prefix-match itself and would keep this alias pinned to V3
+    # forever (unlike "claude-sonnet"/"gpt", whose prefix spans versions).
+    # Point at deepseek-v4-flash instead, matching what config.yaml already
+    # uses for auxiliary tasks and ahead of DeepSeek's 2026-07-24 retirement
+    # of the deepseek-chat/deepseek-reasoner ids.
+    "deepseek":  ModelIdentity("deepseek", "deepseek-v4-flash"),
 
     # X.AI
     "grok":      ModelIdentity("x-ai", "grok"),

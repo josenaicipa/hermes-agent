@@ -193,15 +193,40 @@ class TestDeepSeekAuxModel:
     expected to set `default_aux_model` on `ProviderProfile`, and the
     fallback dict only exists for providers that predate the profiles
     system.
+
+    2026-07-05: bumped from ``deepseek-chat`` (V3) to ``deepseek-v4-flash``
+    per the actualidad-ai daily report's DeepSeek migration recommendation —
+    DeepSeek retires the ``deepseek-chat``/``deepseek-reasoner`` IDs on
+    2026-07-24, and Hermes' own ``config.yaml`` auxiliary blocks already use
+    ``deepseek-v4-flash`` everywhere else, so the profile default was the
+    one place still pointing at the legacy V3 alias.
     """
 
-    def test_profile_advertises_deepseek_chat(self, deepseek_profile):
-        assert deepseek_profile.default_aux_model == "deepseek-chat"
+    def test_profile_advertises_deepseek_v4_flash(self, deepseek_profile):
+        assert deepseek_profile.default_aux_model == "deepseek-v4-flash"
 
-    def test_consumer_api_returns_deepseek_chat(self):
+    def test_consumer_api_returns_deepseek_v4_flash(self):
         from agent.auxiliary_client import _get_aux_model_for_provider
-        assert _get_aux_model_for_provider("deepseek") == "deepseek-chat"
+        assert _get_aux_model_for_provider("deepseek") == "deepseek-v4-flash"
 
     def test_consumer_api_returns_non_empty(self):
         from agent.auxiliary_client import _get_aux_model_for_provider
         assert _get_aux_model_for_provider("deepseek") != ""
+
+
+class TestDeepSeekFallbackModels:
+    """Picker fallback list (shown when the live models.dev fetch fails)
+    surfaces V4 first while keeping the legacy V3/R1 IDs reachable for
+    explicit selection ahead of DeepSeek's 2026-07-24 retirement deadline
+    for ``deepseek-chat``/``deepseek-reasoner``.
+    """
+
+    def test_v4_models_listed_first(self, deepseek_profile):
+        assert deepseek_profile.fallback_models[:2] == (
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+        )
+
+    def test_legacy_ids_still_present_for_explicit_selection(self, deepseek_profile):
+        assert "deepseek-chat" in deepseek_profile.fallback_models
+        assert "deepseek-reasoner" in deepseek_profile.fallback_models
