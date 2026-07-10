@@ -4783,6 +4783,80 @@ class TestVacuum:
         db.vacuum()
 
 
+class TestWalCheckpoint:
+    def test_try_wal_checkpoint_runs_passive_never_truncate(self, db, monkeypatch):
+        """Periodic checkpoints must use PASSIVE; TRUNCATE stays close()-only."""
+
+        class _RecordingConnection:
+            """Wraps the real connection, recording every SQL statement."""
+
+            def __init__(self, real_conn):
+                self._real_conn = real_conn
+                self.executed_sql = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.executed_sql.append(sql)
+                return self._real_conn.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self._real_conn.close()
+
+        recorder = _RecordingConnection(db._conn)
+        monkeypatch.setattr(db, "_conn", recorder)
+
+        db._try_wal_checkpoint()
+
+        assert any(
+            "wal_checkpoint(PASSIVE)" in sql for sql in recorder.executed_sql
+        )
+        assert all("TRUNCATE" not in sql for sql in recorder.executed_sql)
+
+    def test_close_keeps_explicit_truncate_checkpoint(self, tmp_path, monkeypatch):
+        """Shutdown still truncates the WAL after periodic checkpoints became PASSIVE."""
+
+        class _RecordingConnection:
+            def __init__(self, real_conn):
+                self._real_conn = real_conn
+                self.executed_sql = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.executed_sql.append(sql)
+                return self._real_conn.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self._real_conn.close()
+
+        session_db = SessionDB(db_path=tmp_path / "close_checkpoint.db")
+        recorder = _RecordingConnection(session_db._conn)
+        monkeypatch.setattr(session_db, "_conn", recorder)
+
+        session_db.close()
+
+        assert any(
+            "wal_checkpoint(TRUNCATE)" in sql for sql in recorder.executed_sql
+        )
+        assert session_db._conn is None
+
+    def test_try_wal_checkpoint_execute_failure_logs_warning_and_does_not_raise(
+        self, db, monkeypatch, caplog
+    ):
+        """A failing checkpoint pragma must be swallowed, not propagated."""
+
+        class _BoomConnection:
+            def execute(self, sql, *args, **kwargs):
+                raise sqlite3.OperationalError("simulated checkpoint failure")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(db, "_conn", _BoomConnection())
+
+        with caplog.at_level("WARNING"):
+            db._try_wal_checkpoint()  # must not raise
+
+        assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
 class TestOptimizeFts:
     def test_optimize_returns_index_count(self, db):
         """A fresh DB has both FTS indexes; optimize merges both."""
