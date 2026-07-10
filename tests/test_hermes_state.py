@@ -630,6 +630,67 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_profile_fuse_handles_legacy_schema_and_safe_reenable(self, tmp_path):
+        """Legacy trigram is removed while fused and rebuilt after fuse removal."""
+        db_path = tmp_path / "state.db"
+        marker = tmp_path / hermes_state._TRIGRAM_FTS_DISABLE_MARKER
+
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="legacy", source="cli")
+            seeded.append_message(
+                "legacy", role="user", content="legacy search 大别山项目"
+            )
+            assert seeded._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            seeded.close()
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE schema_version SET version = 10")
+        conn.commit()
+        conn.close()
+        marker.write_text("recurrent trigram corruption\n", encoding="utf-8")
+
+        fused = SessionDB(db_path=db_path)
+        try:
+            assert fused._fts_enabled is True
+            assert fused._trigram_available is False
+            assert fused._fts_table_exists("messages_fts_trigram") is False
+            assert len(fused.search_messages("legacy")) == 1
+            assert len(fused.search_messages("大别山")) == 1
+            assert fused._conn is not None
+            trigger_names = {
+                row[0]
+                for row in fused._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert trigger_names == set(hermes_state._BASE_FTS_TRIGGERS)
+            assert fused._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+        finally:
+            fused.close()
+
+        marker.unlink()
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert restored._trigram_available is True
+            assert restored._fts_table_exists("messages_fts_trigram") is True
+            assert len(restored.search_messages("大别山")) == 1
+            assert restored._conn is not None
+            trigger_names = {
+                row[0]
+                for row in restored._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert trigger_names == set(hermes_state._FTS_TRIGGERS)
+        finally:
+            restored.close()
+
     def test_existing_fts_tables_do_not_break_without_fts5(
         self, tmp_path, monkeypatch
     ):
