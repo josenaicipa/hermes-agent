@@ -4785,7 +4785,7 @@ class TestVacuum:
 
 class TestWalCheckpoint:
     def test_try_wal_checkpoint_runs_passive_never_truncate(self, db, monkeypatch):
-        """Periodic checkpoints must use PASSIVE; TRUNCATE stays close()-only."""
+        """Periodic checkpoints use PASSIVE; TRUNCATE stays maintenance-only."""
 
         class _RecordingConnection:
             """Wraps the real connection, recording every SQL statement."""
