@@ -4811,8 +4811,8 @@ class TestWalCheckpoint:
         )
         assert all("TRUNCATE" not in sql for sql in recorder.executed_sql)
 
-    def test_close_keeps_explicit_truncate_checkpoint(self, tmp_path, monkeypatch):
-        """Shutdown still truncates the WAL after periodic checkpoints became PASSIVE."""
+    def test_close_uses_passive_checkpoint(self, tmp_path, monkeypatch):
+        """Per-request close must not issue an exclusive TRUNCATE checkpoint."""
 
         class _RecordingConnection:
             def __init__(self, real_conn):
@@ -4833,8 +4833,9 @@ class TestWalCheckpoint:
         session_db.close()
 
         assert any(
-            "wal_checkpoint(TRUNCATE)" in sql for sql in recorder.executed_sql
+            "wal_checkpoint(PASSIVE)" in sql for sql in recorder.executed_sql
         )
+        assert all("TRUNCATE" not in sql for sql in recorder.executed_sql)
         assert session_db._conn is None
 
     def test_try_wal_checkpoint_execute_failure_logs_warning_and_does_not_raise(

@@ -1446,17 +1446,19 @@ class SessionDB:
             pass  # Best effort — never fatal.
 
     def close(self):
-        """Close the database connection.
+        """Close the database connection with a non-exclusive checkpoint.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        SessionDB is instantiated per request in gateway and web-server paths,
+        so close() is not necessarily a process shutdown boundary.  Use
+        PASSIVE here; exclusive TRUNCATE remains reserved for controlled
+        maintenance such as pre-VACUUM while writers are quiesced.
         """
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception as exc:
-                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
+                    logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
 
