@@ -597,6 +597,39 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_profile_fuse_disables_trigram_but_keeps_base_fts(self, tmp_path):
+        """The profile marker removes only optional trigram functionality."""
+        marker = tmp_path / hermes_state._TRIGRAM_FTS_DISABLE_MARKER
+        marker.write_text("recurrent trigram corruption\n", encoding="utf-8")
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert db._fts_enabled is True
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts") is True
+            assert db._fts_table_exists("messages_fts_trigram") is False
+            assert db._conn is not None
+
+            trigger_names = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert trigger_names == set(hermes_state._BASE_FTS_TRIGGERS)
+
+            db.create_session(session_id="s1", source="cli")
+            db.append_message(
+                "s1", role="user", content="operacion normal disponible"
+            )
+            results = db.search_messages("operacion")
+            assert len(results) == 1
+            assert ">>>operacion<<<" in results[0]["snippet"]
+            assert "normal disponible" in results[0]["snippet"]
+        finally:
+            db.close()
+
     def test_existing_fts_tables_do_not_break_without_fts5(
         self, tmp_path, monkeypatch
     ):

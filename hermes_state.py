@@ -196,14 +196,23 @@ _last_init_error_lock = threading.Lock()
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
 
-_FTS_TRIGGERS = (
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
+
+# Profile-local operational fuse.  Creating this marker next to state.db keeps
+# the healthy unicode61 FTS index enabled while preventing creation/use of the
+# optional trigram index.  It is intended for recovery from recurrent trigram
+# corruption on very large databases and does not affect other profiles.
+_TRIGRAM_FTS_DISABLE_MARKER = ".disable-trigram-fts"
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1915,22 +1924,37 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            trigram_disabled = (
+                self.db_path.parent / _TRIGRAM_FTS_DISABLE_MARKER
+            ).is_file()
+            if trigram_disabled:
+                # The marker is installed only during quiesced maintenance, but
+                # dropping stale trigram triggers here is a defensive guard so
+                # future message writes cannot target a removed/corrupt table.
+                for trigger in _TRIGRAM_FTS_TRIGGERS:
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            expected_triggers = (
+                len(_BASE_FTS_TRIGGERS)
+                if trigram_disabled
+                else len(_FTS_TRIGGERS)
+            )
+            triggers_need_repair = self._fts_trigger_count(cursor) < expected_triggers
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
-            # Trigram FTS5 for CJK/substring search. This is optional relative
-            # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
-            if self._fts_enabled:
+            # Trigram FTS5 for CJK/substring search is optional.  A profile-local
+            # fuse can disable it after recurrent corruption; CJK then uses the
+            # existing LIKE fallback while the main FTS index remains available.
+            trigram_enabled = False
+            if self._fts_enabled and not trigram_disabled:
                 trigram_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                 )
-                self._trigram_available = trigram_enabled
-                if triggers_need_repair:
-                    self._rebuild_fts_indexes(
-                        cursor,
-                        include_trigram=trigram_enabled,
-                    )
+            self._trigram_available = trigram_enabled
+            if self._fts_enabled and triggers_need_repair:
+                self._rebuild_fts_indexes(
+                    cursor,
+                    include_trigram=trigram_enabled,
+                )
 
         self._conn.commit()
 
