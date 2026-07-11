@@ -42,6 +42,67 @@ def test_get_managed_dir_default_ignored_under_pytest(monkeypatch):
     assert managed_scope.get_managed_dir() is None
 
 
+# ── Fail-open on directory-probe errors (cron/gateway sandbox regression) ─────
+#
+# ``Path.is_dir()`` only swallows ENOENT/ENOTDIR/EBADF/ELOOP; it RE-RAISES
+# EACCES (PermissionError) and other errnos. In a sandboxed cron/gateway
+# environment ``stat('/etc/hermes')`` can raise PermissionError, which used to
+# propagate out of get_managed_dir() and crash startup. Both resolution tiers
+# must instead fail open to None (no managed scope).
+
+
+@pytest.mark.parametrize(
+    "probe_error",
+    [
+        PermissionError(13, "Permission denied"),
+        OSError(5, "I/O error"),
+    ],
+    ids=["permission_error", "os_error"],
+)
+def test_get_managed_dir_override_fails_open_on_probe_error(
+    tmp_path, monkeypatch, probe_error
+):
+    """An explicit HERMES_MANAGED_DIR override whose probe raises must → None."""
+    from pathlib import Path
+
+    from hermes_cli import managed_scope
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+    def _raise(*_a, **_k):
+        raise probe_error
+
+    monkeypatch.setattr(Path, "is_dir", _raise)
+    assert managed_scope.get_managed_dir() is None
+
+
+@pytest.mark.parametrize(
+    "probe_error",
+    [
+        PermissionError(13, "Permission denied"),
+        OSError(5, "I/O error"),
+    ],
+    ids=["permission_error", "os_error"],
+)
+def test_get_managed_dir_default_fails_open_on_probe_error(monkeypatch, probe_error):
+    """The /etc/hermes default probe raising in a sandbox must → None, not raise."""
+    from pathlib import Path
+
+    from hermes_cli import managed_scope
+
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    # Reach the default tier that is normally short-circuited under pytest.
+    monkeypatch.setattr(managed_scope, "_under_pytest", lambda: False)
+
+    def _raise(*_a, **_k):
+        raise probe_error
+
+    monkeypatch.setattr(Path, "is_dir", _raise)
+    assert managed_scope.get_managed_dir() is None
+
+
 # ── Loaders + key helpers ────────────────────────────────────────────────────
 
 
