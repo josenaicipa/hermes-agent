@@ -624,6 +624,27 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+def _drop_trigram_fts_objects(conn: sqlite3.Connection) -> None:
+    """Drop every ``messages_fts_trigram`` object: the three message triggers
+    and the virtual table (which removes its shadow tables with it).
+
+    The trigram triggers are attached to ``messages`` (``AFTER INSERT ON
+    messages``), so ``DROP TABLE`` alone does not remove them — they must be
+    dropped explicitly, or a later message write fires a trigger into a
+    now-absent table. Each statement is guarded because on a still-malformed
+    schema even a ``DROP ... IF EXISTS`` can raise ``OperationalError``.
+    """
+    for trigger in _TRIGRAM_FTS_TRIGGERS:
+        try:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        except sqlite3.OperationalError:
+            pass
+    try:
+        conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+    except sqlite3.OperationalError:
+        pass
+
+
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
@@ -648,6 +669,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     Canonical ``sessions`` / ``messages`` rows are never modified. A
     timestamped raw backup is taken first unless ``backup=False``.
 
+    Profile-fuse aware: when the ``.disable-trigram-fts`` marker sits next to
+    state.db, any recovery strategy that runs skips rebuilding the optional
+    trigram index and drops every ``messages_fts_trigram`` object/trigger on
+    success, so a fused profile is never left with (or handed a rebuilt)
+    trigram index. Non-fused recovery preserves trigram exactly as before.
+
     Returns a report dict: ``{repaired: bool, strategy: str|None,
     backup_path: str|None, error: str|None}``.
     """
@@ -668,6 +695,26 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["strategy"] = "already_healthy"
         return report
 
+    # Profile-local fuse: when ``.disable-trigram-fts`` sits next to state.db,
+    # recovery must never rebuild, recreate, or leave behind the optional
+    # trigram index. Any strategy that actually runs skips the trigram rebuild
+    # and drops trigram objects/triggers on success via ``_succeed``. The
+    # already-healthy shortcut above is intentionally NOT fuse-normalised —
+    # nothing was recovered, and the SessionDB open path handles a healthy
+    # fused profile — so non-fused and no-op behaviour stays unchanged.
+    trigram_disabled = (db_path.parent / _TRIGRAM_FTS_DISABLE_MARKER).is_file()
+
+    def _succeed(strategy: str) -> Dict[str, Any]:
+        if trigram_disabled:
+            conn = sqlite3.connect(str(db_path), isolation_level=None)
+            try:
+                _drop_trigram_fts_objects(conn)
+            finally:
+                conn.close()
+        report["repaired"] = True
+        report["strategy"] = strategy
+        return report
+
     if backup:
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
@@ -679,7 +726,15 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     try:
         conn = sqlite3.connect(str(db_path), isolation_level=None)
         try:
-            for table_name in ("messages_fts", "messages_fts_trigram"):
+            if trigram_disabled:
+                # Fuse set: never rebuild the optional trigram index. Remove its
+                # triggers + table up front so the health probe's write cannot
+                # fire a trigram trigger into a stale/corrupt table.
+                _drop_trigram_fts_objects(conn)
+                rebuild_tables = ("messages_fts",)
+            else:
+                rebuild_tables = ("messages_fts", "messages_fts_trigram")
+            for table_name in rebuild_tables:
                 try:
                     conn.execute(
                         f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
@@ -690,13 +745,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
-            report["repaired"] = True
-            report["strategy"] = "rebuild_fts"
             logger.warning(
                 "state.db FTS indexes rebuilt in place (schema preserved): %s",
                 db_path,
             )
-            return report
+            return _succeed("rebuild_fts")
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
 
@@ -720,13 +773,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
-            report["repaired"] = True
-            report["strategy"] = "dedup_schema"
             logger.warning(
                 "state.db schema repaired by de-duplicating sqlite_master "
                 "(FTS index preserved): %s", db_path
             )
-            return report
+            return _succeed("dedup_schema")
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db dedup repair pass failed: %s", exc)
 
@@ -743,13 +794,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.close()
         reason = _db_opens_cleanly(db_path)
         if reason is None:
-            report["repaired"] = True
-            report["strategy"] = "drop_fts_rebuild"
             logger.warning(
                 "state.db schema repaired by dropping FTS schema; indexes "
                 "will rebuild from messages on next open: %s", db_path
             )
-            return report
+            return _succeed("drop_fts_rebuild")
         report["error"] = reason
     except sqlite3.DatabaseError as exc:
         report["error"] = str(exc)
@@ -1211,26 +1260,55 @@ class SessionDB:
         *,
         include_trigram: bool = True,
     ) -> None:
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
-        if not include_trigram:
-            return
-        cursor.execute("DELETE FROM messages_fts_trigram")
-        cursor.execute(
-            "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        """Atomically reset and repopulate the inline FTS index(es) from the
+        canonical ``messages`` rows.
+
+        SessionDB opens its connection with ``isolation_level=None`` (autocommit
+        — see ``__init__``), so without an explicit transaction the ``DELETE``
+        and the large ``INSERT ... SELECT`` repopulation each autocommit
+        separately. An interruption/failure after the DELETE commits but before
+        the INSERT completes would then durably empty the historical base FTS
+        index, silently breaking full-text search for all prior history.
+
+        A SAVEPOINT makes the destructive reset + repopulation atomic on this
+        autocommit connection: any failure rolls back to the pre-existing rows
+        instead of leaving the index empty. SAVEPOINT (rather than a plain
+        BEGIN) also composes correctly if a caller ever wraps this in an outer
+        transaction. The repopulation is an explicit ``INSERT ... SELECT FROM
+        messages`` for the inline base FTS — deliberately NOT the FTS5
+        external-content ``'rebuild'`` command, whose semantics do not apply to
+        these inline (self-contained) FTS tables.
+        """
+        cursor.execute("SAVEPOINT hermes_rebuild_fts")
+        try:
+            cursor.execute("DELETE FROM messages_fts")
+            cursor.execute(
+                "INSERT INTO messages_fts(rowid, content) "
+                "SELECT id, "
+                "COALESCE(content, '') || ' ' || "
+                "COALESCE(tool_name, '') || ' ' || "
+                "COALESCE(tool_calls, '') "
+                "FROM messages"
+            )
+            if include_trigram:
+                cursor.execute("DELETE FROM messages_fts_trigram")
+                cursor.execute(
+                    "INSERT INTO messages_fts_trigram(rowid, content) "
+                    "SELECT id, "
+                    "COALESCE(content, '') || ' ' || "
+                    "COALESCE(tool_name, '') || ' ' || "
+                    "COALESCE(tool_calls, '') "
+                    "FROM messages"
+                )
+        except BaseException:
+            # Undo the destructive reset so pre-existing FTS rows survive, then
+            # release the (now-reverted) savepoint before propagating.
+            try:
+                cursor.execute("ROLLBACK TO hermes_rebuild_fts")
+            finally:
+                cursor.execute("RELEASE hermes_rebuild_fts")
+            raise
+        cursor.execute("RELEASE hermes_rebuild_fts")
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
