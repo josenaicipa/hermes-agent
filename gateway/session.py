@@ -1588,9 +1588,25 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+            # SQLite is authoritative: once it commits, this generation is
+            # durable even if the best-effort JSON mirror fails afterward.
+            if db_saved:
+                self._persisted_routing_generation = generation
+
             if getattr(self, "_write_sessions_json", True) or not db_saved:
-                self._save_sessions_json(data)
-            self._persisted_routing_generation = generation
+                try:
+                    self._save_sessions_json(data)
+                except Exception:
+                    if not db_saved:
+                        raise
+                    logger.warning(
+                        "gateway.session: sessions.json mirror write failed; "
+                        "routing already persisted to state.db",
+                        exc_info=True,
+                    )
+                else:
+                    if not db_saved:
+                        self._persisted_routing_generation = generation
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""

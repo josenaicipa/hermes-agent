@@ -301,3 +301,67 @@ class TestPersistSnapshotVersionGuard:
         )
         # The heal's own repoint is still present too.
         assert store._entries[KEY].session_id == "sid_child"
+
+
+# ---------------------------------------------------------------------------
+# 5. Partial-success persist — authoritative SQLite commit + failed JSON mirror.
+#    A snapshot whose SQLite write succeeds must count as committed even if the
+#    best-effort sessions.json mirror then fails, so a LATER-arriving OLDER
+#    snapshot cannot pass the version guard and clobber SQLite.
+# ---------------------------------------------------------------------------
+
+class TestPersistSnapshotPartialSuccess:
+    def test_older_snapshot_cannot_clobber_after_mirror_failure(self, tmp_path):
+        """SQLite is the authoritative routing store; sessions.json is a
+        best-effort mirror. When a newer snapshot's SQLite write succeeds but
+        its JSON mirror then fails, the persist must still advance the version
+        guard — otherwise a lower-version snapshot (e.g. an older startup-heal
+        persist still queued on ``_persist_lock``) would pass the guard and
+        clobber the routes SQLite already committed."""
+        db = SessionDB(tmp_path / "state.db")
+        store = _make_unloaded_store(tmp_path, db)
+        store._ensure_loaded()
+        scope = store._routing_scope()
+        # Baseline guard value after load — versions are chosen relative to it so
+        # the scenario is deterministic regardless of what the load/heal set.
+        base = store._persisted_routing_generation
+
+        newer = {"k_new": _make_entry("k_new", "sid_new").to_dict()}
+        older = {"k_old": _make_entry("k_old", "sid_old").to_dict()}
+
+        real_save_json = store._save_sessions_json
+
+        def failing_mirror(data):
+            raise OSError("sessions.json mirror unavailable")
+
+        store._save_sessions_json = failing_mirror
+
+        # Newer snapshot: the authoritative SQLite write commits, then the JSON
+        # mirror fails. A successfully persisted SQLite snapshot must not look
+        # uncommitted, so this must NOT raise — pre-fix it does, so tolerate the
+        # raise here to expose the downstream clobber either way.
+        try:
+            store._persist_routing_data(newer, base + 1000)
+        except Exception:
+            pass
+
+        assert "k_new" in db.load_gateway_routing_entries(scope=scope), (
+            "newer snapshot's authoritative SQLite write never committed"
+        )
+
+        # An older snapshot now arrives (as an out-of-lock startup-heal persist
+        # still waiting on _persist_lock would carry), this time with a working
+        # mirror. The version guard must drop it.
+        store._save_sessions_json = real_save_json
+        store._persist_routing_data(older, base + 1)
+
+        loaded = db.load_gateway_routing_entries(scope=scope)
+        assert "k_new" in loaded, (
+            "an older snapshot clobbered SQLite routes already committed by a "
+            "newer, partially-successful persist — the JSON mirror failure left "
+            "the version guard stale"
+        )
+        assert "k_old" not in loaded, (
+            "an older snapshot overwrote newer SQLite routing state after the "
+            "newer persist's JSON mirror failed"
+        )
