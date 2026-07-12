@@ -11,6 +11,7 @@ These tests assert that contract.
 """
 
 import threading
+import time
 
 
 def _lock():
@@ -132,6 +133,60 @@ def test_reader_never_observes_writer_override():
     assert not wt.is_alive() and not rt.is_alive()
     # The reader saw the restored value, never the writer's /project/A override.
     assert observations == ["<scheduler>"]
+
+
+def test_waiting_reader_is_not_starved_by_later_writer():
+    """FIFO regression: a later writer must not cut ahead of an older reader."""
+    lock = _lock()
+    order = []
+    reader_acquired = threading.Event()
+    release_reader = threading.Event()
+    later_writer_acquired = threading.Event()
+
+    # Hold an initial writer so both subsequent waiters queue deterministically.
+    lock.acquire_write()
+
+    def reader():
+        lock.acquire_read()
+        try:
+            order.append("reader")
+            reader_acquired.set()
+            release_reader.wait(timeout=5)
+        finally:
+            lock.release_read()
+
+    def later_writer():
+        lock.acquire_write()
+        try:
+            order.append("writer")
+            later_writer_acquired.set()
+        finally:
+            lock.release_write()
+
+    rt = threading.Thread(target=reader)
+    wt = threading.Thread(target=later_writer)
+    rt.start()
+
+    deadline = time.monotonic() + 5
+    while len(lock._waiters) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(lock._waiters) == 1
+
+    wt.start()
+    deadline = time.monotonic() + 5
+    while len(lock._waiters) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(lock._waiters) == 2
+
+    lock.release_write()
+    assert reader_acquired.wait(timeout=5)
+    assert not later_writer_acquired.is_set()
+    release_reader.set()
+
+    rt.join(timeout=5)
+    wt.join(timeout=5)
+    assert not rt.is_alive() and not wt.is_alive()
+    assert order == ["reader", "writer"]
 
 
 def test_run_job_releases_cwd_lock_when_body_raises(tmp_path):

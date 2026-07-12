@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+from collections import deque
 import json
 import logging
 import os
@@ -443,7 +444,7 @@ _sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
 
 class _ReadWriteLock:
-    """Writer-preferring readers-writer lock.
+    """FIFO readers-writer lock.
 
     Guards the process-global ``os.environ["TERMINAL_CWD"]`` override that a
     workdir cron job applies for the whole of its agent run.  Workdir jobs are
@@ -454,22 +455,37 @@ class _ReadWriteLock:
     exactly what stops a workdir-less job from picking up another job's workdir
     override and running its commands in the wrong directory.
 
-    Writer preference bounds the wait for a workdir job (dispatched on the
-    single-thread sequential pool) so a stream of workdir-less readers cannot
-    starve it.
+    Waiters are admitted in arrival order, with adjacent readers batched. This
+    prevents both sides from starving: a stream of workdir-less readers cannot
+    bypass an older writer, and a stream of queued workdir writers cannot keep
+    an older reader blocked forever. The latter matters for manual
+    ``cronjob(action="run")`` calls, which otherwise leave the interactive turn
+    waiting indefinitely before the cron agent even starts.
     """
 
     def __init__(self) -> None:
         self._cond = threading.Condition(threading.Lock())
         self._readers = 0
         self._writer_active = False
-        self._writers_waiting = 0
+        self._waiters = deque()
 
     def acquire_read(self) -> None:
+        entry = ("read", object())
         with self._cond:
-            while self._writer_active or self._writers_waiting > 0:
-                self._cond.wait()
+            self._waiters.append(entry)
+            try:
+                # Only the head reader enters. It removes itself and wakes the
+                # next waiter, so a contiguous FIFO batch of readers can enter
+                # together before the next writer.
+                while self._writer_active or self._waiters[0] is not entry:
+                    self._cond.wait()
+            except BaseException:
+                self._waiters.remove(entry)
+                self._cond.notify_all()
+                raise
+            self._waiters.popleft()
             self._readers += 1
+            self._cond.notify_all()
 
     def release_read(self) -> None:
         with self._cond:
@@ -478,13 +494,21 @@ class _ReadWriteLock:
                 self._cond.notify_all()
 
     def acquire_write(self) -> None:
+        entry = ("write", object())
         with self._cond:
-            self._writers_waiting += 1
+            self._waiters.append(entry)
             try:
-                while self._writer_active or self._readers > 0:
+                while (
+                    self._writer_active
+                    or self._readers > 0
+                    or self._waiters[0] is not entry
+                ):
                     self._cond.wait()
-            finally:
-                self._writers_waiting -= 1
+            except BaseException:
+                self._waiters.remove(entry)
+                self._cond.notify_all()
+                raise
+            self._waiters.popleft()
             self._writer_active = True
 
     def release_write(self) -> None:

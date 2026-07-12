@@ -9,12 +9,21 @@ import json
 import logging
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+# Manual ``cronjob(action="run")`` executions must not hold the calling
+# conversation open for the full cron duration. Keep a small in-process
+# registry so a repeated request for the same job is rejected while its worker
+# is alive. The durable at-most-once guard remains ``fire_claim`` in the
+# cron job store; this registry is only the local execution handle.
+_manual_runs_lock = threading.Lock()
+_manual_run_threads: Dict[str, threading.Thread] = {}
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -656,6 +665,72 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"claimed": True, "success": False, "error": str(e)}
 
 
+def _dispatch_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Claim and dispatch a manual cron run without blocking the caller.
+
+    The old model-tool path called :func:`_execute_job_now` inline. A cron that
+    waited on ``TERMINAL_CWD`` or performed long agent work therefore froze the
+    interactive turn for minutes. Claim synchronously (preserving at-most-once
+    behavior), then run the shared scheduler body on a worker thread so the
+    tool can return a pending handle immediately. The worker is intentionally
+    non-daemon so a short-lived CLI process still honors the execution guarantee
+    from #41037 instead of exiting before the cron finishes.
+    """
+    job_id = job["id"]
+
+    with _manual_runs_lock:
+        existing = _manual_run_threads.get(job_id)
+        if existing is not None and existing.is_alive():
+            return {
+                "claimed": False,
+                "dispatched": False,
+                "error": "Job already has a manual run in progress.",
+            }
+
+    if not claim_job_for_fire(job_id):
+        return {
+            "claimed": False,
+            "dispatched": False,
+            "error": "Job is already being fired by the scheduler; not run again.",
+        }
+
+    def _worker() -> None:
+        try:
+            from cron.scheduler import run_one_job
+
+            run_one_job(job)
+        except Exception as exc:
+            logger.exception("Background manual cron run %s failed: %s", job_id, exc)
+            try:
+                mark_job_run(job_id, False, str(exc))
+            except Exception:
+                pass
+        finally:
+            with _manual_runs_lock:
+                if _manual_run_threads.get(job_id) is threading.current_thread():
+                    _manual_run_threads.pop(job_id, None)
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"cron-manual-{job_id[:12]}",
+        daemon=False,
+    )
+    with _manual_runs_lock:
+        _manual_run_threads[job_id] = thread
+    try:
+        thread.start()
+    except Exception as exc:
+        with _manual_runs_lock:
+            _manual_run_threads.pop(job_id, None)
+        try:
+            mark_job_run(job_id, False, str(exc))
+        except Exception:
+            pass
+        return {"claimed": True, "dispatched": False, "error": str(exc)}
+
+    return {"claimed": True, "dispatched": True, "error": None}
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -836,21 +911,24 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
-            # Execute the job immediately rather than only scheduling it for the
-            # next scheduler tick — a manual `run` should actually run, even when
-            # no gateway/ticker is active (the #41037 case). The claim inside
-            # _execute_job_now advances next_run_at and blocks a concurrent tick
-            # from double-firing.
-            exec_result = _execute_job_now(job)
-            # Re-read so the response reflects the post-run last_run_at/last_status.
+            # Claim and dispatch immediately, but do not hold the interactive
+            # model-tool turn open while a potentially long cron executes. The
+            # worker uses the same run_one_job body as the scheduler.
+            exec_result = _dispatch_job_now(job)
             result = _format_job(get_job(job_id) or {"id": job_id})
-            result["executed"] = exec_result.get("claimed", False)
-            result["execution_success"] = exec_result.get("success", False)
+            result["dispatched"] = exec_result.get("dispatched", False)
+            result["execution_pending"] = bool(
+                exec_result.get("claimed") and exec_result.get("dispatched")
+            )
+            # Retain these compatibility fields without pretending an
+            # asynchronous run has already completed successfully.
+            result["executed"] = result["execution_pending"]
+            result["execution_success"] = None if result["execution_pending"] else False
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
-            elif exec_result.get("error"):
+            if exec_result.get("error"):
                 result["execution_error"] = exec_result["error"]
             return json.dumps({"success": True, "job": result}, indent=2)
 
