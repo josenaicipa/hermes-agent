@@ -39,6 +39,29 @@ class TestCronCommandLifecycle:
         assert "Resumed job" in out
         assert "Triggered job" in out
 
+    def test_run_dispatched_pending_is_not_reported_as_failed(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **_kwargs: {
+                "success": True,
+                "job": {
+                    "name": "manual run",
+                    "job_id": "job-run-1",
+                    "executed": True,
+                    "execution_pending": True,
+                    "execution_success": None,
+                },
+            },
+        )
+
+        rc = cron_cli._job_action("run", "job-run-1", "Triggered")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Run dispatched; completion pending." in out
+        assert "Ran now: failed." not in out
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

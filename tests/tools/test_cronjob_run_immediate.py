@@ -10,7 +10,13 @@ import threading
 import time
 from unittest.mock import patch
 
-from tools.cronjob_tools import cronjob, _dispatch_job_now, _execute_job_now
+from tools.cronjob_tools import (
+    cronjob,
+    _dispatch_job_now,
+    _execute_job_now,
+    _manual_run_threads,
+    _manual_runs_lock,
+)
 
 
 _JOB = {
@@ -42,8 +48,10 @@ class TestCronjobRunExecutesImmediately:
         started = threading.Event()
         release = threading.Event()
         done = threading.Event()
+        worker_daemon = []
 
         def _run(_job):
+            worker_daemon.append(threading.current_thread().daemon)
             started.set()
             try:
                 release.wait(timeout=5)
@@ -61,7 +69,16 @@ class TestCronjobRunExecutesImmediately:
             assert started.wait(timeout=5)
             release.set()
             assert done.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with _manual_runs_lock:
+                    if "job-run-1" not in _manual_run_threads:
+                        break
+                time.sleep(0.01)
+            with _manual_runs_lock:
+                assert "job-run-1" not in _manual_run_threads
 
+        assert worker_daemon == [False]
         m_claim.assert_called_once_with("job-run-1")
         m_run.assert_called_once()
 
@@ -75,6 +92,21 @@ class TestCronjobRunExecutesImmediately:
         assert result["claimed"] is False
         assert result["dispatched"] is False
         m_run.assert_not_called()
+
+    def test_dispatch_marks_failure_when_thread_cannot_start(self):
+        """A start failure clears the local handle and durable fire claim."""
+        job = dict(_JOB, id="job-run-start-failure")
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("tools.cronjob_tools.threading.Thread.start", side_effect=RuntimeError("no thread")), \
+             patch("tools.cronjob_tools.mark_job_run") as m_mark:
+            result = _dispatch_job_now(job)
+
+        assert result["claimed"] is True
+        assert result["dispatched"] is False
+        assert "no thread" in result["error"]
+        m_mark.assert_called_once_with("job-run-start-failure", False, "no thread")
+        with _manual_runs_lock:
+            assert "job-run-start-failure" not in _manual_run_threads
 
     def test_run_response_reports_claim_loss(self):
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
