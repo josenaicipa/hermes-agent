@@ -8,6 +8,7 @@ them and silently route incoming messages into a closed session (#52804).
 """
 
 import json
+import threading
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -324,3 +325,303 @@ class TestEnsureLoadedCallsPrune:
         store._ensure_loaded()
 
         assert "active_key" in store._entries
+
+
+# ---------------------------------------------------------------------------
+# Concurrency barrier (G3): startup heal must run without SessionStore._lock
+# held, and the real inbound path must wait for it to reach a terminal state
+# before reading the routing index. Unlike the tests above (single-threaded,
+# calling _prune_stale_sessions_locked directly), these use real threads, a
+# real SessionDB, and threading.Event to pause/release the unlocked
+# DB-resolution boundary — proving Thread B is blocked by the new heal
+# barrier rather than by the pre-existing global lock.
+# ---------------------------------------------------------------------------
+
+class TestStartupHealBarrier:
+    KEY = "agent:main:telegram:dm:919191"
+    SOURCE = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="919191",
+        chat_type="dm",
+        user_id="919191",
+    )
+
+    @staticmethod
+    def _make_unloaded_store(tmp_path, db) -> SessionStore:
+        """A SessionStore that has NOT loaded yet — the next _ensure_loaded()
+        / get_or_create_session() call performs the real, un-bypassed startup
+        load and becomes the startup-heal owner."""
+        config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = db
+        return store
+
+    def _seed_compression_route(self, tmp_path, db):
+        """Real SQLite compression parent -> live child, routed via a stale
+        sessions.json entry pointing at the (ended) parent."""
+        db.create_session("sid_parent", source="telegram")
+        db.end_session("sid_parent", "compression")
+        db.create_session("sid_child", source="telegram", parent_session_id="sid_parent")
+
+        entry = _make_entry(self.KEY, "sid_parent")
+        entry.origin = self.SOURCE
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({self.KEY: entry.to_dict()}, indent=2), encoding="utf-8"
+        )
+
+    def _seed_ended_route_without_recovery(self, tmp_path, db):
+        """Real SQLite: an agent_close-ended session with no lineage child and
+        no recoverable gateway peer.
+
+        Unlike the compression fixture above, nothing about this route is
+        compression-specific, so get_or_create_session's separate per-request
+        compression-tip healer (_heal_compression_tip_locked) is a structural
+        no-op here (get_compression_tip finds no child and returns the same
+        id). That isolates the startup-heal failure path under test from
+        that other, pre-existing healing mechanism.
+        """
+        db.create_session("sid_ended", source="telegram")
+        db.end_session("sid_ended", "agent_close")
+
+        entry = _make_entry(self.KEY, "sid_ended")
+        entry.origin = self.SOURCE
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({self.KEY: entry.to_dict()}, indent=2), encoding="utf-8"
+        )
+
+    def test_startup_heal_db_phase_runs_without_routing_lock(self, tmp_path):
+        """The first startup-heal DB lookup must run with SessionStore._lock
+        free — proving the heal's DB-resolution phase is not nested inside
+        the routing lock (d7c62193b holds it there via
+        _ensure_loaded_locked -> _prune_stale_sessions_locked)."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        real_get_session = db.get_session
+        lock_was_free: list = []
+
+        def instrumented_get_session(session_id):
+            acquired = store._lock.acquire(blocking=False)
+            lock_was_free.append(acquired)
+            if acquired:
+                store._lock.release()
+            return real_get_session(session_id)
+
+        db.get_session = instrumented_get_session
+
+        store._ensure_loaded()
+
+        assert lock_was_free, "startup-heal DB lookup was never invoked"
+        assert all(lock_was_free), (
+            "SessionStore._lock must be free during every startup-heal DB "
+            "lookup, not just serialized behind it"
+        )
+
+    def test_inbound_waits_for_terminal_startup_heal(self, tmp_path):
+        """Thread B (the real get_or_create_session inbound path) must block
+        until Thread A's startup heal reaches a terminal state, then resolve
+        the compression continuation child rather than the stale parent."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        reached_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+        original_resolve = store._resolve_stale_sessions
+
+        def paused_resolve(items):
+            actions = original_resolve(items)
+            reached_snapshot.set()
+            assert release_snapshot.wait(timeout=5), "test never released thread A"
+            return actions
+
+        store._resolve_stale_sessions = paused_resolve
+
+        b_entered_wait = threading.Event()
+        original_wait = store._wait_for_startup_heal_locked
+
+        def instrumented_wait():
+            b_entered_wait.set()
+            return original_wait()
+
+        store._wait_for_startup_heal_locked = instrumented_wait
+
+        thread_a = threading.Thread(target=store._ensure_loaded)
+        result: dict = {}
+
+        def run_b():
+            result["entry"] = store.get_or_create_session(self.SOURCE)
+
+        thread_b = threading.Thread(target=run_b)
+
+        thread_a.start()
+        assert reached_snapshot.wait(timeout=5), (
+            "thread A never reached the unlocked DB-resolution snapshot"
+        )
+
+        thread_b.start()
+        assert b_entered_wait.wait(timeout=5), (
+            "thread B never reached the startup-heal barrier"
+        )
+        thread_b.join(timeout=0.2)
+        assert thread_b.is_alive(), (
+            "inbound get_or_create_session must wait for terminal startup heal, "
+            "not read/replace the unhealed parent entry"
+        )
+        assert "entry" not in result
+
+        release_snapshot.set()
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+        assert not thread_a.is_alive(), "thread A (heal owner) never terminated"
+        assert not thread_b.is_alive(), "thread B (inbound waiter) never terminated"
+        assert result["entry"].session_id == "sid_child"
+
+    def test_startup_heal_failure_releases_inbound_waiter(self, tmp_path):
+        """A DB-resolution exception during startup heal must still release
+        Thread B (conservatively — no pruning applied) rather than hanging."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_ended_route_without_recovery(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        resolve_started = threading.Event()
+        release_failure = threading.Event()
+
+        def failing_get_session(session_id):
+            resolve_started.set()
+            assert release_failure.wait(timeout=5), "test never released the DB failure"
+            raise RuntimeError("simulated DB-resolution failure")
+
+        db.get_session = failing_get_session
+
+        b_entered_wait = threading.Event()
+        original_wait = store._wait_for_startup_heal_locked
+
+        def instrumented_wait():
+            b_entered_wait.set()
+            return original_wait()
+
+        store._wait_for_startup_heal_locked = instrumented_wait
+
+        thread_a = threading.Thread(target=store._ensure_loaded)
+        result: dict = {}
+
+        def run_b():
+            result["entry"] = store.get_or_create_session(self.SOURCE)
+
+        thread_b = threading.Thread(target=run_b)
+
+        thread_a.start()
+        assert resolve_started.wait(timeout=5), (
+            "thread A never reached the DB-resolution phase"
+        )
+
+        thread_b.start()
+        assert b_entered_wait.wait(timeout=5), (
+            "thread B never reached the startup-heal barrier"
+        )
+        thread_b.join(timeout=0.2)
+        assert thread_b.is_alive(), (
+            "inbound waiter must block until heal reaches a terminal state, "
+            "even on the failure path"
+        )
+
+        release_failure.set()
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+        assert not thread_a.is_alive(), "thread A never terminated after the DB failure"
+        assert not thread_b.is_alive(), "thread B never released after the DB failure"
+
+        # Conservative fallback: heal applied no changes on error, so B
+        # resolves the original (unhealed) route rather than hanging or
+        # silently losing the session.
+        assert result["entry"].session_id == "sid_ended"
+
+    def test_ensure_loaded_does_not_wait_for_in_progress_heal(self, tmp_path):
+        """A direct, non-inbound _ensure_loaded() call must not be stranded
+        behind an in-flight heal, and must never observe a half-applied
+        (partially pruned/repointed) routing index."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        reached_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+        original_resolve = store._resolve_stale_sessions
+
+        def paused_resolve(items):
+            actions = original_resolve(items)
+            reached_snapshot.set()
+            assert release_snapshot.wait(timeout=5), "test never released the owner"
+            return actions
+
+        store._resolve_stale_sessions = paused_resolve
+
+        owner = threading.Thread(target=store._ensure_loaded)
+        owner.start()
+        assert reached_snapshot.wait(timeout=5), (
+            "owner never reached the unlocked DB-resolution snapshot"
+        )
+
+        direct_caller = threading.Thread(target=store._ensure_loaded)
+        direct_caller.start()
+        direct_caller.join(timeout=1)
+        assert not direct_caller.is_alive(), (
+            "_ensure_loaded() must not block on an in-progress startup heal"
+        )
+
+        # Pre-heal snapshot observed, never a half-applied one: the
+        # compression-parent entry is still present, untouched.
+        assert store._entries[self.KEY].session_id == "sid_parent"
+
+        release_snapshot.set()
+        owner.join(timeout=5)
+        assert not owner.is_alive()
+        assert store._entries[self.KEY].session_id == "sid_child"
+
+    def test_has_any_sessions_db_error_fallback_does_not_wait_for_in_progress_heal(
+        self, tmp_path
+    ):
+        """has_any_sessions()'s DB-error fallback must not be stranded behind
+        an in-flight heal either."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        reached_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+        original_resolve = store._resolve_stale_sessions
+
+        def paused_resolve(items):
+            actions = original_resolve(items)
+            reached_snapshot.set()
+            assert release_snapshot.wait(timeout=5), "test never released the owner"
+            return actions
+
+        store._resolve_stale_sessions = paused_resolve
+
+        owner = threading.Thread(target=store._ensure_loaded)
+        owner.start()
+        assert reached_snapshot.wait(timeout=5), (
+            "owner never reached the unlocked DB-resolution snapshot"
+        )
+
+        with patch.object(db, "session_count", side_effect=Exception("db unavailable")):
+            result: dict = {}
+
+            def call_has_any():
+                result["value"] = store.has_any_sessions()
+
+            fallback_thread = threading.Thread(target=call_has_any)
+            fallback_thread.start()
+            fallback_thread.join(timeout=1)
+            assert not fallback_thread.is_alive(), (
+                "has_any_sessions() DB-error fallback must not block on an "
+                "in-progress startup heal"
+            )
+            assert result["value"] is False  # one pre-heal entry: len == 1, not > 1
+
+        release_snapshot.set()
+        owner.join(timeout=5)
+        assert not owner.is_alive()
