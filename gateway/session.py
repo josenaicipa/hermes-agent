@@ -1074,6 +1074,13 @@ class SessionStore:
         # the duration of the wait — see _run_startup_heal_locked.
         self._heal_state = self._HEAL_PENDING
         self._heal_cond = threading.Condition(self._lock)
+        # Startup-load barrier (G3): the initial state.db routing read used to
+        # run inline under _lock. It now runs with _lock released while a single
+        # owner thread loads; concurrent callers wait on _load_cond (which
+        # shares _lock's underlying lock, so waiting releases _lock) until the
+        # owner finishes — see _ensure_loaded_locked.
+        self._loading = False
+        self._load_cond = threading.Condition(self._lock)
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -1141,11 +1148,68 @@ class SessionStore:
         if getattr(self, "_heal_cond", None) is None:
             self._heal_state = self._HEAL_PENDING
             self._heal_cond = threading.Condition(self._lock)
-
+        if getattr(self, "_load_cond", None) is None:
+            self._loading = False
+            self._load_cond = threading.Condition(self._lock)
         if self._loaded:
             return
 
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # Startup-load barrier (G3): the state.db routing read below is SQLite
+        # I/O and must not run under _lock. A single owner thread performs it
+        # with _lock released; any other caller that arrives mid-load waits on
+        # _load_cond (which releases _lock while waiting) until _loaded is set,
+        # then returns — never holding _lock across the read, and never
+        # double-loading (one-owner, mirroring the startup-heal owner below).
+        if self._loading:
+            while self._loading and not self._loaded:
+                self._load_cond.wait()
+            return
+
+        self._loading = True
+        try:
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            # Read state.db + sessions.json with _lock RELEASED — pure I/O into
+            # a local dict, no shared-state mutation. Concurrent callers are
+            # parked on _load_cond above, so _entries cannot be mutated here.
+            self._lock.release()
+            try:
+                loaded_entries = self._load_routing_entries_from_disk()
+            finally:
+                self._lock.acquire()
+            # Populate under _lock. setdefault preserves any entry a direct
+            # caller may have created (defensive: the load barrier already keeps
+            # other _ensure_loaded_locked callers parked), and keeps the DB-wins
+            # ordering resolved inside the helper.
+            for key, entry in loaded_entries.items():
+                self._entries.setdefault(key, entry)
+            self._loaded = True
+        finally:
+            self._loading = False
+            self._load_cond.notify_all()
+
+        # Heal any sessions.json entries that point to sessions already ended
+        # in state.db. A hard gateway crash (exit code 1) skips the graceful
+        # shutdown path, so sessions.json is never cleared and is left pointing
+        # at ended sessions. On the next startup those stale entries act as live
+        # routing keys. get_or_create_session() only consulted end_reason at
+        # startup (here) until #54878 added a routing-time guard for the
+        # live-gateway case; this startup heal still self-heals crash-left
+        # entries before the first message arrives. The DB lookups this
+        # requires run without _lock held — see _run_startup_heal_locked.
+        self._run_startup_heal_locked()
+
+    def _load_routing_entries_from_disk(self) -> Dict[str, "SessionEntry"]:
+        """Read the routing index from state.db + sessions.json (no _lock).
+
+        Pure I/O: returns a fresh ``{session_key: SessionEntry}`` dict and never
+        touches ``self._entries`` or any shared mutable state, so it is safe to
+        call with ``self._lock`` released (see ``_ensure_loaded_locked``'s
+        startup-load barrier). Read order (#9006 follow-up): the
+        ``gateway_routing`` table in state.db is primary; sessions.json is the
+        legacy import path whose entries only fill keys the DB didn't provide.
+        Every failure is non-fatal — startup must never fail here.
+        """
+        entries: Dict[str, "SessionEntry"] = {}
 
         # Primary: state.db gateway_routing table. getattr: some tests build
         # partially-initialized stores without __init__ (same pattern as
@@ -1160,12 +1224,12 @@ class SessionStore:
                         try:
                             entry_data = json.loads(entry_json)
                             if isinstance(entry_data, dict):
-                                self._entries[key] = SessionEntry.from_dict(entry_data)
+                                entries[key] = SessionEntry.from_dict(entry_data)
                         except (ValueError, KeyError, TypeError) as e:
                             logger.warning(
                                 "Skipping invalid routing entry %r: %s", key, e
                             )
-                    db_had_entries = bool(self._entries)
+                    db_had_entries = bool(entries)
                 except Exception as e:
                     logger.warning(
                         "gateway.session: state.db routing load failed: %s", e
@@ -1186,7 +1250,7 @@ class SessionStore:
                     # entries. Skip them so they never reach SessionEntry.from_dict.
                     if key.startswith("_"):
                         continue
-                    if key in self._entries:
+                    if key in entries:
                         continue
                     # Skip non-dict entries (corrupted sessions.json, e.g. a
                     # bare bool or string where a dict is expected). Without
@@ -1201,7 +1265,7 @@ class SessionStore:
                         )
                         continue
                     try:
-                        self._entries[key] = SessionEntry.from_dict(entry_data)
+                        entries[key] = SessionEntry.from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -1214,18 +1278,7 @@ class SessionStore:
             except Exception as e:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
-        self._loaded = True
-
-        # Heal any sessions.json entries that point to sessions already ended
-        # in state.db. A hard gateway crash (exit code 1) skips the graceful
-        # shutdown path, so sessions.json is never cleared and is left pointing
-        # at ended sessions. On the next startup those stale entries act as live
-        # routing keys. get_or_create_session() only consulted end_reason at
-        # startup (here) until #54878 added a routing-time guard for the
-        # live-gateway case; this startup heal still self-heals crash-left
-        # entries before the first message arrives. The DB lookups this
-        # requires run without _lock held — see _run_startup_heal_locked.
-        self._run_startup_heal_locked()
+        return entries
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove sessions.json entries whose session has ended in state.db.
@@ -1353,6 +1406,22 @@ class SessionStore:
         )
 
     def _apply_stale_session_actions(self, actions: List[_StaleSessionAction]) -> None:
+        """Apply a resolved stale-session plan and persist it synchronously.
+
+        Direct-call entry point (``_prune_stale_sessions_locked``): must be
+        called with ``self._lock`` held, applies the mutations and — like
+        before — persists them before returning, so existing callers keep their
+        synchronous semantics (and its ``_save`` contract). The startup-heal
+        owner instead calls ``_apply_stale_session_actions_locked`` directly and
+        persists a snapshot with ``self._lock`` released (see
+        ``_run_startup_heal_locked``).
+        """
+        if self._apply_stale_session_actions_locked(actions):
+            self._save()
+
+    def _apply_stale_session_actions_locked(
+        self, actions: List[_StaleSessionAction]
+    ) -> bool:
         """Apply a resolved stale-session plan to ``self._entries``.
 
         Must be called with ``self._lock`` held. Each action is
@@ -1362,6 +1431,12 @@ class SessionStore:
         skipped rather than clobbered — the same protection
         ``_heal_compression_tip_locked`` uses for per-request compression-tip
         healing.
+
+        Does NOT perform I/O. Returns ``True`` iff at least one action changed
+        the index; the caller persists (``_save`` under the lock for the direct
+        path, or a ``_snapshot_routing_locked`` + out-of-lock
+        ``_persist_routing_data`` for
+        the startup-heal owner).
         """
         changed = False
         for action in actions:
@@ -1394,8 +1469,7 @@ class SessionStore:
                 self._entries[action.key] = action.new_entry
                 changed = True
 
-        if changed:
-            self._save()
+        return changed
 
     def _run_startup_heal_locked(self) -> None:
         """Owner-only startup heal: resolve stale/compression routes without
@@ -1407,13 +1481,18 @@ class SessionStore:
         and always returns with ``self._lock`` held, preserving
         ``_ensure_loaded_locked``'s existing contract. The outer ``finally``
         guarantees the terminal state is reached and waiters are notified no
-        matter what happens in between — including a failure inside
-        ``_apply_stale_session_actions`` itself (e.g. ``_save()`` re-raising
-        on a disk I/O error) — so a waiter blocked in
+        matter what happens in between — including a failure inside the apply
+        or the out-of-lock persist — so a waiter blocked in
         ``_wait_for_startup_heal_locked`` can never hang forever. Only the
         real inbound path (``get_or_create_session``) calls that wait; other
         direct ``_ensure_loaded_locked`` callers never wait on this and so
         are never stranded by an in-progress heal either.
+
+        Both SQLite phases run with ``self._lock`` RELEASED: the DB-resolution
+        reads and the persist write. Only the in-memory apply (CAS-guarded) and
+        the atomic snapshot capture run under the lock; the snapshot's version
+        lets ``_persist_routing_data`` drop the write if a concurrent route save
+        superseded it while the lock was released.
         """
         self._heal_state = self._HEAL_RUNNING
         items = list(self._entries.items())
@@ -1431,13 +1510,31 @@ class SessionStore:
             finally:
                 self._lock.acquire()
 
+            snapshot = None
             try:
-                self._apply_stale_session_actions(actions)
+                if self._apply_stale_session_actions_locked(actions):
+                    # Capture the versioned snapshot atomically under _lock…
+                    snapshot = self._snapshot_routing_locked()
             except Exception:
                 logger.warning(
                     "gateway.session: startup-heal apply failed unexpectedly",
                     exc_info=True,
                 )
+
+            # …then write it with _lock RELEASED — the SQLite/file write must
+            # not run under the routing lock. _persist_routing_data's generation guard
+            # keeps this snapshot from clobbering a concurrent route save.
+            if snapshot is not None:
+                self._lock.release()
+                try:
+                    self._persist_routing_data(*snapshot)
+                except Exception:
+                    logger.warning(
+                        "gateway.session: startup-heal persist failed unexpectedly",
+                        exc_info=True,
+                    )
+                finally:
+                    self._lock.acquire()
         finally:
             self._heal_state = self._HEAL_TERMINAL
             self._heal_cond.notify_all()

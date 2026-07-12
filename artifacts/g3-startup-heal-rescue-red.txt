@@ -1,0 +1,207 @@
+=== G3 STARTUP-HEAL RESCUE — RED (pre-fix) ===
+Commit (pre-change) HEAD: 8b55da32d484ba33b32309f86b1d160312a85006
+Date: 2026-07-12T15:07:08Z
+Command: python -m pytest tests/gateway/test_session_store_g3_lock_free.py -v
+===========================================================================
+
+============================= test session starts ==============================
+platform linux -- Python 3.13.13, pytest-9.0.2, pluggy-1.6.0 -- /home/jose-naicipa/.hermes/hermes-agent-vpsclone-0cb6a295/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/jose-naicipa/.hermes/worktrees/hermes-vpsclone-g3-startup-heal-sonnet
+configfile: pyproject.toml
+plugins: asyncio-1.3.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 5 items
+
+tests/gateway/test_session_store_g3_lock_free.py::TestInitialLoadLockFree::test_initial_load_runs_without_routing_lock FAILED [ 20%]
+tests/gateway/test_session_store_g3_lock_free.py::TestStartupHealPersistLockFree::test_startup_heal_persist_runs_without_routing_lock FAILED [ 40%]
+tests/gateway/test_session_store_g3_lock_free.py::TestInboundEndedLookupLockFree::test_inbound_ended_session_lookup_runs_without_routing_lock FAILED [ 60%]
+tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotVersionGuard::test_stale_version_snapshot_is_dropped FAILED [ 80%]
+tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotVersionGuard::test_heal_persist_does_not_clobber_concurrent_route FAILED [100%]
+
+=================================== FAILURES ===================================
+_____ TestInitialLoadLockFree.test_initial_load_runs_without_routing_lock ______
+
+self = <tests.gateway.test_session_store_g3_lock_free.TestInitialLoadLockFree object at 0x73dfc5468b90>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-803/test_initial_load_runs_without0')
+
+    def test_initial_load_runs_without_routing_lock(self, tmp_path):
+        """``load_gateway_routing_entries`` (the first startup DB read) must run
+        with ``SessionStore._lock`` free."""
+        db = SessionDB(tmp_path / "state.db")
+        store = _make_unloaded_store(tmp_path, db)
+
+        # Seed one live routing entry so the loader returns real data.
+        entry = _make_entry(KEY, "sid_live")
+        db.replace_gateway_routing_entries(
+            {KEY: json.dumps(entry.to_dict())}, scope=store._routing_scope()
+        )
+
+        real_loader = db.load_gateway_routing_entries
+        lock_free: list = []
+
+        def instrumented_loader(*, scope=""):
+            _probe_lock_free(store, lock_free)
+            return real_loader(scope=scope)
+
+        db.load_gateway_routing_entries = instrumented_loader
+
+        store._ensure_loaded()
+
+        assert lock_free, "initial load_gateway_routing_entries was never invoked"
+>       assert all(lock_free), (
+            "SessionStore._lock must be free during every "
+            "load_gateway_routing_entries call, not serialized behind it"
+        )
+E       AssertionError: SessionStore._lock must be free during every load_gateway_routing_entries call, not serialized behind it
+E       assert False
+E        +  where False = all([False])
+
+tests/gateway/test_session_store_g3_lock_free.py:108: AssertionError
+_ TestStartupHealPersistLockFree.test_startup_heal_persist_runs_without_routing_lock _
+
+self = <tests.gateway.test_session_store_g3_lock_free.TestStartupHealPersistLockFree object at 0x73dfc5469090>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-803/test_startup_heal_persist_runs0')
+
+    def test_startup_heal_persist_runs_without_routing_lock(self, tmp_path):
+        """The startup-heal persist (``_save`` ->
+        ``replace_gateway_routing_entries``) must run with ``_lock`` free."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = _make_unloaded_store(tmp_path, db)
+
+        real_replace = db.replace_gateway_routing_entries
+        lock_free: list = []
+
+        def instrumented_replace(entries, *, scope=""):
+            _probe_lock_free(store, lock_free)
+            return real_replace(entries, scope=scope)
+
+        db.replace_gateway_routing_entries = instrumented_replace
+
+        store._ensure_loaded()
+
+        assert lock_free, "startup-heal persistence never wrote to state.db"
+>       assert all(lock_free), (
+            "SessionStore._lock must be free during the startup-heal "
+            "replace_gateway_routing_entries persist"
+        )
+E       AssertionError: SessionStore._lock must be free during the startup-heal replace_gateway_routing_entries persist
+E       assert False
+E        +  where False = all([False])
+
+tests/gateway/test_session_store_g3_lock_free.py:155: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  gateway.session:session.py:1287 gateway.session: repointing stale sessions.json entry 'agent:main:telegram:dm:919191' from compression parent sid_parent to lineage tip sid_child
+_ TestInboundEndedLookupLockFree.test_inbound_ended_session_lookup_runs_without_routing_lock _
+
+self = <tests.gateway.test_session_store_g3_lock_free.TestInboundEndedLookupLockFree object at 0x73dfc54691d0>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-803/test_inbound_ended_session_loo0')
+
+    def test_inbound_ended_session_lookup_runs_without_routing_lock(self, tmp_path):
+        """``get_or_create_session``'s ``_is_session_ended_in_db`` DB lookup must
+        run with ``_lock`` free."""
+        db = SessionDB(tmp_path / "state.db")
+
+        # A live session, routed live in sessions.json. It survives startup heal.
+        db.create_session("sid_live", source="telegram")
+        entry = _make_entry(KEY, "sid_live")
+        entry.origin = SOURCE
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({KEY: entry.to_dict()}, indent=2), encoding="utf-8"
+        )
+
+        store = _make_unloaded_store(tmp_path, db)
+        store._ensure_loaded()  # load + heal; the live entry survives
+        assert store._entries[KEY].session_id == "sid_live"
+
+        # The session now ends in the DB while the gateway stays alive (#54878).
+        db.end_session("sid_live", "agent_close")
+
+        real_get_session = db.get_session
+        observed: list = []  # (session_id, lock_was_free)
+
+        def instrumented_get_session(session_id):
+            acquired = store._lock.acquire(blocking=False)
+            observed.append((session_id, acquired))
+            if acquired:
+                store._lock.release()
+            return real_get_session(session_id)
+
+        db.get_session = instrumented_get_session
+
+        store.get_or_create_session(SOURCE)
+
+        ended_checks = [free for (sid, free) in observed if sid == "sid_live"]
+        assert ended_checks, (
+            "inbound ended-session DB lookup (_is_session_ended_in_db) was "
+            "never invoked"
+        )
+>       assert all(ended_checks), (
+            "SessionStore._lock must be free during the inbound "
+            "ended-session DB lookup, not held around get_session"
+        )
+E       AssertionError: SessionStore._lock must be free during the inbound ended-session DB lookup, not held around get_session
+E       assert False
+E        +  where False = all([False])
+
+tests/gateway/test_session_store_g3_lock_free.py:207: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  gateway.session:session.py:1937 gateway.session: routing key 'agent:main:telegram:dm:919191' -> sid_live is ended in state.db but still live in sessions.json; dropping stale entry and recovering/recreating the session (#54878)
+____ TestPersistSnapshotVersionGuard.test_stale_version_snapshot_is_dropped ____
+
+self = <tests.gateway.test_session_store_g3_lock_free.TestPersistSnapshotVersionGuard object at 0x73dfc5468f50>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-803/test_stale_version_snapshot_is0')
+
+    def test_stale_version_snapshot_is_dropped(self, tmp_path):
+        """A snapshot with a version older than the last persisted one must be
+        dropped rather than overwriting the newer routing state."""
+        db = SessionDB(tmp_path / "state.db")
+        store = _make_unloaded_store(tmp_path, db)
+        store._ensure_loaded()
+        scope = store._routing_scope()
+
+        newer = {"k_new": _make_entry("k_new", "sid_new").to_dict()}
+        older = {"k_old": _make_entry("k_old", "sid_old").to_dict()}
+
+        # Persist the newer snapshot first, then a stale (lower-version) one.
+>       store._persist_snapshot(10_000, newer)
+        ^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'SessionStore' object has no attribute '_persist_snapshot'
+
+tests/gateway/test_session_store_g3_lock_free.py:231: AttributeError
+_ TestPersistSnapshotVersionGuard.test_heal_persist_does_not_clobber_concurrent_route _
+
+self = <tests.gateway.test_session_store_g3_lock_free.TestPersistSnapshotVersionGuard object at 0x73dfc5468e10>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-803/test_heal_persist_does_not_clo0')
+
+    def test_heal_persist_does_not_clobber_concurrent_route(self, tmp_path):
+        """While the startup heal is persisting its snapshot OUTSIDE ``_lock``, a
+        concurrent direct-caller route mutation + save must not be clobbered by
+        the heal's (older) snapshot write."""
+        db = SessionDB(tmp_path / "state.db")
+        # Compression route so the heal makes a change and therefore persists.
+        db.create_session("sid_parent", source="telegram")
+        db.end_session("sid_parent", "compression")
+        db.create_session("sid_child", source="telegram", parent_session_id="sid_parent")
+        entry = _make_entry(KEY, "sid_parent")
+        entry.origin = SOURCE
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({KEY: entry.to_dict()}, indent=2), encoding="utf-8"
+        )
+
+        store = _make_unloaded_store(tmp_path, db)
+        scope = store._routing_scope()
+
+>       real_persist = store._persist_snapshot
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'SessionStore' object has no attribute '_persist_snapshot'
+
+tests/gateway/test_session_store_g3_lock_free.py:258: AttributeError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_session_store_g3_lock_free.py::TestInitialLoadLockFree::test_initial_load_runs_without_routing_lock
+FAILED tests/gateway/test_session_store_g3_lock_free.py::TestStartupHealPersistLockFree::test_startup_heal_persist_runs_without_routing_lock
+FAILED tests/gateway/test_session_store_g3_lock_free.py::TestInboundEndedLookupLockFree::test_inbound_ended_session_lookup_runs_without_routing_lock
+FAILED tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotVersionGuard::test_stale_version_snapshot_is_dropped
+FAILED tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotVersionGuard::test_heal_persist_does_not_clobber_concurrent_route
+============================== 5 failed in 0.11s ===============================
