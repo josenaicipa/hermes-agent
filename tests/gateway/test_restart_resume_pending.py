@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import gateway.run as gateway_run
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
@@ -469,7 +470,7 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
         assert "NEW message" in result
-        assert "Do NOT re-execute" in result
+        assert "do NOT re-execute or verify it" in result
         assert "what happened?" in result
 
     def test_resume_pending_shutdown_note_mentions_shutdown(self):
@@ -483,13 +484,17 @@ class TestResumePendingSystemNote:
         )
         assert "gateway shutdown" in result
 
-    def test_empty_message_interactive_note_asks_what_next(self):
-        """Interactive platforms: the startup auto-resume turn reports the
-        restore and asks the (present) human what to do next."""
+    def test_empty_message_interactive_note_continues_interrupted_work(self):
+        """Interactive platforms: the synthetic empty auto-resume turn must
+        continue unfinished work rather than ask what to do next.
+
+        Local resume-continuity intent: asking "what next?" defeats the
+        purpose of scheduling an empty recovery turn on startup.
+        """
         note = build_resume_recovery_note("restart_timeout", "", interactive=True)
-        assert "session was restored" in note
-        assert "ask what they would like to do next" in note
-        assert "skip any unfinished work" in note
+        assert "automatically continue the unfinished user goal" in note
+        assert "ask what they would like to do next" not in note
+        assert "session was restored" not in note
 
     def test_empty_message_noninteractive_note_continues_task(self):
         """Non-interactive platforms (webhook, API server): nobody can answer
@@ -791,10 +796,9 @@ class TestResumePendingSystemNote:
         assert "already" in result and "do NOT re-execute or verify" in result
         assert "restarted!" in result
 
-    def test_resume_pending_empty_message_reports_recovery(self):
-        """On the empty-message auto-resume startup turn there is no NEW user
-        message, so the note instructs the model to report recovery and ask
-        for instructions rather than 'address the user's NEW message'.
+    def test_resume_pending_empty_message_continues_unfinished_goal(self):
+        """The startup auto-resume turn must continue the interrupted goal
+        after inspecting durable state, without inventing a NEW user message.
         """
         entry = self._pending_entry(reason="restart_timeout")
         result = _simulate_note_injection(
@@ -806,13 +810,31 @@ class TestResumePendingSystemNote:
         )
         assert "[System note:" in result
         assert "gateway restart" in result
-        assert "restored successfully" in result
-        assert "ask what they would like to do next" in result
-        assert "do NOT re-execute or verify" in result
-        # No phantom "NEW message" instruction when there is no new message.
+        assert "automatically continue" in result
+        assert "unfinished user goal" in result
+        assert "inspect current durable state" in result
+        assert "Do not ask what to do next" in result
         assert "NEW message" not in result
         # Nothing appended after the closing bracket (no empty user text).
         assert result.rstrip().endswith("]")
+
+
+def test_empty_startup_resume_guidance_continues_unfinished_goal_safely():
+    guidance = gateway_run._restart_resume_guidance(has_new_message=False)
+
+    assert "automatically continue" in guidance
+    assert "unfinished user goal" in guidance
+    assert "inspect current durable state" in guidance
+    assert "Do not ask what to do next" in guidance
+    assert "blindly repeat" in guidance
+
+
+def test_real_new_message_wins_over_interrupted_goal():
+    guidance = gateway_run._restart_resume_guidance(has_new_message=True)
+
+    assert "NEW message" in guidance
+    assert "takes priority" in guidance
+    assert "Do not automatically resume unrelated old work" in guidance
 
 
 # ---------------------------------------------------------------------------
@@ -1454,8 +1476,12 @@ async def test_startup_restore_gate_queues_real_inbound_messages():
 
 
 @pytest.mark.asyncio
-async def test_startup_restore_waits_for_resume_before_draining_inbound():
-    """Queued inbound turns replay only after startup resume tasks finish."""
+async def test_startup_restore_prioritizes_pending_inbound_before_auto_resume():
+    """A real message already queued at startup wins over synthetic recovery.
+
+    This prevents the recovery turn from invoking tools or external effects
+    before a cancellation/replacement message from the user is considered.
+    """
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
@@ -1476,40 +1502,34 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     )
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
-    resume_done = asyncio.Event()
     seen: list[str] = []
+    synthetic_effects = 0
 
     async def fake_handle_message(event: MessageEvent) -> None:
+        nonlocal synthetic_effects
         if event.internal:
             seen.append("resume-start")
-            task = asyncio.create_task(resume_done.wait())
-            adapter._session_tasks[pending_entry.session_key] = task
+            synthetic_effects += 1
             return
         seen.append(f"inbound:{event.text}")
+        # Mirrors BasePlatformAdapter.handle_message(): a real inbound event
+        # installs its guard synchronously before its background agent starts.
+        adapter._active_sessions[pending_entry.session_key] = asyncio.Event()
 
     adapter.handle_message = fake_handle_message
-
-    scheduled = runner._schedule_resume_pending_sessions()
-    await asyncio.sleep(0)
-
     inbound = MessageEvent(
-        text="hello",
+        text="cancel that task",
         message_type=MessageType.TEXT,
         source=source,
     )
-    assert await runner._handle_message(inbound) is None
-    assert scheduled == 1
-    assert seen == ["resume-start"]
-    assert runner._startup_restore_queue == [inbound]
+    runner._queue_startup_restore_event(inbound)
 
-    finish_task = asyncio.create_task(runner._finish_startup_restore())
-    await asyncio.sleep(0)
-    assert seen == ["resume-start"]
+    scheduled, drained_first = await runner._restore_startup_sessions()
 
-    resume_done.set()
-    await finish_task
-
-    assert seen == ["resume-start", "inbound:hello"]
+    assert drained_first == 1
+    assert scheduled == 0
+    assert seen == ["inbound:cancel that task"]
+    assert synthetic_effects == 0
     assert runner._startup_restore_queue == []
     assert runner._startup_restore_in_progress is False
 
