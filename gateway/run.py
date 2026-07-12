@@ -6901,10 +6901,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             service_arg = shlex.quote(service_name)
+            # Use ``start`` rather than ``restart`` after the old PID exits.
+            # The unit's own Restart= policy may already have started a fresh
+            # MainPID by the time this helper runs. ``restart`` would then stop
+            # that healthy replacement and can race it into an orphan/lock
+            # collision loop; ``start`` is idempotent and only acts when the
+            # unit is still down.
             shell_cmd = (
                 f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
                 f"{systemctl_scope} reset-failed {service_arg}; "
-                f"{systemctl_scope} restart {service_arg}"
+                f"{systemctl_scope} start {service_arg}"
             )
             unit_name = f"{service_name}-planned-restart-{current_pid}".replace(".", "-")
             subprocess.Popen(
