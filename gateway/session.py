@@ -1207,6 +1207,32 @@ class SessionStore:
                 # end_reason is None  -> session alive — keep
                 # end_reason not None -> session ended — prune
                 if row is not None and row.get("end_reason") is not None:
+                    # Compression lineage is authoritative even when the child
+                    # was created just before a crash and therefore never
+                    # received gateway peer metadata. Recover by parent->child
+                    # lineage before the peer-metadata fallback below.
+                    if row.get("end_reason") == "compression":
+                        canonical_id = self._compression_tip_for_session_id(
+                            entry.session_id
+                        )
+                        if canonical_id and canonical_id != entry.session_id:
+                            canonical_row = db.get_session(canonical_id)
+                            if (
+                                canonical_row is not None
+                                and canonical_row.get("end_reason") is None
+                            ):
+                                logger.warning(
+                                    "gateway.session: repointing stale sessions.json "
+                                    "entry %r from compression parent %s to lineage "
+                                    "tip %s",
+                                    key,
+                                    entry.session_id,
+                                    canonical_id,
+                                )
+                                entry.session_id = canonical_id
+                                recovered_keys += 1
+                                continue
+
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
 from gateway.session import SessionEntry, SessionSource, SessionStore
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,78 @@ class TestPruneStaleSessionsLocked:
         assert store._entries[key].session_id == "sid_child"
         db.find_latest_gateway_session_for_peer.assert_called_once()
         db.reopen_session.assert_called_once_with("sid_child")
+
+    def test_repoints_compression_parent_via_lineage_when_child_lacks_peer_metadata(self, tmp_path):
+        """A crash before gateway metadata propagation must not delete the route.
+
+        Compression creates the child row before the gateway persists that
+        child's peer metadata. If the process dies in that window, startup can
+        still recover the live child through the parent-to-child lineage.
+        """
+        key = "agent:main:discord:group:123:456"
+        db = _db_returning({
+            "sid_parent": {"end_reason": "compression", "id": "sid_parent"},
+            "sid_child": {"end_reason": None, "id": "sid_child"},
+        })
+        db.get_compression_tip.return_value = "sid_child"
+        db.find_latest_gateway_session_for_peer.return_value = None
+        store = _make_store_with_db(tmp_path, db)
+        store._entries[key] = _make_entry_with_origin(key, "sid_parent")
+
+        store._prune_stale_sessions_locked()
+
+        assert key in store._entries
+        assert store._entries[key].session_id == "sid_child"
+        db.get_compression_tip.assert_called_once_with("sid_parent")
+        db.find_latest_gateway_session_for_peer.assert_not_called()
+
+    def test_repoints_compression_parent_via_real_sqlite_lineage(self, tmp_path):
+        key = "agent:main:discord:group:123:456"
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("sid_parent", source="discord")
+        db.end_session("sid_parent", "compression")
+        db.create_session(
+            "sid_child",
+            source="discord",
+            parent_session_id="sid_parent",
+        )
+        store = _make_store_with_db(tmp_path, db)
+        store._entries[key] = _make_entry_with_origin(key, "sid_parent")
+
+        store._prune_stale_sessions_locked()
+
+        assert key in store._entries
+        assert store._entries[key].session_id == "sid_child"
+
+    def test_prunes_compression_parent_when_lineage_tip_is_ended(self, tmp_path):
+        key = "agent:main:discord:group:123:456"
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("sid_parent", source="discord")
+        db.end_session("sid_parent", "compression")
+        db.create_session(
+            "sid_child",
+            source="discord",
+            parent_session_id="sid_parent",
+        )
+        db.end_session("sid_child", "user_exit")
+        store = _make_store_with_db(tmp_path, db)
+        store._entries[key] = _make_entry_with_origin(key, "sid_parent")
+
+        store._prune_stale_sessions_locked()
+
+        assert key not in store._entries
+
+    def test_prunes_compression_parent_when_no_lineage_child_exists(self, tmp_path):
+        key = "agent:main:discord:group:123:456"
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("sid_parent", source="discord")
+        db.end_session("sid_parent", "compression")
+        store = _make_store_with_db(tmp_path, db)
+        store._entries[key] = _make_entry_with_origin(key, "sid_parent")
+
+        store._prune_stale_sessions_locked()
+
+        assert key not in store._entries
 
     def test_prunes_stale_entry_when_recovery_only_finds_same_ended_session(self, tmp_path):
         key = "agent:main:telegram:dm:5140768830"
