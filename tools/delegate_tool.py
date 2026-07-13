@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import contextvars
 import enum
 import json
 import logging
@@ -29,7 +30,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from toolsets import TOOLSETS
 
@@ -740,17 +741,27 @@ def _build_child_system_prompt(
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts.
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
+    Prefer the parent task's isolated override and runtime cwd. Process-global
+    ``TERMINAL_CWD`` is only a final fallback; consulting it first can leak one
+    cron job's checkout into another child's prompt.
     """
+    from agent.runtime_cwd import get_session_cwd
+    from tools.terminal_tool import resolve_task_overrides
+
+    task_id = getattr(parent_agent, "_current_task_id", None)
+    task_cwd = None
+    if isinstance(task_id, str) and task_id:
+        task_cwd = resolve_task_overrides(task_id).get("cwd")
     candidates = [
-        os.getenv("TERMINAL_CWD"),
+        task_cwd,
+        getattr(parent_agent, "session_cwd", None),
+        get_session_cwd(),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
         ),
         getattr(parent_agent, "terminal_cwd", None),
         getattr(parent_agent, "cwd", None),
+        os.getenv("TERMINAL_CWD"),
     ]
     for candidate in candidates:
         if not candidate:
@@ -1115,7 +1126,7 @@ def _build_child_agent(
     # spawn_requested event, and the _active_subagents registry all share
     # one key.  parent_id is non-None when THIS parent is itself a subagent
     # (nested orchestrator -> worker chain).
-    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
@@ -1361,47 +1372,56 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
-    child = AIAgent(
-        base_url=effective_base_url,
-        api_key=effective_api_key,
-        model=effective_model,
-        provider=effective_provider,
-        api_mode=effective_api_mode,
-        acp_command=effective_acp_command,
-        acp_args=effective_acp_args,
-        max_iterations=max_iterations,
+    from agent.runtime_cwd import set_session_cwd
 
-        reasoning_config=child_reasoning,
-        prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_model=parent_fallback,
-        enabled_toolsets=child_toolsets,
-        disabled_toolsets=child_disabled_toolsets,
-        quiet_mode=True,
-        ephemeral_system_prompt=child_prompt,
-        log_prefix=f"[subagent-{task_index}]",
-        platform="subagent",
-        skip_context_files=True,
-        skip_memory=True,
-        clarify_callback=None,
-        thinking_callback=child_thinking_cb,
-        session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
-        providers_allowed=child_providers_allowed,
-        providers_ignored=child_providers_ignored,
-        providers_order=child_providers_order,
-        provider_sort=child_provider_sort,
-        provider_require_parameters=child_provider_require_parameters,
-        provider_data_collection=child_provider_data_collection,
-        request_overrides=(
-            dict(override_request_overrides or {})
-            if override_provider
-            else dict(getattr(parent_agent, "request_overrides", {}) or {})
-        ),
-        openrouter_min_coding_score=child_openrouter_min_coding_score,
-        tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
-        **child_optional_kwargs,
+    child_init_context = contextvars.copy_context()
+    if workspace_hint:
+        child_init_context.run(set_session_cwd, workspace_hint)
+    child = child_init_context.run(
+        lambda: cast(Any, AIAgent)(
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
+            acp_command=effective_acp_command,
+            acp_args=effective_acp_args,
+            max_iterations=max_iterations,
+            reasoning_config=child_reasoning,
+            prefill_messages=getattr(parent_agent, "prefill_messages", None),
+            fallback_model=parent_fallback,
+            enabled_toolsets=child_toolsets,
+            disabled_toolsets=child_disabled_toolsets,
+            quiet_mode=True,
+            ephemeral_system_prompt=child_prompt,
+            log_prefix=f"[subagent-{task_index}]",
+            platform="subagent",
+            session_id=subagent_id,
+            skip_context_files=True,
+            skip_memory=True,
+            clarify_callback=None,
+            thinking_callback=child_thinking_cb,
+            session_db=getattr(parent_agent, "_session_db", None),
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            providers_allowed=child_providers_allowed,
+            providers_ignored=child_providers_ignored,
+            providers_order=child_providers_order,
+            provider_sort=child_provider_sort,
+            provider_require_parameters=child_provider_require_parameters,
+            provider_data_collection=child_provider_data_collection,
+            request_overrides=(
+                dict(override_request_overrides or {})
+                if override_provider
+                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            ),
+            openrouter_min_coding_score=child_openrouter_min_coding_score,
+            tool_progress_callback=child_progress_cb,
+            iteration_budget=None,  # fresh budget per subagent
+            **child_optional_kwargs,
+        )
     )
+    if workspace_hint:
+        setattr(child, "session_cwd", workspace_hint)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -1788,6 +1808,40 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _snapshot_child_task_environment(parent_agent, child) -> bool:
+    """Copy parent task overrides before an async dispatch can detach.
+
+    The parent cron may finish and clear its override immediately after
+    ``delegate_task`` returns. Persisting the snapshot under the child's stable
+    task id here guarantees that a queued background worker still starts in the
+    correct workspace and sandbox.
+    """
+    from tools.terminal_tool import (
+        inherit_task_env_overrides,
+        resolve_task_overrides,
+    )
+
+    parent_task_id = getattr(parent_agent, "_current_task_id", None)
+    child_task_id = getattr(child, "_subagent_id", None)
+    if not isinstance(parent_task_id, str) or not isinstance(child_task_id, str):
+        return False
+    if not resolve_task_overrides(parent_task_id):
+        return False
+
+    inherit_task_env_overrides(parent_task_id, child_task_id)
+    child_overrides = resolve_task_overrides(child_task_id)
+    if not child_overrides:
+        return False
+
+    child._task_environment_prepared = True
+    child._prepared_parent_task_id = parent_task_id
+    candidate_cwd = child_overrides.get("cwd")
+    if isinstance(candidate_cwd, str) and candidate_cwd.strip():
+        child._prepared_runtime_cwd = candidate_cwd.strip()
+        child.session_cwd = candidate_cwd.strip()
+    return True
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -1935,6 +1989,18 @@ def _run_single_child(
             }
         )
 
+    child_task_id = None
+    parent_task_id = getattr(child, "_prepared_parent_task_id", None)
+    if not isinstance(parent_task_id, str):
+        parent_task_id = None
+    _inherited_task_override = (
+        getattr(child, "_task_environment_prepared", False) is True
+    )
+    _child_future = None
+    _child_runtime_cwd = getattr(child, "_prepared_runtime_cwd", None)
+    if not isinstance(_child_runtime_cwd, str):
+        _child_runtime_cwd = None
+
     try:
         _heartbeat_thread.start()
         if child_progress_cb:
@@ -1945,22 +2011,44 @@ def _run_single_child(
 
         # File-state coordination: reuse the stable subagent_id as the child's
         # task_id so file_state writes, active-subagents registry, and TUI
-        # events all share one key.  Falls back to a fresh uuid only if the
+        # events all share one key. Falls back to a full UUID only if the
         # pre-built id is somehow missing.
         import uuid as _uuid
+        from tools.terminal_tool import (
+            inherit_task_env_overrides,
+            resolve_task_overrides,
+        )
 
-        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
-        parent_task_id = getattr(parent_agent, "_current_task_id", None)
-        # Seed the child's session-cwd record from the parent's (cwd rearch):
-        # children share the parent's container, and today they inherit the
-        # parent's live env.cwd implicitly. Seeding at spawn preserves that
-        # starting directory while keeping the child's subsequent `cd`s
-        # isolated in its own record (a child's cd no longer bleeds back into
-        # the parent once readers flip to the record store).
+        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex}"
+        if parent_task_id is None:
+            raw_parent_task_id = getattr(parent_agent, "_current_task_id", None)
+            parent_task_id = (
+                raw_parent_task_id if isinstance(raw_parent_task_id, str) else None
+            )
+
+        if not _inherited_task_override and parent_task_id:
+            # Synchronous/legacy callers may bypass delegate_task's pre-dispatch
+            # snapshot. Preserve the same inheritance contract here.
+            inherit_task_env_overrides(parent_task_id, child_task_id)
+            _inherited_task_override = bool(resolve_task_overrides(child_task_id))
+
+        if _inherited_task_override:
+            _candidate_cwd = resolve_task_overrides(child_task_id).get("cwd")
+            if isinstance(_candidate_cwd, str) and _candidate_cwd.strip():
+                _child_runtime_cwd = _candidate_cwd.strip()
+                # Codex app-server uses the agent-local cwd before consulting
+                # ContextVars; pin both surfaces to the inherited workdir.
+                setattr(child, "session_cwd", _child_runtime_cwd)
+
+        # Seed the child's session-cwd record from the inherited override or
+        # the parent's live record. Subsequent child `cd`s remain isolated.
         try:
             from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            record_session_cwd(
+                child_task_id,
+                _child_runtime_cwd or get_session_cwd(parent_task_id),
+            )
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
@@ -2008,7 +2096,17 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # Worker threads do not inherit ContextVars from cron/delegation
+        # threads. Carry the inherited cwd explicitly so runtime-level consumers
+        # (including Codex app-server) agree with the task-scoped tool overrides.
+        _child_context = contextvars.copy_context()
+        if _child_runtime_cwd:
+            from agent.runtime_cwd import set_session_cwd
+
+            _child_context.run(set_session_cwd, _child_runtime_cwd)
+        _child_future = _timeout_executor.submit(
+            _child_context.run, _run_with_thread_capture
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2390,14 +2488,37 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        # Close the child's resources only after its worker is truly done.  A
+        # Future timeout does not stop the daemon thread immediately; closing the
+        # agent or sandbox here would race any late tool call made while the
+        # worker unwinds.  The child has its own inherited sandbox, so cleanup is
+        # safe and complete once that future finishes.
+        def _close_child_and_clear_override() -> None:
+            try:
+                if child is not None and hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
+            if child_task_id:
+                from tools.terminal_tool import (
+                    cleanup_vm,
+                    clear_task_env_overrides,
+                )
+
+                # The execution/sandbox key is child_task_id. Clean it
+                # explicitly even if a legacy/test child has a different
+                # agent.session_id; cleanup_vm is idempotent when close() already
+                # reclaimed the same environment.
+                cleanup_vm(child_task_id)
+                if _inherited_task_override:
+                    clear_task_env_overrides(child_task_id)
+
+        if _child_future is not None and not _child_future.done():
+            _child_future.add_done_callback(
+                lambda _f: _close_child_and_clear_override()
+            )
+        else:
+            _close_child_and_clear_override()
 
 
 def _recover_tasks_from_json_string(
@@ -2624,6 +2745,12 @@ def delegate_task(
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    # Snapshot task-local cwd/sandbox state before background dispatch returns.
+    # The parent cron is allowed to tear down immediately after it receives the
+    # dispatch handle, so queued workers must no longer depend on parent state.
+    for _i, _task, _child in children:
+        _snapshot_child_task_environment(parent_agent, _child)
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,

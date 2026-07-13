@@ -6,8 +6,11 @@ Covers:
   - jobs.update_job: set, clear, re-validate
   - tools.cronjob_tools.cronjob: create + update JSON round-trip, schema
     includes workdir, _format_job exposes it when set
-  - scheduler.tick(): partitions workdir jobs off the thread pool, restores
-    TERMINAL_CWD in finally, honours the env override during run_job
+  - scheduler.tick(): runs workdir jobs on the shared non-blocking parallel
+    pool (no sequential partition), and run_job enables context-file discovery
+    for a workdir WITHOUT mutating the process-global TERMINAL_CWD.  The
+    concurrency + per-job cwd-isolation contract lives in
+    test_cron_workdir_concurrency.py.
 """
 
 from __future__ import annotations
@@ -193,21 +196,28 @@ class TestCronjobToolWorkdir:
 
 
 # ---------------------------------------------------------------------------
-# scheduler.tick(): workdir partition
+# scheduler.tick(): workdir jobs run on the shared parallel pool
 # ---------------------------------------------------------------------------
 
-class TestTickWorkdirPartition:
+class TestTickWorkdirParallel:
     """
-    tick() must run workdir jobs sequentially (outside the ThreadPoolExecutor)
-    because run_job mutates os.environ["TERMINAL_CWD"], which is process-global.
-    We verify the partition without booting the real scheduler by patching the
-    pieces tick() calls.
+    tick() dispatches workdir jobs to the SAME non-blocking parallel pool as
+    workdir-less jobs.  They used to be funnelled through a single-thread
+    ``cron-seq`` pool because run_job mutated the process-global
+    os.environ["TERMINAL_CWD"]; now each job isolates its own cwd (ContextVar +
+    per-task terminal env override), so a long workdir job no longer serializes
+    the rest of the schedule.
     """
 
-    def test_workdir_jobs_run_sequentially(self, tmp_path, monkeypatch):
+    def test_workdir_jobs_run_on_parallel_pool(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
-        # Two workdir jobs (both sequential) + one parallel job.
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+
+        # Two workdir jobs + one workdir-less job — all should run on the
+        # parallel pool now (no sequential partition).
         workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
         workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
         parallel_job = {"id": "c", "name": "C", "workdir": None}
@@ -215,13 +225,12 @@ class TestTickWorkdirPartition:
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, parallel_job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
-        # Record call order / thread context.
+        # Record which thread each job ran on.
         import threading
         calls: list[tuple[str, str]] = []
         order_lock = threading.Lock()
 
         def fake_run_job(job, *, defer_agent_teardown=None):
-            # Return a minimal tuple matching run_job's signature.
             with order_lock:
                 calls.append((job["id"], threading.current_thread().name))
             return True, "output", "response", None
@@ -235,21 +244,16 @@ class TestTickWorkdirPartition:
 
         n = sched.tick(verbose=False)
         assert n == 3
+        assert {c[0] for c in calls} == {"a", "b", "c"}
 
-        ids = [c[0] for c in calls]
-        # Sequential workdir jobs preserve submission order relative to each
-        # other (single-thread pool).
-        assert ids.index("a") < ids.index("b")
-
-        # Workdir jobs run on the persistent single-thread cron-seq pool —
-        # NOT the main thread — so a long workdir job never blocks the ticker.
+        # Every job — workdir or not — runs on the persistent parallel pool,
+        # off the ticker thread, so no single job can block the schedule.
         main_thread_name = threading.current_thread().name
-        for jid in ("a", "b"):
-            workdir_thread_name = next(t for j, t in calls if j == jid)
-            assert workdir_thread_name != main_thread_name
-            assert workdir_thread_name.startswith("cron-seq"), workdir_thread_name
-        par_thread_name = next(t for j, t in calls if j == "c")
-        assert par_thread_name.startswith("cron-parallel"), par_thread_name
+        for jid, tname in calls:
+            assert tname != main_thread_name, jid
+            assert tname.startswith("cron-parallel"), (jid, tname)
+
+        sched._shutdown_parallel_pool()
 
 
 # ---------------------------------------------------------------------------
@@ -258,9 +262,11 @@ class TestTickWorkdirPartition:
 
 class TestRunJobTerminalCwd:
     """
-    run_job sets TERMINAL_CWD + flips skip_context_files=False when workdir
-    is set, and restores the prior TERMINAL_CWD in finally — even on error.
-    We stub AIAgent so no real API call happens.
+    run_job flips skip_context_files=False when a workdir is set, and does NOT
+    mutate the process-global os.environ["TERMINAL_CWD"] — per-job cwd is now
+    isolated via the _SESSION_CWD ContextVar + a per-task terminal env override
+    (that contract is exercised in test_cron_workdir_concurrency.py).  We stub
+    AIAgent so no real API call happens.
     """
 
     @staticmethod
@@ -318,15 +324,14 @@ class TestRunJobTerminalCwd:
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
 
-    def test_workdir_sets_and_restores_terminal_cwd(
+    def test_workdir_enables_context_files_without_touching_terminal_cwd(
         self, tmp_path, monkeypatch
     ):
         import os
         import cron.scheduler as sched
 
-        # Make sure the test's TERMINAL_CWD starts at a known non-workdir value.
-        # Use monkeypatch.setenv so it's restored on teardown regardless of
-        # whatever other tests in this xdist worker have left behind.
+        # Pin TERMINAL_CWD to a known non-workdir value via monkeypatch so it's
+        # restored on teardown regardless of cross-test state.
         monkeypatch.setenv("TERMINAL_CWD", "/original/cwd")
 
         observed: dict = {}
@@ -342,14 +347,15 @@ class TestRunJobTerminalCwd:
         success, _output, response, error = sched.run_job(job)
         assert success is True, f"run_job failed: error={error!r} response={response!r}"
 
-        # AIAgent was built with skip_context_files=False (feature ON).
+        # AIAgent was built with skip_context_files=False (context-file
+        # discovery ON) so AGENTS.md / CLAUDE.md from the workdir are loaded.
         assert observed["skip_context_files"] is False
         assert observed["load_soul_identity"] is True
-        # TERMINAL_CWD was pointing at the job workdir while the agent ran.
-        assert observed["terminal_cwd_during_init"] == str(tmp_path.resolve())
-        assert observed["terminal_cwd_during_run"] == str(tmp_path.resolve())
-
-        # And it was restored to the original value in finally.
+        # run_job must NOT point the process-global TERMINAL_CWD at the workdir
+        # — that global mutation is exactly what forced serialization.  It
+        # stays at whatever it was before the job ran, throughout the run.
+        assert observed["terminal_cwd_during_init"] == "/original/cwd"
+        assert observed["terminal_cwd_during_run"] == "/original/cwd"
         assert os.environ["TERMINAL_CWD"] == "/original/cwd"
 
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):

@@ -283,6 +283,13 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _resolve_subdirectory_hint_working_dir() -> str:
+    """Resolve tracker root from the per-session cwd before global fallbacks."""
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    return str(resolve_agent_cwd())
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -2050,7 +2057,7 @@ def init_agent(
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=_resolve_subdirectory_hint_working_dir(),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

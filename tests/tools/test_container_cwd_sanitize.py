@@ -17,6 +17,7 @@ Both paths now share ``_is_unusable_container_cwd()``; these tests pin its
 behaviour so neither path can regress.
 """
 
+import pytest
 import tools.terminal_tool as tt
 
 
@@ -255,3 +256,182 @@ class TestFileOpsCwdSanitizedAtCallSite:
         cwd = self._run_and_capture_cwd(
             monkeypatch, "/Users/me/workspace", env_type="modal")
         assert cwd == "/workspace"
+
+
+@pytest.mark.parametrize("surface", ["terminal", "file", "execute_code"])
+def test_docker_auto_mount_uses_each_tasks_own_host_cwd(
+    monkeypatch, tmp_path, surface
+):
+    """Whichever tool creates Docker first must mount this task's workdir."""
+    import tools.code_execution_tool as cet
+    import tools.file_tools as ft
+
+    task_cwd = tmp_path / surface
+    task_cwd.mkdir()
+    decoy = tmp_path / "global-decoy"
+    decoy.mkdir(exist_ok=True)
+    task_id = f"cron-docker-{surface}"
+    captured = {}
+    config = {
+        "env_type": "docker",
+        "docker_image": "example:latest",
+        "cwd": "/workspace",
+        "host_cwd": str(decoy),
+        "docker_mount_cwd_to_workspace": True,
+        "timeout": 60,
+        "lifetime_seconds": 300,
+        "container_cpu": 1,
+        "container_memory": 5120,
+        "container_disk": 51200,
+        "container_persistent": True,
+        "docker_volumes": [],
+        "docker_env": {},
+        "docker_extra_args": [],
+        "docker_forward_env": [],
+        "docker_run_as_host_user": False,
+        "docker_network": True,
+        "modal_mode": "auto",
+        "local_persistent": False,
+    }
+
+    class DummyEnv:
+        cwd = "/workspace"
+        env = {}
+
+        def execute(self, *_args, **_kwargs):
+            return {"output": "", "returncode": 0, "exit_code": 0}
+
+    def fake_create_environment(*, cwd, host_cwd=None, **_kwargs):
+        captured.update(cwd=cwd, host_cwd=host_cwd)
+        return DummyEnv()
+
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_create_environment", fake_create_environment)
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {"approved": True})
+    monkeypatch.setattr(tt, "_active_environments", {})
+    monkeypatch.setattr(tt, "_last_activity", {})
+    monkeypatch.setattr(tt, "_creation_locks", {})
+    monkeypatch.setattr(ft, "_file_ops_cache", {})
+    monkeypatch.setattr(ft, "_last_known_cwd", {})
+
+    tt.register_task_env_overrides(
+        task_id, {"cwd": str(task_cwd), "isolate_env": True}
+    )
+    try:
+        if surface == "terminal":
+            tt.terminal_tool(command="pwd", task_id=task_id)
+        elif surface == "file":
+            ft._get_file_ops(task_id)
+        else:
+            cet._get_or_create_env(task_id)
+        assert captured == {"cwd": "/workspace", "host_cwd": str(task_cwd)}
+    finally:
+        tt.clear_task_env_overrides(task_id)
+
+
+def test_explicit_docker_host_cwd_under_root_maps_to_workspace(monkeypatch):
+    task_id = "cron-docker-root-host"
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": True,
+    }
+    real_isdir = tt.os.path.isdir
+    monkeypatch.setattr(
+        tt.os.path,
+        "isdir",
+        lambda path: True if path == "/root/project" else real_isdir(path),
+    )
+    tt.register_task_env_overrides(
+        task_id,
+        {"cwd": "/root/project", "host_cwd": "/root/project", "isolate_env": True},
+    )
+    try:
+        assert tt.resolve_task_environment_paths(task_id, config) == (
+            "/workspace",
+            "/root/project",
+        )
+    finally:
+        tt.clear_task_env_overrides(task_id)
+
+
+def test_docker_auto_mount_file_operations_use_workspace_paths(monkeypatch, tmp_path):
+    """Relative read/write/patch targets stay inside the mounted checkout."""
+    import json
+    import posixpath
+
+    import tools.file_tools as ft
+
+    task_cwd = tmp_path / "cron-project"
+    task_cwd.mkdir()
+    decoy = tmp_path / "global-decoy"
+    decoy.mkdir()
+    task_id = "cron-docker-file-functional"
+    config = {
+        "env_type": "docker",
+        "docker_image": "example:latest",
+        "cwd": "/workspace",
+        "host_cwd": str(decoy),
+        "docker_mount_cwd_to_workspace": True,
+    }
+    calls = {}
+
+    class Result:
+        content = "hello"
+        error = None
+
+        def to_dict(self):
+            return {
+                "content": self.content,
+                "file_size": 5,
+                "total_lines": 1,
+                "truncated": False,
+            }
+
+    class FakeOps:
+        cwd = "/workspace"
+        env = None
+
+        def read_file(self, path, _offset, _limit):
+            calls["read"] = posixpath.join(self.cwd, path)
+            return Result()
+
+        def write_file(self, path, _content):
+            calls["write"] = path
+            return Result()
+
+        def patch_replace(self, path, _old, _new, _replace_all):
+            calls["patch"] = path
+            return Result()
+
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(ft, "_get_file_ops", lambda _task_id: FakeOps())
+    monkeypatch.setattr(ft, "_mark_verification_stale", lambda *a, **k: None)
+    tt.register_task_env_overrides(
+        task_id,
+        {"cwd": str(task_cwd), "host_cwd": str(task_cwd), "isolate_env": True},
+    )
+    try:
+        assert str(ft._resolve_path_for_task("src/a.py", task_id)) == "/workspace/src/a.py"
+        assert not json.loads(ft.read_file_tool("src/a.py", task_id=task_id)).get("error")
+        assert not json.loads(
+            ft.write_file_tool("src/a.py", "hello", task_id=task_id)
+        ).get("error")
+        assert not json.loads(
+            ft.patch_tool(
+                mode="replace",
+                path="src/a.py",
+                old_string="hello",
+                new_string="bye",
+                task_id=task_id,
+            )
+        ).get("error")
+        assert calls == {
+            "read": "/workspace/src/a.py",
+            "write": "/workspace/src/a.py",
+            "patch": "/workspace/src/a.py",
+        }
+    finally:
+        tt.clear_task_env_overrides(task_id)

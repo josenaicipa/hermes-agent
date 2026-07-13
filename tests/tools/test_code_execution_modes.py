@@ -210,6 +210,46 @@ class TestResolveChildCwd(unittest.TestCase):
             with patch.dict(os.environ, {"TERMINAL_CWD": td}):
                 self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), td)
 
+    def test_project_prefers_registered_task_override_cwd(self):
+        """A per-task {"cwd": ...} override (cron workdir jobs / ACP / TUI) wins
+        over TERMINAL_CWD, so the subprocess honors the caller's workdir without
+        any process-global env mutation."""
+        import tempfile
+        import tools.terminal_tool as terminal_tool
+        with tempfile.TemporaryDirectory() as override_dir:
+            with tempfile.TemporaryDirectory() as env_dir:
+                task_id = "cron_job_probe"
+                terminal_tool.register_task_env_overrides(
+                    task_id, {"cwd": override_dir, "isolate_env": True}
+                )
+                try:
+                    with patch.dict(os.environ, {"TERMINAL_CWD": env_dir}):
+                        self.assertEqual(
+                            _resolve_child_cwd("project", "/tmp/staging", task_id=task_id),
+                            override_dir,
+                        )
+                finally:
+                    terminal_tool.clear_task_env_overrides(task_id)
+
+    def test_project_task_override_ignored_without_task_id(self):
+        """No task_id -> the override channel is skipped and TERMINAL_CWD wins,
+        so non-cron callers are unaffected."""
+        import tempfile
+        import tools.terminal_tool as terminal_tool
+        with tempfile.TemporaryDirectory() as override_dir:
+            with tempfile.TemporaryDirectory() as env_dir:
+                terminal_tool.register_task_env_overrides(
+                    "some-other-task", {"cwd": override_dir}
+                )
+                try:
+                    with patch.dict(os.environ, {"TERMINAL_CWD": env_dir}):
+                        self.assertEqual(
+                            _resolve_child_cwd("project", "/tmp/staging"),
+                            env_dir,
+                        )
+                finally:
+                    terminal_tool.clear_task_env_overrides("some-other-task")
+
     def test_project_bogus_terminal_cwd_falls_back_to_getcwd(self):
         with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist/anywhere"}):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())

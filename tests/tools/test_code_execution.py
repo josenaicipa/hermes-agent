@@ -69,6 +69,59 @@ def _mock_handle_function_call(function_name, function_args, task_id=None, user_
     return json.dumps({"error": f"Unknown tool in mock: {function_name}"})
 
 
+class TestRemoteEnvironmentOverrideResolution(unittest.TestCase):
+    def test_inherited_child_cwd_survives_parent_override_cleanup(self):
+        """Remote execute_code must read the child's raw inherited override.
+
+        The child owns an isolated environment copied from the parent, so a
+        timed-out child can outlive cleanup of the parent's override safely. Its
+        copied child override must still supply the correct cwd when the remote
+        env is created.
+        """
+        from tools import terminal_tool
+        from tools.code_execution_tool import _get_or_create_env
+
+        created = {}
+        parent_id = "remote-parent"
+        child_id = "remote-child"
+
+        terminal_tool.register_task_env_overrides(
+            parent_id, {"cwd": "/projects/isolated", "isolate_env": True}
+        )
+        self.assertTrue(
+            terminal_tool.inherit_task_env_overrides(parent_id, child_id)
+        )
+        terminal_tool.clear_task_env_overrides(parent_id)
+
+        def _create_environment(**kwargs):
+            created.update(kwargs)
+            return MagicMock()
+
+        config = {
+            "env_type": "local",
+            "cwd": "/wrong/default",
+            "timeout": 30,
+            "host_cwd": None,
+            "local_persistent": False,
+        }
+        try:
+            terminal_tool._active_environments.pop(child_id, None)
+            terminal_tool._last_activity.pop(child_id, None)
+            with patch.object(terminal_tool, "_get_env_config", return_value=config), \
+                 patch.object(terminal_tool, "_create_environment", side_effect=_create_environment), \
+                 patch.object(terminal_tool, "_start_cleanup_thread"):
+                _env, env_type = _get_or_create_env(child_id)
+            self.assertEqual(env_type, "local")
+            self.assertEqual(created["task_id"], child_id)
+            self.assertEqual(created["cwd"], "/projects/isolated")
+        finally:
+            terminal_tool._active_environments.pop(child_id, None)
+            terminal_tool._last_activity.pop(child_id, None)
+            terminal_tool._creation_locks.pop(child_id, None)
+            terminal_tool.clear_task_env_overrides(child_id)
+            terminal_tool.clear_task_env_overrides(parent_id)
+
+
 class TestSandboxRequirements(unittest.TestCase):
     def test_available_on_posix(self):
         if sys.platform != "win32":

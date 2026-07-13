@@ -12,7 +12,6 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
-from collections import deque
 import json
 import logging
 import os
@@ -22,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -436,90 +436,15 @@ def _consume_interrupted_flag(job_id: str) -> bool:
         return False
 
 
-# Sequential (env-mutating) cron jobs — workdir jobs that touch
-# process-global runtime state — must run one at a time, but must NOT block the
-# ticker thread.  A persistent single-thread executor preserves ordering across
-# ticks while keeping dispatch fire-and-forget, the same as the parallel pool.
-_sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
-
-
-class _ReadWriteLock:
-    """FIFO readers-writer lock.
-
-    Guards the process-global ``os.environ["TERMINAL_CWD"]`` override that a
-    workdir cron job applies for the whole of its agent run.  Workdir jobs are
-    writers: they mutate the shared env and need exclusive access.  Workdir-less
-    jobs are readers: they only observe ``TERMINAL_CWD`` (indirectly, via the
-    terminal / file / code-exec tools), so any number of them may run
-    concurrently with each other, but none may run alongside a writer — that is
-    exactly what stops a workdir-less job from picking up another job's workdir
-    override and running its commands in the wrong directory.
-
-    Waiters are admitted in arrival order, with adjacent readers batched. This
-    prevents both sides from starving: a stream of workdir-less readers cannot
-    bypass an older writer, and a stream of queued workdir writers cannot keep
-    an older reader blocked forever. The latter matters for manual
-    ``cronjob(action="run")`` calls, which otherwise leave the interactive turn
-    waiting indefinitely before the cron agent even starts.
-    """
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
-        self._readers = 0
-        self._writer_active = False
-        self._waiters = deque()
-
-    def acquire_read(self) -> None:
-        entry = ("read", object())
-        with self._cond:
-            self._waiters.append(entry)
-            try:
-                # Only the head reader enters. It removes itself and wakes the
-                # next waiter, so a contiguous FIFO batch of readers can enter
-                # together before the next writer.
-                while self._writer_active or self._waiters[0] is not entry:
-                    self._cond.wait()
-            except BaseException:
-                self._waiters.remove(entry)
-                self._cond.notify_all()
-                raise
-            self._waiters.popleft()
-            self._readers += 1
-            self._cond.notify_all()
-
-    def release_read(self) -> None:
-        with self._cond:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    def acquire_write(self) -> None:
-        entry = ("write", object())
-        with self._cond:
-            self._waiters.append(entry)
-            try:
-                while (
-                    self._writer_active
-                    or self._readers > 0
-                    or self._waiters[0] is not entry
-                ):
-                    self._cond.wait()
-            except BaseException:
-                self._waiters.remove(entry)
-                self._cond.notify_all()
-                raise
-            self._waiters.popleft()
-            self._writer_active = True
-
-    def release_write(self) -> None:
-        with self._cond:
-            self._writer_active = False
-            self._cond.notify_all()
-
-
-# Serializes the per-job TERMINAL_CWD override against every other concurrently
-# running cron job.  See _ReadWriteLock and run_job for the usage contract.
-_terminal_cwd_lock = _ReadWriteLock()
+# NOTE: A single-thread ``cron-seq`` pool plus a process-global readers/writer
+# lock used to serialize every workdir cron job, because run_job pointed the
+# shared ``os.environ["TERMINAL_CWD"]`` at the job's workdir for its whole agent
+# run. That made one long workdir job block every other workdir cron across
+# unrelated projects (a due job could be claimed/advanced yet wait indefinitely
+# behind the global workdir queue). Per-job cwd is now isolated through the
+# ``_SESSION_CWD`` ContextVar + per-task terminal env overrides (see run_job),
+# so workdir jobs run on the same non-blocking parallel pool as everyone else
+# and no cross-job serialization is required.
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -536,33 +461,13 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
-def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
-    """Return (or create) the persistent single-thread sequential pool.
-
-    A single worker guarantees env-mutating jobs never overlap, even
-    across ticks: a job queued by a newer tick waits for the previous tick's
-    sequential jobs to finish rather than corrupting their os.environ
-    state.
-    """
-    global _sequential_pool
-    if _sequential_pool is None:
-        _sequential_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="cron-seq",
-        )
-    return _sequential_pool
-
-
 def _shutdown_parallel_pool() -> None:
-    """Shut down the persistent pools on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    """Shut down the persistent parallel pool on process exit."""
+    global _parallel_pool, _parallel_pool_max_workers
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
-    if _sequential_pool is not None:
-        _sequential_pool.shutdown(wait=True, cancel_futures=False)
-        _sequential_pool = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -2134,7 +2039,9 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str, *, workdir: Optional[str] = None
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2160,6 +2067,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        workdir: Optional subprocess cwd. Used by ``no_agent`` jobs so relative
+            paths inside the script resolve from the configured job workdir
+            without mutating the scheduler process cwd.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2218,6 +2128,13 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
 
+    script_cwd = path.parent
+    if workdir:
+        requested_cwd = Path(workdir).expanduser()
+        if not requested_cwd.is_dir():
+            return False, f"Workdir not found or not a directory: {requested_cwd}"
+        script_cwd = requested_cwd
+
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
@@ -2235,7 +2152,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=str(script_cwd),
             env=env,
             **popen_kwargs,
         )
@@ -2269,7 +2186,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
 
 def _run_job_script_with_claim_heartbeat(
-    job: dict, script_path: str
+    job: dict, script_path: str, *, workdir: Optional[str] = None
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -2291,7 +2208,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2322,10 +2239,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
 
     try:
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2386,7 +2303,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, workdir=job.get("workdir")
+            )
         if success:
             if script_output:
                 prompt = (
@@ -2727,26 +2646,12 @@ def run_job(
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
 
-        # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
-        _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
-
-        try:
-            ok, output = _run_job_script_with_claim_heartbeat(job, script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+        # Pin the subprocess directly to the configured workdir. We deliberately
+        # do NOT os.chdir the scheduler process: process cwd is process-global
+        # and would race other cron jobs now that workdir jobs run concurrently.
+        ok, output = _run_job_script_with_claim_heartbeat(
+            job, script_path, workdir=job.get("workdir")
+        )
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2931,7 +2836,10 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = (
+        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+        f"_{uuid.uuid4().hex[:8]}"
+    )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -2946,6 +2854,15 @@ def run_job(
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+
+    # Per-job workdir isolation reuses the same per-session/per-task
+    # infrastructure the gateway/ACP/TUI use, so concurrent workdir jobs never
+    # share process-global cwd state (see the workdir block below).
+    from agent.runtime_cwd import set_session_cwd
+    from tools.terminal_tool import (
+        register_task_env_overrides,
+        clear_task_env_overrides,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -2995,22 +2912,15 @@ def run_job(
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
-    # Per-job working directory.  When set (and validated at create/update
-    # time), we point TERMINAL_CWD at it so:
-    #   - build_context_files_prompt() picks up AGENTS.md / CLAUDE.md /
-    #     .cursorrules from the job's project dir, AND
-    #   - the terminal, file, and code-exec tools run commands from there.
-    #
-    # os.environ["TERMINAL_CWD"] is process-global, so this override is
-    # serialized by _terminal_cwd_lock (acquired just below): a workdir job
-    # holds it as a writer for its whole run, excluding every other job, while
-    # workdir-less jobs hold it as readers and stay parallel with each other.
-    # The sequential pool only keeps workdir jobs from overlapping EACH OTHER;
-    # the lock is what additionally keeps a concurrently-firing workdir-less
-    # parallel-pool job from observing this override and running its shell /
-    # file / code-exec commands in the wrong directory.  For workdir-less jobs
-    # we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
+    # Per-job working directory.  When set (validated at create/update time),
+    # the job runs isolated to its workdir WITHOUT any process-global mutation,
+    # so different-workdir jobs run concurrently and one long job can't block
+    # another. Isolation is applied inside the try
+    # below via set_session_cwd (the _SESSION_CWD ContextVar, for context-file
+    # discovery + the Codex runtime) and register_task_env_overrides (per-task,
+    # for the terminal / file / execute_code tools).  Workdir-less jobs keep the
+    # original behaviour: skip_context_files=True and tools use the scheduler's
+    # own cwd.
     _job_workdir = (job.get("workdir") or "").strip() or None
     if _job_workdir and not Path(_job_workdir).is_dir():
         # Directory was removed between create-time validation and now.  Log
@@ -3021,26 +2931,36 @@ def run_job(
         )
         _job_workdir = None
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    # A per-job task id (== the cron session id) keys the terminal env override
+    # AND the agent's own sandbox teardown (AIAgent.close -> cleanup_vm(
+    # session_id)), so the job's isolated env is created and reclaimed under one
+    # key regardless of when the override is cleared.
+    _job_task_id = _cron_session_id
+    _cron_future = None
 
-    _holds_cwd_write = _job_workdir is not None
-    if _holds_cwd_write:
-        _terminal_cwd_lock.acquire_write()
-    else:
-        _terminal_cwd_lock.acquire_read()
-
-    # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
+    # Everything below runs inside this try so the finally always clears the
+    # per-task cwd override (the _SESSION_CWD ContextVar is cleared by
+    # clear_session_vars).  No process-global lock is taken: per-job isolation
+    # is what keeps concurrent jobs from seeing each other's workdir.
     try:
         if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
+            # ContextVar channel: system-prompt / context-file discovery and the
+            # Codex runtime resolve cwd via resolve_context_cwd/resolve_agent_cwd,
+            # which read _SESSION_CWD first.  Isolated per job because the agent
+            # runs inside a copied context (contextvars.copy_context) below.
+            set_session_cwd(_job_workdir)
+            # Task-override channel: the terminal / file / execute_code tools
+            # resolve THIS job's workdir keyed by the run_conversation task_id.
+            # ``isolate_env`` gives the job its OWN terminal env so concurrent
+            # jobs never clobber a shared env.cwd.
+            register_task_env_overrides(
+                _job_task_id,
+                {
+                    "cwd": _job_workdir,
+                    "host_cwd": _job_workdir,
+                    "isolate_env": True,
+                },
+            )
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -3393,6 +3313,19 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Keep execution-owned resources attached to the agent so teardown can
+        # wait for a timed-out worker to finish before closing its sandbox or DB.
+        setattr(
+            agent,
+            "_cron_cleanup_task_id",
+            _job_task_id if _job_workdir else None,
+        )
+        if _session_db is not None:
+            setattr(
+                agent,
+                "_cron_session_cleanup",
+                (_session_db, _cron_session_id, job_name, job_id),
+            )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3453,7 +3386,13 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # Pass task_id so the per-task cwd override registered above actually
+        # reaches the tool calls; it matches the agent's session_id so sandbox
+        # teardown (cleanup_vm) targets the same key.
+        _cron_future = _cron_pool.submit(
+            _cron_context.run, agent.run_conversation, prompt, task_id=_job_task_id
+        )
+        setattr(agent, "_cron_worker_future", _cron_future)
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -3632,66 +3571,22 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Release the cwd lock now that the env is restored, so a waiting
-        # workdir job (or queued reader) can proceed without seeing the override.
-        if _holds_cwd_write:
-            _terminal_cwd_lock.release_write()
-        else:
-            _terminal_cwd_lock.release_read()
-        # Clean up ContextVar session/delivery state for this job.
+        # If agent construction failed, no lifecycle owner exists to reclaim
+        # resources; clean those directly.  Otherwise _teardown_cron_agent owns
+        # both sandbox and session-store cleanup, and may defer them until the
+        # worker Future has actually finished.
+        if agent is None:
+            if _job_workdir:
+                clear_task_env_overrides(_job_task_id)
+            if _session_db:
+                _finalize_cron_session(
+                    _session_db, _cron_session_id, job_name, job_id
+                )
+        # Clean up ContextVar session/delivery state for this job.  This also
+        # clears the _SESSION_CWD ContextVar via clear_session_cwd().
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
-        if _session_db:
-            # Title the cron session from the job (name -> id) and PERSIST it
-            # BEFORE end_session()/close() tear the connection down, so the
-            # close can never run over an in-flight title write (#50536). The
-            # run-time suffix keeps it unique against the sessions.title index
-            # across runs; _set_cron_session_title dedupes (#50537) and the
-            # except-fallback below guarantees a non-blank title (#50535).
-            try:
-                _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-                _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
-                if not _set_cron_session_title(_session_db, _cron_session_id, _cron_title):
-                    # Helper returned None (blank base) -> use the id fallback.
-                    _set_cron_session_title(
-                        _session_db, _cron_session_id, f"cron {job_id}"
-                    )
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug(
-                    "Job '%s': failed to set cron session title: %s", job_id, e
-                )
-                # Last-resort: never leave the session blank (#50535). Try the
-                # next free title in the lineage, then a bare id-stamped title.
-                for _fallback in (
-                    getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(
-                        f"cron {job_id}"
-                    ),
-                    f"cron {job_id} {_cron_session_id[-6:]}",
-                ):
-                    try:
-                        if _set_cron_session_title(
-                            _session_db, _cron_session_id, _fallback
-                        ):
-                            break
-                    except (Exception, KeyboardInterrupt):
-                        continue
-            try:
-                _session_db.end_session(_cron_session_id, "cron_complete")
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            try:
-                _session_db.close()
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -3707,24 +3602,90 @@ def run_job(
             _teardown_cron_agent(agent, job_id)
 
 
-def _teardown_cron_agent(agent, job_id: str) -> None:
-    """Release an ephemeral cron agent's async resources.
+def _finalize_cron_session(
+    session_db, session_id: str, job_name: str, job_id: str
+) -> None:
+    """Title, end, and close a cron session store exactly once.
 
-    Split out of ``run_job``'s ``finally`` so a caller that defers teardown
-    (to deliver first — #58720) can invoke the identical cleanup AFTER delivery.
-    Closes the agent (subprocesses, sandboxes, browser daemons, OpenAI/httpx
-    client) and reaps stale async clients whose loop has since closed. Idempotent
-    and independently guarded, matching the original inline behavior.
+    Uses the upstream ``_set_cron_session_title`` helper so title dedupe /
+    blank-title fallbacks (#50535/#50537) survive the workdir-isolation
+    teardown split.
     """
+    try:
+        _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+        _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+        if not _set_cron_session_title(session_db, session_id, _cron_title):
+            _set_cron_session_title(session_db, session_id, f"cron {job_id}")
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
+        for _fallback in (
+            getattr(session_db, "get_next_title_in_lineage", lambda b: b)(
+                f"cron {job_id}"
+            ),
+            f"cron {job_id} {session_id[-6:]}",
+        ):
+            try:
+                if _set_cron_session_title(session_db, session_id, _fallback):
+                    break
+            except (Exception, KeyboardInterrupt):
+                continue
+    try:
+        session_db.end_session(session_id, "cron_complete")
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to end session: %s", job_id, e)
+    try:
+        session_db.close()
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+
+
+def _teardown_cron_agent(agent, job_id: str) -> None:
+    """Release an ephemeral cron agent after its worker Future is idle.
+
+    A timeout only returns control to the scheduler; the worker thread may still
+    be unwinding and issuing tool calls.  Teardown is therefore scheduled on the
+    Future instead of racing ``agent.close()`` / ``cleanup_vm`` against it.
+    """
+    _worker_future = getattr(agent, "_cron_worker_future", None) if agent else None
+    if _worker_future is not None and not _worker_future.done():
+        if getattr(agent, "_cron_teardown_scheduled", False) is True:
+            return
+        setattr(agent, "_cron_teardown_scheduled", True)
+        _worker_future.add_done_callback(
+            lambda _f, _agent=agent, _job_id=job_id: _teardown_cron_agent_now(
+                _agent, _job_id
+            )
+        )
+        return
+    _teardown_cron_agent_now(agent, job_id)
+
+
+def _teardown_cron_agent_now(agent, job_id: str) -> None:
+    """Perform cron cleanup once no worker can use the owned resources."""
+    if (
+        agent is not None
+        and getattr(agent, "_cron_teardown_complete", False) is True
+    ):
+        return
+    if agent is not None:
+        setattr(agent, "_cron_teardown_complete", True)
     try:
         if agent is not None:
             agent.close()
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close agent resources: %s", job_id, e)
-    # Each cron run spins up a short-lived worker thread whose event loop
-    # dies as soon as the ``ThreadPoolExecutor`` shuts down. Any async
-    # httpx clients cached under that loop are now unusable — reap them
-    # so their transports don't accumulate in the process-global cache.
+    if agent is not None:
+        _cleanup_task_id = getattr(agent, "_cron_cleanup_task_id", None)
+        if _cleanup_task_id:
+            from tools.terminal_tool import clear_task_env_overrides
+
+            clear_task_env_overrides(_cleanup_task_id)
+        _session_cleanup = getattr(agent, "_cron_session_cleanup", None)
+        if _session_cleanup:
+            _finalize_cron_session(*_session_cleanup)
+            setattr(agent, "_cron_session_cleanup", None)
+    # Each cron run spins up a short-lived worker thread whose event loop dies
+    # when the Future exits. Reap cached clients only after that point.
     try:
         from agent.auxiliary_client import cleanup_stale_async_clients
         cleanup_stale_async_clients()
@@ -4006,15 +3967,6 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
-
         _results: list = []
         _all_futures: list = []
 
@@ -4080,30 +4032,18 @@ def tick(
                 )
                 return None
 
-        # Sequential pass for env-mutating (workdir) jobs.
-        # Queued to a persistent single-thread pool so they run one at a time
-        # WITHOUT blocking the ticker thread — a long workdir job no
-        # longer starves the rest of the schedule (same fix as the parallel
-        # pass, just serialized).  The in-flight guard prevents a still-running
-        # job from being re-queued on the next tick.
-        if sequential_jobs:
-            seq_pool = _get_sequential_pool()
-            for job in sequential_jobs:
-                fut = _submit_with_guard(job, seq_pool)
-                if fut is None:
-                    continue
-                _all_futures.append(fut)
-                if not sync:
-                    _results.append(True)  # optimistically counted
-
-        # Parallel pass — persistent pool, non-blocking dispatch.
-        # Jobs that are already running (from a previous tick) are skipped.
-        # mark_job_run() updates next_run_at on completion, so the next tick
-        # after completion finds the job due again naturally.  No catch-up
-        # queue needed.
-        if parallel_jobs:
+        # Dispatch every due job to the persistent parallel pool, non-blocking.
+        # Workdir jobs no longer need a separate serialized pool: each job now
+        # isolates its own cwd (the _SESSION_CWD ContextVar + a per-task terminal
+        # env override, applied in run_job) instead of mutating process-global
+        # state, so different-workdir jobs run concurrently and one long job can
+        # no longer starve the schedule.  Jobs already running from a previous
+        # tick are skipped by the in-flight guard; mark_job_run() updates
+        # next_run_at on completion, so the next tick finds the job due again
+        # naturally (no catch-up queue needed).
+        if due_jobs:
             pool = _get_parallel_pool(_max_workers)
-            for job in parallel_jobs:
+            for job in due_jobs:
                 fut = _submit_with_guard(job, pool)
                 if fut is None:
                     continue

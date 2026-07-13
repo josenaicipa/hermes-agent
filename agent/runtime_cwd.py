@@ -57,6 +57,11 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def get_session_cwd() -> str:
+    """Return the logical cwd pinned in this context, or an empty string."""
+    return _session_cwd_override()
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:

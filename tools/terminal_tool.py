@@ -1133,6 +1133,12 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - isolate_env: bool -- When truthy, give this task_id its OWN
+          environment instead of collapsing a CWD-only override to the shared
+          "default" env (see ``_resolve_container_task_id``).  Used by the cron
+          scheduler so concurrent per-workdir jobs don't share one live shell.
+        - inherit_env_from: str -- Internal parent container/task id whose live
+          environment this delegated child must share.
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1172,6 +1178,26 @@ def clear_task_env_overrides(task_id: str):
     clear_session_cwd(task_id)
 
 
+def inherit_task_env_overrides(parent_task_id: str, child_task_id: str) -> bool:
+    """Copy a parent's effective environment settings to a delegated child.
+
+    Already-isolated parents (cron, benchmark/image overrides) stay isolated per
+    child so timeout cleanup cannot race another worker. CWD-only ACP/TUI
+    overrides deliberately remain on the shared ``default`` environment for
+    backward compatibility.
+    Returns ``False`` when the parent has no override.
+    """
+    if not parent_task_id or not child_task_id or parent_task_id == child_task_id:
+        return False
+    parent_overrides = resolve_task_overrides(parent_task_id)
+    if not parent_overrides:
+        return False
+    inherited = dict(parent_overrides)
+    inherited.pop("inherit_env_from", None)
+    register_task_env_overrides(child_task_id, inherited)
+    return True
+
+
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     Map a tool-call ``task_id`` to the container/sandbox key used by
@@ -1202,7 +1228,22 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
+        inherited_env = overrides.get("inherit_env_from")
+        if (
+            isinstance(inherited_env, str)
+            and inherited_env
+            and inherited_env != task_id
+        ):
+            return inherited_env
         if set(overrides.keys()) & _ISOLATION_KEYS:
+            return task_id
+        # ``isolate_env`` is an explicit opt-in for a dedicated environment even
+        # for an otherwise CWD-only override.  The cron scheduler sets it so
+        # concurrent per-workdir jobs each get their OWN terminal env (keyed by
+        # their unique task_id) instead of sharing the single "default" shell
+        # and clobbering each other's live ``env.cwd`` — the cross-job cwd leak
+        # that would otherwise appear once workdir jobs run in parallel.
+        if overrides.get("isolate_env"):
             return task_id
     return "default"
 
@@ -1346,6 +1387,58 @@ def _ensure_terminal_env_bridged() -> None:
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
 
 
+def resolve_task_environment_paths(
+    task_id: Optional[str],
+    config: Dict[str, Any],
+    *,
+    fallback_cwd: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Resolve sandbox ``cwd`` and Docker ``host_cwd`` for one task.
+
+    All environment creators must use this helper so whichever surface creates
+    a Docker sandbox first mounts the task's host workdir, never the process-wide
+    scheduler cwd. Non-mounted container backends retain the existing host-path
+    sanitization behavior.
+    """
+    overrides = resolve_task_overrides(task_id)
+    override_cwd = overrides.get("cwd")
+    cwd = override_cwd or fallback_cwd or config["cwd"]
+    host_cwd = overrides.get("host_cwd") or config.get("host_cwd")
+    env_type = config["env_type"]
+
+    if env_type == "docker" and config.get("docker_mount_cwd_to_workspace"):
+        # An explicit task-scoped host cwd is authoritative even when its host
+        # path resembles a normal in-container location (for example /root).
+        # Cron registers both fields, so the bind source is unambiguous.
+        explicit_host_cwd = overrides.get("host_cwd")
+        if isinstance(explicit_host_cwd, str) and explicit_host_cwd.strip():
+            candidate = os.path.abspath(os.path.expanduser(explicit_host_cwd.strip()))
+            if os.path.isdir(candidate):
+                return "/workspace", candidate
+
+        # Without explicit host_cwd, retain the legacy heuristic: cwd values
+        # already rooted at /workspace or /root may be intentional sandbox paths.
+        if isinstance(override_cwd, str) and override_cwd.strip():
+            candidate = os.path.abspath(os.path.expanduser(override_cwd.strip()))
+            if os.path.isdir(candidate) and not candidate.startswith(
+                ("/workspace", "/root")
+            ):
+                return "/workspace", candidate
+        return cwd, host_cwd
+
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != config["cwd"]:
+            logger.info(
+                "Ignoring host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd,
+                env_type,
+                config["cwd"],
+            )
+        cwd = config["cwd"]
+    return cwd, host_cwd
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1485,7 +1578,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: Optional[str] = None):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -2183,27 +2276,9 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
+        cwd, host_cwd = resolve_task_environment_paths(task_id, config)
         default_timeout = config["timeout"]
+
         effective_timeout = timeout or default_timeout
 
         # Reject foreground commands where the model explicitly requests
@@ -2322,7 +2397,7 @@ def terminal_tool(
                             container_config=container_config,
                             local_config=local_config,
                             task_id=effective_task_id,
-                            host_cwd=config.get("host_cwd"),
+                            host_cwd=host_cwd,
                         )
                     except ImportError as e:
                         return json.dumps({
