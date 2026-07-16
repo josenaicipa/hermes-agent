@@ -195,6 +195,7 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
                 "id": str(ch.id),
                 "name": ch.name,
                 "guild": guild.name,
+                "guild_id": str(guild.id),
                 "type": "channel",
             })
         # Forum channels (type 15) — creating a message auto-spawns a thread post.
@@ -204,6 +205,7 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
                 "id": str(ch.id),
                 "name": ch.name,
                 "guild": guild.name,
+                "guild_id": str(guild.id),
                 "type": "forum",
             })
         # Also include DM-capable users we've interacted with is not
