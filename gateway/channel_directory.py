@@ -295,7 +295,10 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+        # Resolve the DB path at call time instead of relying on
+        # hermes_state.DEFAULT_DB_PATH, which is fixed at module import. Gateway
+        # profiles and tests can change HERMES_HOME between calls.
+        db = SessionDB(get_hermes_home() / "state.db")
         try:
             lister = getattr(db, "list_gateway_sessions", None)
             if not callable(lister):

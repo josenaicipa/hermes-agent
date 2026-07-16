@@ -1017,6 +1017,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
         if terminal_env is None:
             from tools.terminal_tool import (
+                get_session_cwd,
                 resolve_task_environment_paths,
                 resolve_task_overrides,
             )
@@ -1039,7 +1040,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             cwd, host_cwd = resolve_task_environment_paths(
                 raw_task_id,
                 config,
-                fallback_cwd=_last_known_cwd.get(task_id),
+                fallback_cwd=get_session_cwd(raw_task_id),
             )
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 

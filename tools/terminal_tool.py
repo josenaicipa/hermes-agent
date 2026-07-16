@@ -202,12 +202,17 @@ def set_approval_callback(cb):
 
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
+    # An explicitly supplied process/session key is authoritative. This also
+    # prevents a stale copied ContextVar from leaking one test/worker's sudo
+    # cache into another session that deliberately set a different key.
+    session_key = os.getenv("HERMES_SESSION_KEY", "")
     try:
         from gateway.session_context import get_session_env
 
-        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        if not session_key:
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
     except Exception:
-        session_key = os.getenv("HERMES_SESSION_KEY", "")
+        pass
     if session_key:
         return f"session:{session_key}"
 
