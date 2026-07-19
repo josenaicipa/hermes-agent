@@ -2211,6 +2211,14 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    def _run_script() -> tuple[bool, str]:
+        # Preserve the historical one-argument call shape when no workdir was
+        # supplied. Besides keeping existing wrappers/test doubles compatible,
+        # this avoids making ``None`` look like an explicitly selected cwd.
+        if workdir is None:
+            return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
+
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -2219,7 +2227,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_script()
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2250,10 +2258,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_script()
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_script()
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -3948,7 +3956,12 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
     Future instead of racing ``agent.close()`` / ``cleanup_vm`` against it.
     """
     _worker_future = getattr(agent, "_cron_worker_future", None) if agent else None
-    if _worker_future is not None and not _worker_future.done():
+    _future_done = getattr(_worker_future, "done", None)
+    if (
+        _worker_future is not None
+        and callable(_future_done)
+        and not _future_done()
+    ):
         if getattr(agent, "_cron_teardown_scheduled", False) is True:
             return
         setattr(agent, "_cron_teardown_scheduled", True)
@@ -3977,12 +3990,12 @@ def _teardown_cron_agent_now(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to close agent resources: %s", job_id, e)
     if agent is not None:
         _cleanup_task_id = getattr(agent, "_cron_cleanup_task_id", None)
-        if _cleanup_task_id:
+        if isinstance(_cleanup_task_id, str) and _cleanup_task_id:
             from tools.terminal_tool import clear_task_env_overrides
 
             clear_task_env_overrides(_cleanup_task_id)
         _session_cleanup = getattr(agent, "_cron_session_cleanup", None)
-        if _session_cleanup:
+        if isinstance(_session_cleanup, tuple) and len(_session_cleanup) == 4:
             _finalize_cron_session(*_session_cleanup)
             setattr(agent, "_cron_session_cleanup", None)
     # Each cron run spins up a short-lived worker thread whose event loop dies
