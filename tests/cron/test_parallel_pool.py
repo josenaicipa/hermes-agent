@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.cron.tick_claim_helpers import install_successful_tick_fire_claims
+
 
 class TestPersistentPool:
     """_get_parallel_pool returns a persistent ThreadPoolExecutor."""
@@ -84,6 +86,7 @@ class TestRunningJobGuard:
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -117,6 +120,7 @@ class TestSyncMode:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, jobs, sched=sched)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -153,6 +157,7 @@ class TestSyncMode:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -207,6 +212,7 @@ class TestWorkdirJobsOnParallelPool:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -248,6 +254,7 @@ class TestWorkdirJobsOnParallelPool:
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)

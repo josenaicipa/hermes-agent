@@ -278,7 +278,18 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    get_due_jobs,
+    get_job,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    claim_dispatch,
+    claim_job_for_fire,
+    heartbeat_run_claim,
+    heartbeat_fire_claim,
+    new_fire_claim_owner,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -2599,6 +2610,291 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+class _FireClaimLifecycleError(RuntimeError):
+    """Fire-claim lifecycle refused to continue (pre-execution or mid-run).
+
+    Dedicated lease-loss / start / ownership errors must not leak to callers of
+    ``run_one_job``: they convert to a normal failed/aborted result (False).
+    """
+
+
+class _FireClaimPreExecutionError(_FireClaimLifecycleError):
+    """Refuse to run: fire_claim ownership/preflight/start failed before side effects."""
+
+
+class _FireClaimOwnershipError(_FireClaimPreExecutionError):
+    """Durable fire_claim ownership preflight failed (lost or unavailable)."""
+
+
+class _FireClaimHeartbeatStartError(_FireClaimPreExecutionError):
+    """Fire-claim heartbeat thread could not start; refuse unprotected runs."""
+
+
+class _FireClaimOwnershipLostError(_FireClaimLifecycleError):
+    """Fire-claim ownership was lost mid-run (heartbeat or post-run checkpoint).
+
+    Cooperative boundary only: in-flight agent/tool side effects are not rolled
+    back. Enforceable gate is abort of remaining post-run delivery/mark once the
+    loss is observed (async heartbeat or synchronous exact-owner checkpoint).
+    """
+
+
+class _FireClaimGuard:
+    """Per-run lease-loss signal shared by heartbeat thread and checkpoints.
+
+    Installed in a ContextVar around the full ``run_one_job`` body so heartbeat
+    callbacks and body checkpoints see the same guard. On False or exception the
+    heartbeat thread marks loss atomically; checkpoints inspect the event and
+    reconfirm durable ownership via ``heartbeat_fire_claim``.
+    """
+
+    __slots__ = ("job_id", "expected_owner", "lost", "reason", "error", "_lock")
+
+    def __init__(self, *, job_id: str, expected_owner: str):
+        self.job_id = job_id
+        self.expected_owner = expected_owner
+        self.lost = threading.Event()
+        self.reason: Optional[str] = None
+        self.error: Optional[BaseException] = None
+        self._lock = threading.Lock()
+
+    def mark_lost(
+        self,
+        reason: str,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Atomically record first observed lease loss (idempotent)."""
+        with self._lock:
+            if self.lost.is_set():
+                return
+            self.reason = reason
+            self.error = error
+            self.lost.set()
+
+
+# Per-run guard for the active fire_claim owner. Default None = no claim / no fence.
+_fire_claim_guard: contextvars.ContextVar[Optional[_FireClaimGuard]] = (
+    contextvars.ContextVar("hermes_cron_fire_claim_guard", default=None)
+)
+
+
+def _fire_claim_owner_from_job(job: dict) -> Optional[str]:
+    """Stable fire_claim owner captured from a dispatched job dict, or None."""
+    claim = job.get("fire_claim") if isinstance(job, dict) else None
+    if not isinstance(claim, dict):
+        return None
+    owner = str(claim.get("by") or "")
+    return owner or None
+
+
+def _checkpoint_fire_claim_ownership(
+    job_id: str,
+    expected_owner: Optional[str],
+    *,
+    stage: str,
+) -> None:
+    """Fail closed if this runner no longer holds the durable fire_claim.
+
+    Used by ``_run_one_job_body`` immediately after ``run_job`` returns, before
+    ``_deliver_result``, and immediately before owner-conditional ``mark_job_run``.
+
+    Each checkpoint:
+      1. Inspects the per-run ``_FireClaimGuard`` lost event (async heartbeat).
+      2. Synchronously calls ``heartbeat_fire_claim(job_id, expected_owner=...)``
+         to confirm exact ownership in durable storage.
+
+    False or exception sets loss on the guard and raises
+    ``_FireClaimOwnershipLostError``. No expected owner → no-op (legacy path).
+    """
+    if not expected_owner:
+        return
+
+    guard = _fire_claim_guard.get()
+    prior_lost = bool(guard is not None and guard.lost.is_set())
+    prior_reason = guard.reason if guard is not None else None
+    prior_error = guard.error if guard is not None else None
+
+    try:
+        still_owns = heartbeat_fire_claim(job_id, expected_owner=expected_owner)
+    except Exception as exc:
+        reason = (
+            f"fire_claim ownership checkpoint ({stage}) raised: {exc}"
+        )
+        if guard is not None:
+            guard.mark_lost(reason, exc)
+        raise _FireClaimOwnershipLostError(reason) from exc
+
+    if not still_owns:
+        reason = (
+            f"fire_claim ownership checkpoint ({stage}) failed: durable claim "
+            f"is not held by expected owner {expected_owner!r}"
+        )
+        if guard is not None:
+            guard.mark_lost(reason)
+        raise _FireClaimOwnershipLostError(reason)
+
+    # Sync confirm succeeded, but an earlier async heartbeat already observed
+    # loss — fail closed on the first observed loss (cooperative abort).
+    if prior_lost:
+        reason = prior_reason or (
+            f"fire_claim ownership lost during run (detected at {stage})"
+        )
+        if prior_error is not None:
+            raise _FireClaimOwnershipLostError(reason) from prior_error
+        raise _FireClaimOwnershipLostError(reason)
+
+
+def _mark_job_run_owned(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    *,
+    delivery_error: Optional[str] = None,
+    expected_fire_claim_owner: Optional[str] = None,
+):
+    """Call ``mark_job_run``, passing expected owner only when one is known.
+
+    Legacy scheduled paths (no fire_claim) keep the historical call signature so
+    existing mocks/assert_called_with stay valid. Manual/external fires always
+    pass their captured owner for the owner-conditional gate.
+    """
+    if expected_fire_claim_owner is None:
+        return mark_job_run(
+            job_id, success, error, delivery_error=delivery_error
+        )
+    return mark_job_run(
+        job_id,
+        success,
+        error,
+        delivery_error=delivery_error,
+        expected_fire_claim_owner=expected_fire_claim_owner,
+    )
+
+
+def _run_with_fire_claim_heartbeat(job: dict, fn):
+    """Keep a manual/external ``fire_claim`` fresh while ``fn`` runs.
+
+    Ownership lives on the full ``run_one_job`` lifecycle (execute → save →
+    deliver → mark), not only ``run_job``. Delivery/cleanup can outlive
+    ``FIRE_CLAIM_TTL_SECONDS`` after the agent returns; without a heartbeat
+    across that window the claim looks dead and the ticker can re-dispatch.
+
+    Scheduled ticker runs that won the shared per-fire CAS claim also carry a
+    ``fire_claim`` and take this heartbeat path. Legacy/no-claim jobs take the
+    fast path (call ``fn`` directly). All fire_claim owners are captured from
+    the dispatched job dict and never re-read from storage before compare, so a
+    stale runner cannot extend a replacement owner's claim.
+
+    Before creating/starting the heartbeat thread and before ``fn``,
+    synchronously validate durable ownership via
+    ``heartbeat_fire_claim(expected_owner=stable_owner)``. False or exception
+    raises ``_FireClaimOwnershipError`` so a stale runner never executes script
+    / agent / delivery side effects against a replacement owner's claim.
+
+    A per-run :class:`_FireClaimGuard` is installed in a ContextVar around the
+    full body. The heartbeat thread, on False or exception, atomically marks
+    lease-lost state (it does not silently continue). Body checkpoints after
+    ``run_job``, before delivery, and before mark reconfirm exact ownership and
+    raise ``_FireClaimOwnershipLostError`` so a stale runner cannot deliver or
+    mutate replacement state. In-flight agent/tool work is not rolled back —
+    the enforceable gate is cooperative post-run abort + no delivery/mark.
+
+    Only after preflight succeeds may the heartbeat thread start. Thread start
+    failure raises ``_FireClaimHeartbeatStartError`` (still before ``fn``). The
+    heartbeat thread inherits the caller's ContextVar snapshot so
+    profile-scoped cron stores stay correct. Stop+join happens after ``fn``
+    returns (including ``mark_job_run``, which clears the claim when still owned).
+    """
+    claim = job.get("fire_claim")
+    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    if not owner:
+        return fn()
+
+    job_id = str(job.get("id") or "")
+    guard = _FireClaimGuard(job_id=job_id, expected_owner=owner)
+    guard_token = _fire_claim_guard.set(guard)
+
+    try:
+        # Synchronous ownership preflight: the async heartbeat loop waits up to
+        # _RUN_CLAIM_HEARTBEAT_SECONDS before its first tick, which is far too
+        # late to catch a replacement owner already present in durable storage.
+        try:
+            still_owns = heartbeat_fire_claim(job_id, expected_owner=owner)
+        except Exception as exc:
+            logger.debug(
+                "Job '%s': fire_claim ownership preflight raised",
+                job_id,
+                exc_info=True,
+            )
+            raise _FireClaimOwnershipError(
+                f"fire_claim ownership preflight failed: {exc}"
+            ) from exc
+        if not still_owns:
+            raise _FireClaimOwnershipError(
+                "fire_claim ownership preflight failed: durable claim is not "
+                f"held by expected owner {owner!r}"
+            )
+
+        stop = threading.Event()
+        # Copy after guard install so the heartbeat thread sees the same
+        # ContextVar profile store *and* the active FireClaimGuard.
+        heartbeat_context = contextvars.copy_context()
+
+        def _heartbeat_loop() -> None:
+            # Reuse the one-shot claim cadence (tests patch that single dial).
+            while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
+                try:
+                    still_owns = heartbeat_fire_claim(
+                        job_id, expected_owner=owner
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Job '%s': fire_claim heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
+                    guard.mark_lost(
+                        f"fire_claim heartbeat raised: {exc}",
+                        exc,
+                    )
+                    return
+                if not still_owns:
+                    guard.mark_lost(
+                        "fire_claim heartbeat lost ownership: durable claim "
+                        f"is not held by expected owner {owner!r}"
+                    )
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_context.run,
+            args=(_heartbeat_loop,),
+            name="cron-fire-claim-heartbeat",
+            daemon=True,
+        )
+        try:
+            heartbeat_thread.start()
+        except Exception as exc:
+            logger.debug(
+                "Job '%s': could not start fire_claim heartbeat",
+                job_id,
+                exc_info=True,
+            )
+            # Fail closed: never run unprotected when a claim requires heartbeat.
+            raise _FireClaimHeartbeatStartError(
+                f"fire_claim heartbeat could not start: {exc}"
+            ) from exc
+
+        try:
+            return fn()
+        finally:
+            stop.set()
+            # Event.wait() wakes immediately. Bound join if the heartbeat is
+            # blocked on another process's jobs-file lock.
+            heartbeat_thread.join(timeout=1.0)
+    finally:
+        _fire_claim_guard.reset(guard_token)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2614,6 +2910,11 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    Manual/external ``fire_claim`` heartbeating is owned by ``run_one_job``
+    (the full execute→save→deliver→mark lifecycle), not here. Nested wrappers
+    would double-write the claim; direct ``run_job`` callers that need
+    singleflight must go through ``run_one_job``.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3705,8 +4006,79 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     under the file lock before dispatch; an external provider claims via the
     store CAS). This function only fires the given job once.
 
+    Manual/external fires and scheduled ticks that carry a ``fire_claim`` keep
+    that claim heartbeated for the entire lifecycle (not only ``run_job``), so a
+    slow delivery/cleanup path cannot let the claim expire and re-enter the due
+    set. Jobs without a claim take the heartbeat fast path.
+
+    The stable ``fire_claim.by`` from the *dispatched* job is captured once and
+    passed to every ``mark_job_run`` path as ``expected_fire_claim_owner`` so a
+    stale runner that finishes after a replacement claim cannot erase the
+    replacement's claim or job state. Ownership preflight / heartbeat-start
+    failure fails closed (no side effect). Mid-run lease loss (heartbeat False
+    / raise, post-run exact-owner checkpoint, or owner-conditional mark
+    returning explicit False after a successful ``before_mark`` checkpoint)
+    aborts remaining delivery/mark without rolling back in-flight agent work.
+    Owner-conditional mark records an owned failure only when this runner still
+    holds the durable claim, and the function returns False so callers cannot
+    treat a no-op abort as success via a stale prior ``last_status``.
+
     Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    failure is recorded via ``mark_job_run``). Returns False if processing
+    raised or if a fire-claim abort refused the run.
+    """
+    expected_fire_claim_owner = _fire_claim_owner_from_job(job)
+    try:
+        return _run_with_fire_claim_heartbeat(
+            job,
+            lambda: _run_one_job_body(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            ),
+        )
+    except _FireClaimLifecycleError as e:
+        # Fail closed for pre-execution *and* any lifecycle error that escaped
+        # the body. Record an owned failure only when this runner still owns
+        # the durable claim. Return False so _execute_job_now cannot report
+        # success from a prior last_status='ok'. Never re-raise.
+        logger.error("Error processing job %s: %s", job.get("id"), e)
+        if not _consume_interrupted_flag(job["id"]):
+            try:
+                _mark_job_run_owned(
+                    job["id"],
+                    False,
+                    str(e),
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+            except Exception:
+                # Durable state may be unavailable (same condition that aborted
+                # ownership); do not mutate replacement/unknown state.
+                logger.debug(
+                    "Job '%s': could not record fire_claim lifecycle abort",
+                    job.get("id"),
+                    exc_info=True,
+                )
+        return False
+
+
+def _run_one_job_body(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    expected_fire_claim_owner: Optional[str] = None,
+) -> bool:
+    """Inner ``run_one_job`` implementation (see :func:`run_one_job`).
+
+    When ``expected_fire_claim_owner`` is set, ownership checkpoints run after
+    ``run_job``, before delivery, and before mark. Lease loss fails closed for
+    remaining post-run side effects (no platform delivery; owner-conditional
+    mark is a no-op for a stale owner). In-flight agent/tool work is not rolled
+    back — that boundary is cooperative only.
     """
     execution_id = job.get("execution_id")
     if not execution_id:
@@ -3777,12 +4149,29 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
-        # between run_job returning and delivery — save_job_output, the [SILENT]
-        # / empty-response computation, or _deliver_result itself — raises, the
-        # deferred agent is still torn down. Otherwise the outer `except` would
-        # swallow the error and leak the agent's subprocesses/clients (#10200).
+        # between run_job returning and delivery — ownership checkpoints,
+        # save_job_output, the [SILENT] / empty-response computation, or
+        # _deliver_result itself — raises, the deferred agent is still torn
+        # down. Otherwise the outer `except` would swallow the error and leak
+        # the agent's subprocesses/clients (#10200).
         delivery_error = None
         try:
+            # Cooperative ownership gate immediately after run_job: if the
+            # async heartbeat already lost the lease (or durable ownership no
+            # longer matches), abort remaining post-run side effects. Local
+            # diagnostic save below is best-effort only when we still own;
+            # platform delivery and schedule/state mutation must not run for a
+            # stale owner.
+            _checkpoint_fire_claim_ownership(
+                job["id"],
+                expected_fire_claim_owner,
+                stage="after_run_job",
+            )
+
+            # Optional local diagnostic output. Ownership may still be
+            # re-checked before delivery; a save that races a concurrent
+            # replacement is acceptable local-only side effect, not
+            # user/platform delivery.
             output_file = save_job_output(job["id"], output)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
@@ -3820,34 +4209,98 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 should_deliver = False
 
             if should_deliver:
+                # Exact-owner refresh immediately before platform delivery.
+                _checkpoint_fire_claim_ownership(
+                    job["id"],
+                    expected_fire_claim_owner,
+                    stage="before_deliver",
+                )
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+            # Treat empty final_response as a soft failure so last_status
+            # is not "ok" — the agent ran but produced nothing useful.
+            # (issue #8585)
+            if success and not final_response.strip():
+                success = False
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+            # Final ownership gate before schedule/state mutation. A stale owner
+            # raises here so mark is never attempted; the except path still uses
+            # owner-conditional mark which is a full no-op for replacements.
+            # Note: a replacement can still win *after* this checkpoint and
+            # *before* mark_job_run acquires the jobs lock (TOCTOU). The mark
+            # itself is then a full no-op returning False — captured below so
+            # callers cannot report success from a rejected stale mark.
+            _checkpoint_fire_claim_ownership(
+                job["id"],
+                expected_fire_claim_owner,
+                stage="before_mark",
+            )
+
+            if not _consume_interrupted_flag(job["id"]):
+                mark_applied = _mark_job_run_owned(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+                # Only an *explicit* False under an expected owner is lease loss.
+                # Legacy paths (no expected owner) ignore mark return values —
+                # including None from void-style mocks and False from not-found —
+                # so historical run_one_job → True semantics stay intact.
+                if (
+                    expected_fire_claim_owner is not None
+                    and mark_applied is False
+                ):
+                    raise _FireClaimOwnershipLostError(
+                        "fire_claim ownership lost at mark: durable claim is "
+                        "not held by expected owner "
+                        f"{expected_fire_claim_owner!r}"
+                    )
+            finish_execution(execution_id, success=success, error=error)
+            return True
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
-            # (or raised). Must happen on every path so cron agents never leak
-            # their subprocesses/clients (#10200).
+            # (or raised / ownership-lost). Must happen on every path so cron
+            # agents never leak their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
+    except _FireClaimOwnershipLostError as e:
+        # Mid-run / post-run lease loss: no delivery after detection (checkpoints
+        # above), no exception leak, owner-conditional mark only if still owned.
+        logger.error("Error processing job %s: %s", job["id"], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
-        return True
+            try:
+                _mark_job_run_owned(
+                    job["id"],
+                    False,
+                    str(e),
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+            except Exception:
+                logger.debug(
+                    "Job '%s': could not record fire_claim ownership-lost abort",
+                    job.get("id"),
+                    exc_info=True,
+                )
+        finish_execution(execution_id, success=False, error=str(e))
+        return False
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            _mark_job_run_owned(
+                job["id"],
+                False,
+                str(e),
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            )
         finish_execution(execution_id, success=False, error=str(e))
         return False
 
@@ -3925,13 +4378,51 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        for job in due_jobs:
-            advance_next_run(job["id"])
+        # Per-fire CAS fencing (same path as manual/external fire_due):
+        # get_due_jobs() releases the jobs lock before submit, so a manual or
+        # external claim can win between the due scan and dispatch. Claim each
+        # due job with a unique token, re-read, and require exact-token match
+        # before any submit. claim_job_for_fire advances recurring next_run_at
+        # atomically — do NOT also call advance_next_run (would double-advance).
+        # Lost / missing / wrong-token claims fail closed: log + skip, never
+        # fall back to the pre-claim due snapshot, never clear a foreign claim.
+        claimed_due_jobs: list = []
+        for due_snapshot in due_jobs:
+            job_id = due_snapshot.get("id")
+            if not job_id:
+                logger.warning("Due job missing id — skipping dispatch")
+                continue
+            claim_owner = new_fire_claim_owner()
+            if not claim_job_for_fire(job_id, claim_owner=claim_owner):
+                logger.info(
+                    "Job '%s' not dispatched — fire_claim lost to another owner",
+                    due_snapshot.get("name", job_id),
+                )
+                continue
+            claimed = get_job(job_id)
+            if claimed is None:
+                logger.warning(
+                    "Job '%s' not dispatched — missing after fire_claim win "
+                    "(left durable claim for owner/TTL recovery)",
+                    due_snapshot.get("name", job_id),
+                )
+                continue
+            claim = claimed.get("fire_claim") if isinstance(claimed, dict) else None
+            stored_owner = (
+                str(claim.get("by") or "") if isinstance(claim, dict) else ""
+            ) or None
+            if stored_owner != claim_owner:
+                logger.warning(
+                    "Job '%s' not dispatched — post-claim fire_claim token "
+                    "mismatch (expected %r, got %r); leaving durable claim",
+                    due_snapshot.get("name", job_id),
+                    claim_owner,
+                    stored_owner,
+                )
+                continue
+            claimed_due_jobs.append(claimed)
+
+        due_jobs = claimed_due_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.

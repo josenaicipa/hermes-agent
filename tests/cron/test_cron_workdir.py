@@ -218,12 +218,16 @@ class TestTickWorkdirParallel:
 
         # Two workdir jobs + one workdir-less job — all should run on the
         # parallel pool now (no sequential partition).
+        from tests.cron.tick_claim_helpers import install_successful_tick_fire_claims
+
         workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
         workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
         parallel_job = {"id": "c", "name": "C", "workdir": None}
+        due = [workdir_a, workdir_b, parallel_job]
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, parallel_job])
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: due)
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, due, sched=sched)
 
         # Record which thread each job ran on.
         import threading

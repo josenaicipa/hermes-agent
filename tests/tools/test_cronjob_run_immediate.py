@@ -27,6 +27,14 @@ _JOB = {
 }
 
 
+def _claimed_job(job: dict, *, owner: str = "test-owner:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") -> dict:
+    """Post-claim store record with the caller's fencing token (exact match required)."""
+    return {
+        **job,
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": owner},
+    }
+
+
 class TestCronjobRunExecutesImmediately:
     def test_run_action_returns_pending_dispatch(self):
         """action='run' returns immediately with an explicit pending state."""
@@ -49,6 +57,8 @@ class TestCronjobRunExecutesImmediately:
         release = threading.Event()
         done = threading.Event()
         worker_daemon = []
+        token = "dispatch-owner:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        claimed = _claimed_job(_JOB, owner=token)
 
         def _run(_job):
             worker_daemon.append(threading.current_thread().daemon)
@@ -59,7 +69,9 @@ class TestCronjobRunExecutesImmediately:
                 done.set()
             return True
 
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
+        with patch("tools.cronjob_tools.new_fire_claim_owner", return_value=token), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
+             patch("tools.cronjob_tools.get_job", return_value=claimed), \
              patch("cron.scheduler.run_one_job", side_effect=_run) as m_run:
             before = time.monotonic()
             result = _dispatch_job_now(dict(_JOB))
@@ -79,8 +91,9 @@ class TestCronjobRunExecutesImmediately:
                 assert "job-run-1" not in _manual_run_threads
 
         assert worker_daemon == [False]
-        m_claim.assert_called_once_with("job-run-1")
+        m_claim.assert_called_once_with("job-run-1", claim_owner=token)
         m_run.assert_called_once()
+        assert m_run.call_args[0][0]["fire_claim"]["by"] == token
 
     def test_dispatch_skips_when_claim_lost(self):
         """If the scheduler owns the fire claim, do not start a worker."""
@@ -96,7 +109,11 @@ class TestCronjobRunExecutesImmediately:
     def test_dispatch_marks_failure_when_thread_cannot_start(self):
         """A start failure clears the local handle and durable fire claim."""
         job = dict(_JOB, id="job-run-start-failure")
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+        token = "start-owner:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        claimed = _claimed_job(job, owner=token)
+        with patch("tools.cronjob_tools.new_fire_claim_owner", return_value=token), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("tools.cronjob_tools.get_job", return_value=claimed), \
              patch("tools.cronjob_tools.threading.Thread.start", side_effect=RuntimeError("no thread")), \
              patch("tools.cronjob_tools.mark_job_run") as m_mark:
             result = _dispatch_job_now(job)
@@ -104,7 +121,12 @@ class TestCronjobRunExecutesImmediately:
         assert result["claimed"] is True
         assert result["dispatched"] is False
         assert "no thread" in result["error"]
-        m_mark.assert_called_once_with("job-run-start-failure", False, "no thread")
+        m_mark.assert_called_once_with(
+            "job-run-start-failure",
+            False,
+            "no thread",
+            expected_fire_claim_owner=token,
+        )
         with _manual_runs_lock:
             assert "job-run-start-failure" not in _manual_run_threads
 
@@ -136,12 +158,20 @@ class TestCronjobRunExecutesImmediately:
 
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during synchronous fire is marked failed, not propagated."""
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+        token = "sync-owner:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        claimed = _claimed_job(_JOB, owner=token)
+        with patch("tools.cronjob_tools.new_fire_claim_owner", return_value=token), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_one_job", side_effect=RuntimeError("boom")), \
              patch("tools.cronjob_tools.mark_job_run") as m_mark, \
-             patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
+             patch("tools.cronjob_tools.get_job", return_value=claimed):
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is True
         assert res["success"] is False
         assert "boom" in res["error"]
-        m_mark.assert_called_once()
+        m_mark.assert_called_once_with(
+            "job-run-1",
+            False,
+            "boom",
+            expected_fire_claim_owner=token,
+        )

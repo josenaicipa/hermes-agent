@@ -35,6 +35,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
+    new_fire_claim_owner,
     parse_schedule,
     pause_job,
     remove_job,
@@ -610,6 +611,39 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _fire_claim_owner_from_job(job: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Stable fire_claim owner from a claimed/dispatched job dict, or None."""
+    if not isinstance(job, dict):
+        return None
+    claim = job.get("fire_claim")
+    if not isinstance(claim, dict):
+        return None
+    owner = str(claim.get("by") or "")
+    return owner or None
+
+
+def _mark_job_run_owned(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    *,
+    expected_fire_claim_owner: Optional[str] = None,
+):
+    """Call ``mark_job_run``, passing expected owner only when known.
+
+    Preserves the historical positional call shape for paths without a
+    fire_claim owner so existing assert_called_with mocks keep working.
+    """
+    if expected_fire_claim_owner is None:
+        return mark_job_run(job_id, success, error)
+    return mark_job_run(
+        job_id,
+        success,
+        error,
+        expected_fire_claim_owner=expected_fire_claim_owner,
+    )
+
+
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
@@ -627,15 +661,20 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    # Per-fire fencing token: generate once, pass into the claim, then require
+    # the durable record still holds this exact token (not just any non-empty
+    # owner). Same-process reclaim generations must not share an owner string.
+    expected_fire_claim_owner: Optional[str] = new_fire_claim_owner()
     try:
         from cron.scheduler import run_one_job
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
+        if not claim_job_for_fire(job_id, claim_owner=expected_fire_claim_owner):
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
             # (#60703): that message sends the user chasing a phantom
             # in-flight run when the job simply isn't runnable.
+            expected_fire_claim_owner = None  # never won the claim
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
@@ -645,9 +684,28 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
+        # Require the post-claim store record still carries THIS caller's
+        # fencing token. Never fall back to the pre-claim snapshot (no claim,
+        # would skip heartbeat / owner-conditional mark). Missing, malformed,
+        # or different-token records fail closed; leave the durable claim for
+        # TTL recovery rather than clearing a possibly-replacement owner.
+        claimed_job = get_job(job_id)
+        stored_owner = _fire_claim_owner_from_job(claimed_job)
+        if stored_owner != expected_fire_claim_owner:
+            return {
+                "claimed": True,
+                "success": False,
+                "error": (
+                    "Post-claim fire_claim owner does not match this caller's "
+                    "fencing token; not run."
+                ),
+            }
+
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        # Pre-execution fire-claim aborts return False so a stale prior
+        # last_status='ok' cannot be reported as this run's success.
+        processed = run_one_job(claimed_job)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -659,7 +717,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         try:
-            mark_job_run(job_id, False, str(e))
+            # Pass the stable claim owner so an outer failure cannot erase a
+            # replacement owner's fire_claim / job state.
+            _mark_job_run_owned(
+                job_id,
+                False,
+                str(e),
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            )
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
@@ -687,22 +752,48 @@ def _dispatch_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 "error": "Job already has a manual run in progress.",
             }
 
-    if not claim_job_for_fire(job_id):
+    # Per-fire fencing token: generate once, pass into the claim, then require
+    # the durable record still holds this exact token.
+    expected_fire_claim_owner = new_fire_claim_owner()
+    if not claim_job_for_fire(job_id, claim_owner=expected_fire_claim_owner):
         return {
             "claimed": False,
             "dispatched": False,
             "error": "Job is already being fired by the scheduler; not run again.",
         }
 
+    # Require the post-claim store record still carries THIS caller's fencing
+    # token. Never fall back to the pre-claim snapshot (no claim, would skip
+    # singleflight protection). Missing/malformed/different-token fails closed;
+    # leave the durable claim for TTL recovery rather than mutating it.
+    claimed_job = get_job(job_id)
+    stored_owner = _fire_claim_owner_from_job(claimed_job)
+    if stored_owner != expected_fire_claim_owner:
+        return {
+            "claimed": True,
+            "dispatched": False,
+            "error": (
+                "Post-claim fire_claim owner does not match this caller's "
+                "fencing token; not run."
+            ),
+        }
+
     def _worker() -> None:
         try:
             from cron.scheduler import run_one_job
 
-            run_one_job(job)
+            run_one_job(claimed_job)
         except Exception as exc:
             logger.exception("Background manual cron run %s failed: %s", job_id, exc)
             try:
-                mark_job_run(job_id, False, str(exc))
+                # Owner-conditional so a stale/outer failure cannot clear a
+                # replacement owner's durable fire_claim.
+                _mark_job_run_owned(
+                    job_id,
+                    False,
+                    str(exc),
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
             except Exception:
                 pass
         finally:
@@ -723,7 +814,12 @@ def _dispatch_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         with _manual_runs_lock:
             _manual_run_threads.pop(job_id, None)
         try:
-            mark_job_run(job_id, False, str(exc))
+            _mark_job_run_owned(
+                job_id,
+                False,
+                str(exc),
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            )
         except Exception:
             pass
         return {"claimed": True, "dispatched": False, "error": str(exc)}

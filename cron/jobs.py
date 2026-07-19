@@ -182,6 +182,12 @@ def get_cron_output_dir() -> Path:
 # claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 
+# Stale-recovery TTL for a multi-machine / manual ``fire_claim`` (#Phase 4C).
+# The claim is a dead-owner detector, not a wall-clock run limit: a live run
+# heartbeats ``fire_claim.at`` so the job stays non-due for the full duration.
+# After this TTL with no refresh, another fire may reclaim (crashed owner).
+FIRE_CLAIM_TTL_SECONDS = 300
+
 # The derived TTL is the cron inactivity timeout times this headroom multiplier.
 # A healthy run clears its claim via mark_job_run() long before the TTL; the
 # TTL only recovers a claim left by a tick that DIED mid-run. HERMES_CRON_TIMEOUT
@@ -1513,7 +1519,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None, *,
+                 expected_fire_claim_owner: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1522,11 +1529,31 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``expected_fire_claim_owner``: when supplied, the mark is owner-conditional
+    on the durable ``fire_claim``. If the stored claim's ``by`` differs from
+    this owner or the claim is missing, return ``False`` before ANY mutation
+    so a stale runner cannot erase a replacement owner's claim/state. When
+    omitted, legacy scheduled callers keep the prior unconditional finalize
+    + clear behavior.
+
+    Returns:
+        ``True`` if the mark was applied, ``False`` if skipped (owner
+        mismatch / missing claim under an expected owner, or job not found).
     """
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                # Owner-conditional gate MUST run before any field mutation.
+                if expected_fire_claim_owner is not None:
+                    claim = job.get("fire_claim")
+                    claim_by = (
+                        claim.get("by") if isinstance(claim, dict) else None
+                    )
+                    if claim_by != expected_fire_claim_owner:
+                        return False
+
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -1567,7 +1594,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1602,9 +1629,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def claim_dispatch(job_id: str) -> bool:
@@ -1702,6 +1730,39 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Refresh a manual/external ``fire_claim`` timestamp while its run is alive.
+
+    Manual ``cronjob(action="run")`` and external ``fire_due`` stamp a
+    ``fire_claim`` then execute outside ``scheduler._running_job_ids``. The
+    claim's TTL is only a dead-owner detector: without a heartbeat a healthy
+    run that outlives ``FIRE_CLAIM_TTL_SECONDS`` looks dead, so the scheduled
+    ticker re-dispatches the same job and two runs mutate one status file.
+
+    ``expected_owner`` is the stable owner copied from the dispatched job at
+    claim time — never re-read from storage before compare. A stale runner
+    that resumes after a replacement owner has claimed must not extend the
+    new claim. ``mark_job_run`` clears the claim on completion.
+
+    Returns True if this owner's fire claim was refreshed; False when the
+    job, claim, or ownership no longer matches.
+    """
+    if not expected_owner:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                return False
+            claim["at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
@@ -1732,10 +1793,13 @@ def advance_next_run(job_id: str) -> bool:
 
 
 def _machine_id() -> str:
-    """Stable-ish identifier for claim attribution/debugging (NOT correctness).
+    """Stable-ish host attribution for fire-claim fencing tokens.
 
-    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
-    comes from the file lock + the fresh-claim check, not from this value.
+    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. This prefix is for
+    attribution/debugging only — fencing correctness requires the full
+    per-fire token from :func:`new_fire_claim_owner` (machine id + unique
+    generation), not the machine id alone. A stable host:pid would collide
+    across reclaim generations in the same gateway process.
     """
     explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
     if explicit:
@@ -1748,13 +1812,40 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def new_fire_claim_owner() -> str:
+    """Return a per-fire unique opaque fencing token for ``fire_claim.by``.
+
+    Format: ``<machine-id>:<uuid4-hex>``. The full string is the correctness-
+    critical owner identity used by heartbeat / owner-conditional mark /
+    post-claim verification. Machine attribution is preserved in the prefix
+    while the UUID makes same-process reclaim generations distinguishable.
+    """
+    return f"{_machine_id()}:{uuid.uuid4().hex}"
+
+
+def claim_job_for_fire(
+    job_id: str,
+    *,
+    claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
+    claim_owner: Optional[str] = None,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
     Used by the external-provider fire path (``CronScheduler.fire_due``) when an
     external scheduler (Chronos) signals a job is due across N gateway replicas:
-    exactly one wins. Single-machine deployments always win.
+    exactly one wins. Single-machine deployments always win. Manual
+    ``cronjob(action="run")`` uses the same claim so a concurrent ticker tick
+    cannot also fire the job.
+
+    ``claim_owner``: optional pre-generated fencing token from
+    :func:`new_fire_claim_owner`. When supplied, it must be a non-empty
+    (after strip) opaque token and that exact stripped token is stamped under
+    the jobs lock (callers that verify the post-claim record must pass the
+    token they generated). Blank/whitespace-only supplied owners fail closed
+    with ``ValueError`` before any mutation. When omitted (``None``), a unique
+    token is generated internally so legacy bool-only callers keep working.
+    The token is never generated outside the lock and then replaced inside.
 
     Under the file lock: reject if the job is missing/disabled/paused. If a
     fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
@@ -1767,8 +1858,17 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
 
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
-    reclaim it.
+    reclaim it. Live runs must heartbeat the claim (see
+    ``heartbeat_fire_claim``) so a healthy long run is never treated as dead.
     """
+    # Validate supplied claim_owner before any lock/mutation. Only None mints
+    # internally; a non-None blank is an API error, not a mint request.
+    if claim_owner is not None and not str(claim_owner).strip():
+        raise ValueError(
+            "claim_owner must be a non-empty fencing token when supplied; "
+            "pass claim_owner=None to mint one internally"
+        )
+
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
@@ -1792,7 +1892,13 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            # Stamp the caller-supplied fencing token, or mint one under the
+            # lock for legacy bool-only callers. Never replace a supplied token.
+            if claim_owner is not None:
+                owner = str(claim_owner).strip()
+            else:
+                owner = new_fire_claim_owner()
+            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -1954,6 +2060,37 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         continue  # a fresh claim is held by an in-flight run
                 except (KeyError, ValueError, TypeError):
                     pass  # malformed claim → fall through and (re)claim
+
+            # Manual/external fire singleflight: a fresh fire_claim means a
+            # manual cronjob(action="run") or Chronos fire_due owns this fire.
+            # Those paths are NOT members of scheduler._running_job_ids, so the
+            # ticker's in-process dedup cannot see them. Skip while the claim
+            # is fresh (heartbeated for long runs). An expired, future-dated, or
+            # malformed claim is a dead/invalid owner signal — clear it from
+            # BOTH the working job and durable raw_jobs *before* due evaluation
+            # so the built-in ticker cannot capture and heartbeat the stale
+            # generation token (which would defeat the ownership fence if a
+            # previously stalled old runner still holds the same token).
+            existing_fire = job.get("fire_claim")
+            if existing_fire:
+                _fire_is_fresh = False
+                try:
+                    fire_claimed_at = _ensure_aware(
+                        datetime.fromisoformat(existing_fire["at"])
+                    )
+                    _fire_age = (now - fire_claimed_at).total_seconds()
+                    if 0 <= _fire_age < FIRE_CLAIM_TTL_SECONDS:
+                        _fire_is_fresh = True
+                except (KeyError, ValueError, TypeError):
+                    pass  # malformed claim → recover by clearing
+                if _fire_is_fresh:
+                    continue
+                job["fire_claim"] = None
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["fire_claim"] = None
+                        needs_save = True
+                        break
 
             next_run = job.get("next_run_at")
             if not next_run:

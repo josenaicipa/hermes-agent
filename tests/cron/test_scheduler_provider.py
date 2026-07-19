@@ -362,13 +362,30 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
+    token = "provider:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
-    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
+    claim_owners = []
+
+    def _claim(jid, *, claim_owner=None, **_kw):
+        claim_owners.append(claim_owner)
+        return True
+
+    monkeypatch.setattr(jobs, "new_fire_claim_owner", lambda: token, raising=False)
+    monkeypatch.setattr(jobs, "claim_job_for_fire", _claim, raising=False)
+    monkeypatch.setattr(
+        jobs,
+        "get_job",
+        lambda jid: {
+            "id": jid,
+            "name": "t",
+            "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": token},
+        },
+    )
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is True
     assert ran == ["j1"]
+    assert claim_owners == [token]
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
@@ -379,7 +396,15 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: False, raising=False)
+    monkeypatch.setattr(
+        jobs,
+        "new_fire_claim_owner",
+        lambda: "provider:lostclaimaaaaaaaaaaaaaaaaaaaaaa",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        jobs, "claim_job_for_fire", lambda jid, **kw: False, raising=False
+    )
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is False
@@ -394,11 +419,56 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
+    monkeypatch.setattr(
+        jobs,
+        "new_fire_claim_owner",
+        lambda: "provider:missingjobaaaaaaaaaaaaaaaaaaaaa",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        jobs, "claim_job_for_fire", lambda jid, **kw: True, raising=False
+    )
     monkeypatch.setattr(jobs, "get_job", lambda jid: None)
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("gone") is False
+    assert ran == []
+
+
+def test_fire_due_wrong_token_after_claim_does_not_run(monkeypatch):
+    """After winning token A, a re-read with token B or missing claim fails closed."""
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    token_a = "provider:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    token_b = "provider:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ran = []
+
+    monkeypatch.setattr(jobs, "new_fire_claim_owner", lambda: token_a, raising=False)
+    monkeypatch.setattr(
+        jobs, "claim_job_for_fire", lambda jid, **kw: True, raising=False
+    )
+    monkeypatch.setattr(
+        jobs,
+        "get_job",
+        lambda jid: {
+            "id": jid,
+            "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": token_b},
+        },
+    )
+    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+
+    assert InProcessCronScheduler().fire_due("j-wrong") is False
+    assert ran == []
+
+    # Missing claim on re-read is also fail-closed.
+    monkeypatch.setattr(
+        jobs,
+        "get_job",
+        lambda jid: {"id": jid, "fire_claim": None},
+    )
+    assert InProcessCronScheduler().fire_due("j-none") is False
     assert ran == []
 
 

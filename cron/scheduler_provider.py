@@ -100,15 +100,26 @@ class CronScheduler(ABC):
         Returns True if THIS caller claimed and ran the job, False if the claim
         was lost (another machine/retry won it) or the job no longer exists.
         """
-        from cron.jobs import claim_job_for_fire, get_job
+        from cron.jobs import claim_job_for_fire, get_job, new_fire_claim_owner
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        # Per-fire fencing token: mint once, stamp via claim, then verify the
+        # durable record still holds this exact owner before side effects.
+        claim_owner = new_fire_claim_owner()
+        if not claim_job_for_fire(job_id, claim_owner=claim_owner):
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
+        claim = job.get("fire_claim") if isinstance(job, dict) else None
+        stored_owner = (
+            str(claim.get("by") or "") if isinstance(claim, dict) else ""
+        ) or None
+        if stored_owner != claim_owner:
+            # Wrong/missing generation (or concurrent reclaim) — fail closed and
+            # leave the durable claim for its rightful owner / TTL recovery.
+            return False
         job["execution_id"] = create_execution(job_id, source=self.name)["id"]
         return run_one_job(job, adapters=adapters, loop=loop)
 

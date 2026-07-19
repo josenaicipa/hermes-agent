@@ -210,21 +210,24 @@ class TestDispatchGuardReleasedAfterHang:
                  patch.object(sched, "save_job_output", return_value="/tmp/out"), \
                  patch.object(sched, "mark_job_run"), \
                  patch.object(sched, "_deliver_result", return_value=None):
+                from tests.cron.tick_claim_helpers import successful_tick_fire_claims
+
                 mock_agent = MagicMock()
                 mock_agent.run_conversation.return_value = {"final_response": "ok"}
                 mock_agent_cls.return_value = mock_agent
 
-                n = sched.tick(verbose=False)  # sync=True by default: waits for the job
-                assert n == 1
+                with successful_tick_fire_claims([job]):
+                    n = sched.tick(verbose=False)  # sync=True by default: waits for the job
+                    assert n == 1
 
-                # Without the fix this would still contain the job ID forever.
-                assert "guard-sessiondb-hang" not in sched.get_running_job_ids()
+                    # Without the fix this would still contain the job ID forever.
+                    assert "guard-sessiondb-hang" not in sched.get_running_job_ids()
 
-                # A second tick can dispatch the same job again — before the
-                # fix this would log "already running — skipping" and
-                # return 0.
-                n2 = sched.tick(verbose=False)
-                assert n2 == 1
+                    # A second tick can dispatch the same job again — before the
+                    # fix this would log "already running — skipping" and
+                    # return 0.
+                    n2 = sched.tick(verbose=False)
+                    assert n2 == 1
         finally:
             never_set.set()
             sched._running_job_ids.discard("guard-sessiondb-hang")
