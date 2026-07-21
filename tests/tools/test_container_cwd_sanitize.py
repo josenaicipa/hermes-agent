@@ -313,7 +313,9 @@ def test_docker_auto_mount_uses_each_tasks_own_host_cwd(
     monkeypatch.setattr(tt, "_last_activity", {})
     monkeypatch.setattr(tt, "_creation_locks", {})
     monkeypatch.setattr(ft, "_file_ops_cache", {})
-    monkeypatch.setattr(ft, "_last_known_cwd", {})
+    # Upstream deleted legacy env-side ``_last_known_cwd`` tracking
+    # (session cwd record + task overrides replace it). Do not reintroduce
+    # that module attribute just for the test fixture.
 
     tt.register_task_env_overrides(
         task_id, {"cwd": str(task_cwd), "isolate_env": True}
