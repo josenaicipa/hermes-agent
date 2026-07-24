@@ -272,18 +272,16 @@ def _has_receipt(value: Any) -> bool:
 
 
 def _payload_failed(value: Any) -> bool:
-    if not isinstance(value, Mapping):
-        return False
-    if value.get("success") is False or bool(value.get("error")):
-        return True
-    status = str(value.get("status") or value.get("state") or "").lower()
-    if status in _FAILED_STATUSES:
-        return True
-    return any(
-        _payload_failed(item)
-        for item in value.values()
-        if isinstance(item, Mapping)
-    )
+    if isinstance(value, Mapping):
+        if value.get("success") is False or bool(value.get("error")):
+            return True
+        status = str(value.get("status") or value.get("state") or "").lower()
+        if status in _FAILED_STATUSES:
+            return True
+        return any(_payload_failed(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_payload_failed(item) for item in value)
+    return False
 
 
 def _is_material_external_action(

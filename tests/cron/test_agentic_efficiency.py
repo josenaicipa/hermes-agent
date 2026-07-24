@@ -516,6 +516,33 @@ class TestClassifyResultadoMaterial:
         ]
         assert classify_resultado_material(messages) == "no"
 
+    def test_nested_failed_external_action_is_no(self):
+        from cron.agentic_efficiency import classify_resultado_material
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c-nested",
+                        "function": {
+                            "name": "cronjob",
+                            "arguments": '{"action": "create"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c-nested",
+                "name": "cronjob",
+                "content": (
+                    '{"job_id": "j", "results": [{"success": false}]}'
+                ),
+            },
+        ]
+        assert classify_resultado_material(messages) == "no"
+
     def test_verified_filesystem_evidence_is_si(self, tmp_path):
         from cron.agentic_efficiency import classify_resultado_material
 
