@@ -49,6 +49,9 @@ _MUTATION_VERBS = frozenset(
 _RECEIPT_KEYS = frozenset(
     {"id", "job_id", "url", "path", "resolved_path", "status", "state", "image", "media", "created", "updated", "deleted", "removed", "sha", "commit"}
 )
+_FAILED_STATUSES = frozenset(
+    {"failed", "failure", "error", "cancelled", "canceled", "rejected"}
+)
 _GIT_COMMIT_RE = re.compile(
     r"(?:^|[;&|]\s*|\n\s*)git\s+commit\b",
     re.IGNORECASE,
@@ -268,10 +271,25 @@ def _has_receipt(value: Any) -> bool:
     return False
 
 
+def _payload_failed(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("success") is False or bool(value.get("error")):
+        return True
+    status = str(value.get("status") or value.get("state") or "").lower()
+    if status in _FAILED_STATUSES:
+        return True
+    return any(
+        _payload_failed(item)
+        for item in value.values()
+        if isinstance(item, Mapping)
+    )
+
+
 def _is_material_external_action(
     name: str, payload: Mapping[str, Any], args_s: str
 ) -> bool:
-    if name not in _EXTERNAL_ACTION_TOOLS or payload.get("error"):
+    if name not in _EXTERNAL_ACTION_TOOLS or _payload_failed(payload):
         return False
     args = _parse_args(args_s)
     if name in {"image_generate", "text_to_speech"}:

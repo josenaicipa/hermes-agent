@@ -491,6 +491,31 @@ class TestClassifyResultadoMaterial:
         ]
         assert classify_resultado_material(messages) == "sí"
 
+    def test_failed_external_action_is_no(self):
+        from cron.agentic_efficiency import classify_resultado_material
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "function": {
+                            "name": "cronjob",
+                            "arguments": '{"action": "create"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "cronjob",
+                "content": '{"success": false, "status": "failed"}',
+            },
+        ]
+        assert classify_resultado_material(messages) == "no"
+
     def test_verified_filesystem_evidence_is_si(self, tmp_path):
         from cron.agentic_efficiency import classify_resultado_material
 
