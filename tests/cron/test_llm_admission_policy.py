@@ -586,8 +586,8 @@ def test_save_jobs_rejects_stripping_fields_from_enabled_compliant_record(hermes
     assert reloaded[0]["enabled"] is True
 
 
-def test_save_jobs_allows_unrelated_persist_of_grandfathered_enabled_incomplete(hermes_env):
-    """Already-enabled legacy incomplete records may continue through bookkeeping writes."""
+def test_save_jobs_rejects_unrelated_persist_of_legacy_enabled_incomplete(hermes_env):
+    """Even bookkeeping cannot persist an enabled LLM cron without declarations."""
     from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs, save_jobs
 
     ensure_dirs()
@@ -598,15 +598,36 @@ def test_save_jobs_allows_unrelated_persist_of_grandfathered_enabled_incomplete(
     assert len(jobs) == 1
     jobs[0]["last_run_at"] = "2030-01-02T00:00:00+00:00"
     jobs[0]["last_status"] = "ok"
-    # Unrelated bookkeeping — must not re-gate grandfathered incomplete enabled.
-    save_jobs(jobs)
 
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        save_jobs(jobs)
+
+    # Failed mutation leaves the pre-policy record byte-for-byte semantically intact.
     reloaded = load_jobs()
     assert reloaded[0]["id"] == "legacy44crm"
     assert reloaded[0]["enabled"] is True
-    assert reloaded[0]["last_status"] == "ok"
+    assert reloaded[0].get("last_status") is None
     assert not reloaded[0].get("category")
     assert not reloaded[0].get("material_result_criterion")
+
+
+def test_update_job_rejects_any_edit_of_legacy_enabled_incomplete(hermes_env):
+    """update_job cannot mutate an enabled legacy LLM until it is classified."""
+    from cron.jobs import JOBS_FILE, ensure_dirs, get_job, update_job
+
+    ensure_dirs()
+    legacy = _legacy_enabled_incomplete_llm()
+    _write_raw_jobs(JOBS_FILE, [legacy])
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        update_job("legacy44crm", {"name": "renamed but still incomplete"})
+
+    unchanged = get_job("legacy44crm")
+    assert unchanged is not None
+    assert unchanged["name"] == "CRM↔Calendar #44"
+    assert unchanged["enabled"] is True
+    assert not unchanged.get("category")
+    assert not unchanged.get("material_result_criterion")
 
 
 def test_save_jobs_rejects_enabling_legacy_incomplete_via_direct_write(hermes_env):
