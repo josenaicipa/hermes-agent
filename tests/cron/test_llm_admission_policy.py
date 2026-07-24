@@ -166,12 +166,21 @@ def test_create_no_agent_job_exempt_from_admission(hermes_env):
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_enabled_llm_job_loads_and_stays_enabled(hermes_env):
-    """Jobs written before the policy remain readable and enabled."""
-    from cron.jobs import JOBS_FILE, ensure_dirs, get_job, list_jobs, load_jobs, save_jobs
+def _write_raw_jobs(jobs_file, jobs):
+    """Seed pre-policy / on-disk state without going through save_jobs().
 
-    ensure_dirs()
-    legacy = {
+    Grandfathered incomplete enabled LLM records predate the save-time gate;
+    tests simulate that by writing jobs.json directly.
+    """
+    jobs_file.parent.mkdir(parents=True, exist_ok=True)
+    jobs_file.write_text(
+        json.dumps({"jobs": jobs, "updated_at": "2026-01-01T00:00:00+00:00"}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _legacy_enabled_incomplete_llm(**overrides):
+    job = {
         "id": "legacy44crm",
         "name": "CRM↔Calendar #44",
         "prompt": "Sync CRM contacts to Google Calendar",
@@ -198,7 +207,16 @@ def test_legacy_enabled_llm_job_loads_and_stays_enabled(hermes_env):
         "origin": None,
         # Intentionally omit category + material_result_criterion
     }
-    save_jobs([legacy])
+    job.update(overrides)
+    return job
+
+
+def test_legacy_enabled_llm_job_loads_and_stays_enabled(hermes_env):
+    """Jobs written before the policy remain readable and enabled."""
+    from cron.jobs import JOBS_FILE, ensure_dirs, get_job, list_jobs, load_jobs
+
+    ensure_dirs()
+    _write_raw_jobs(JOBS_FILE, [_legacy_enabled_incomplete_llm()])
 
     loaded = load_jobs()
     assert len(loaded) == 1
@@ -415,3 +433,234 @@ def test_cronjob_schema_documents_admission_fields():
     assert set(enum) == {"event", "justified_cadence", "necessary_as_is"}
     crit_desc = props["material_result_criterion"]["description"].lower()
     assert "verif" in crit_desc or "material" in crit_desc
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle invariant — no silent strip / no save-path bypass
+# ---------------------------------------------------------------------------
+
+
+def _compliant_enabled_llm(**overrides):
+    job = {
+        "id": "compliant01",
+        "name": "Compliant LLM cron",
+        "prompt": "do verifiable work",
+        "skills": [],
+        "skill": None,
+        "no_agent": False,
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+        "schedule_display": "every 1h",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": "2030-01-01T00:00:00+00:00",
+        "last_run_at": None,
+        "last_status": None,
+        "last_error": None,
+        "deliver": "local",
+        "origin": None,
+        "category": "event",
+        "material_result_criterion": "Outcome X is present with matching ids",
+    }
+    job.update(overrides)
+    return job
+
+
+def test_update_job_clearing_both_admission_fields_rejected_and_unchanged(hermes_env):
+    """Enabled compliant LLM cron cannot have both declarations cleared."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(
+        prompt="sync CRM to calendar",
+        schedule="every 1h",
+        deliver="local",
+        category="event",
+        material_result_criterion="CRM deal id appears on Calendar",
+    )
+    job_id = job["id"]
+    before = get_job(job_id)
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        update_job(
+            job_id,
+            {"category": None, "material_result_criterion": None},
+        )
+
+    after = get_job(job_id)
+    assert after is not None
+    assert after["category"] == before["category"] == "event"
+    assert after["material_result_criterion"] == before["material_result_criterion"]
+    assert after["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "clear_field,keep_field,keep_value",
+    [
+        ("category", "material_result_criterion", "CRM deal id appears on Calendar"),
+        ("material_result_criterion", "category", "event"),
+    ],
+)
+def test_update_job_clearing_one_admission_field_rejected_and_unchanged(
+    hermes_env, clear_field, keep_field, keep_value
+):
+    """Clearing either mandatory field alone on an enabled LLM cron fails closed."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(
+        prompt="sync CRM to calendar",
+        schedule="every 1h",
+        deliver="local",
+        category="event",
+        material_result_criterion="CRM deal id appears on Calendar",
+    )
+    job_id = job["id"]
+    before = get_job(job_id)
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        update_job(job_id, {clear_field: None, keep_field: keep_value})
+
+    after = get_job(job_id)
+    assert after is not None
+    assert after["category"] == before["category"]
+    assert after["material_result_criterion"] == before["material_result_criterion"]
+    assert after["enabled"] is True
+
+
+def test_update_job_clearing_admission_via_empty_string_rejected(hermes_env):
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(
+        prompt="sync CRM to calendar",
+        schedule="every 1h",
+        deliver="local",
+        category="justified_cadence",
+        material_result_criterion="At least one change mirrored",
+    )
+    before = get_job(job["id"])
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        update_job(job["id"], {"category": "", "material_result_criterion": ""})
+
+    after = get_job(job["id"])
+    assert after["category"] == before["category"]
+    assert after["material_result_criterion"] == before["material_result_criterion"]
+
+
+def test_save_jobs_rejects_new_enabled_incomplete_llm_record(hermes_env):
+    """Public save/import path cannot introduce a new incomplete enabled LLM cron."""
+    from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs, save_jobs
+
+    ensure_dirs()
+    incomplete = _legacy_enabled_incomplete_llm(id="brandnew99", name="Illicit import")
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        save_jobs([incomplete])
+
+    # Nothing persisted (or empty store preserved).
+    if JOBS_FILE.exists():
+        assert load_jobs() == []
+
+
+def test_save_jobs_rejects_stripping_fields_from_enabled_compliant_record(hermes_env):
+    """Direct save cannot strip declarations from an enabled compliant LLM cron."""
+    from cron.jobs import ensure_dirs, load_jobs, save_jobs
+
+    ensure_dirs()
+    compliant = _compliant_enabled_llm()
+    save_jobs([compliant])
+
+    stripped = dict(compliant)
+    stripped.pop("category", None)
+    stripped.pop("material_result_criterion", None)
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        save_jobs([stripped])
+
+    reloaded = load_jobs()
+    assert len(reloaded) == 1
+    assert reloaded[0]["category"] == "event"
+    assert reloaded[0]["material_result_criterion"] == compliant["material_result_criterion"]
+    assert reloaded[0]["enabled"] is True
+
+
+def test_save_jobs_allows_unrelated_persist_of_grandfathered_enabled_incomplete(hermes_env):
+    """Already-enabled legacy incomplete records may continue through bookkeeping writes."""
+    from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs, save_jobs
+
+    ensure_dirs()
+    legacy = _legacy_enabled_incomplete_llm()
+    _write_raw_jobs(JOBS_FILE, [legacy])
+
+    jobs = load_jobs()
+    assert len(jobs) == 1
+    jobs[0]["last_run_at"] = "2030-01-02T00:00:00+00:00"
+    jobs[0]["last_status"] = "ok"
+    # Unrelated bookkeeping — must not re-gate grandfathered incomplete enabled.
+    save_jobs(jobs)
+
+    reloaded = load_jobs()
+    assert reloaded[0]["id"] == "legacy44crm"
+    assert reloaded[0]["enabled"] is True
+    assert reloaded[0]["last_status"] == "ok"
+    assert not reloaded[0].get("category")
+    assert not reloaded[0].get("material_result_criterion")
+
+
+def test_save_jobs_rejects_enabling_legacy_incomplete_via_direct_write(hermes_env):
+    """A disabled legacy incomplete record still cannot be enabled without both fields."""
+    from cron.jobs import ensure_dirs, load_jobs, save_jobs
+
+    ensure_dirs()
+    paused = _legacy_enabled_incomplete_llm(
+        id="pausedlegacy",
+        enabled=False,
+        state="paused",
+        next_run_at=None,
+        paused_at="2026-06-01T00:00:00+00:00",
+        paused_reason="operator",
+    )
+    save_jobs([paused])  # disabled incomplete is allowed
+
+    enabled = dict(paused)
+    enabled["enabled"] = True
+    enabled["state"] = "scheduled"
+    enabled["next_run_at"] = "2030-01-01T00:00:00+00:00"
+    enabled["paused_at"] = None
+    enabled["paused_reason"] = None
+
+    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
+        save_jobs([enabled])
+
+    reloaded = load_jobs()
+    assert reloaded[0]["enabled"] is False
+    assert reloaded[0]["state"] == "paused"
+
+
+def test_save_jobs_no_agent_incomplete_still_allowed(hermes_env):
+    """no_agent jobs remain exempt on the direct save path."""
+    from cron.jobs import load_jobs, save_jobs
+
+    script = hermes_env / "scripts" / "na.sh"
+    script.write_text("echo ok\n")
+
+    job = {
+        "id": "noagent01",
+        "name": "script only",
+        "prompt": None,
+        "script": "na.sh",
+        "no_agent": True,
+        "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
+        "schedule_display": "every 5m",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": "2030-01-01T00:00:00+00:00",
+        "deliver": "local",
+    }
+    save_jobs([job])
+    assert load_jobs()[0]["no_agent"] is True
+    assert load_jobs()[0]["enabled"] is True

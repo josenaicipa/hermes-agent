@@ -104,7 +104,9 @@ ONESHOT_GRACE_SECONDS = 120
 # Permanent LLM-cron admission policy: every new or reactivated agentic
 # (non-no_agent) cron must declare a category + material-result criterion
 # before it may be enabled. Existing enabled jobs without these fields are
-# grandfathered on load; resume/reactivate fails closed until both are set.
+# grandfathered on load and through unrelated bookkeeping writes; resume /
+# reactivate fails closed until both are set. The store write path also
+# rejects stripping declarations from an enabled compliant LLM cron.
 LLM_ADMISSION_CATEGORIES = frozenset(
     {"event", "justified_cadence", "necessary_as_is"}
 )
@@ -178,6 +180,119 @@ def _job_will_be_enabled(job: Dict[str, Any]) -> bool:
     if state == "paused":
         return False
     return True
+
+
+def _llm_admission_complete(job: Dict[str, Any]) -> bool:
+    """True when an LLM job has both valid mandatory admission declarations."""
+    if bool(job.get("no_agent")):
+        return True
+    cat = normalize_llm_admission_category(job.get("category"))
+    crit = normalize_material_result_criterion(job.get("material_result_criterion"))
+    return (
+        cat is not None
+        and cat in LLM_ADMISSION_CATEGORIES
+        and crit is not None
+    )
+
+
+def _read_jobs_snapshot_for_admission() -> List[Dict[str, Any]]:
+    """Read currently persisted jobs for admission transition checks.
+
+    Does not auto-repair and never writes. Unreadable / missing files yield an
+    empty previous snapshot so new incomplete enabled LLM jobs still fail
+    closed on first write.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+    try:
+        with open(jobs_file, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        try:
+            with open(jobs_file, "r", encoding="utf-8-sig") as f:
+                data = json.loads(f.read(), strict=False)
+        except Exception:
+            return []
+
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        return jobs if isinstance(jobs, list) else []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def validate_llm_admission_on_persist(
+    jobs: List[Dict[str, Any]],
+    previous_jobs: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Central lifecycle gate for every jobs-store write.
+
+    Rejects any write that would:
+      * introduce a **new** enabled LLM cron without both mandatory declarations
+      * enable / reactivate an incomplete LLM cron
+      * strip declarations from an **enabled compliant** LLM cron
+
+    Preserves grandfathering: an already-enabled incomplete LLM record that
+    already lacked declarations may continue through unrelated bookkeeping
+    writes. ``no_agent=True`` jobs are exempt. Disabled / paused incomplete
+    records may be stored, but cannot become enabled without both fields.
+
+    Never auto-disables jobs or silently rewrites admission fields.
+    """
+    if previous_jobs is None:
+        previous_jobs = _read_jobs_snapshot_for_admission()
+
+    prev_by_id: Dict[Any, Dict[str, Any]] = {}
+    for prev in previous_jobs:
+        if isinstance(prev, dict) and "id" in prev:
+            prev_by_id[prev["id"]] = prev
+
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        if bool(job.get("no_agent")):
+            continue
+        if not _job_will_be_enabled(job):
+            # Disabled / paused incomplete records are allowed to rest on disk.
+            continue
+        if _llm_admission_complete(job):
+            continue
+
+        jid = job.get("id")
+        prev = prev_by_id.get(jid) if jid is not None else None
+
+        if prev is None:
+            raise LlmCronAdmissionError(
+                "LLM cron admission failed: cannot introduce a new enabled LLM "
+                "cron without category and material_result_criterion. Every new "
+                "or reactivated LLM cron must declare both fields. Script-only "
+                "jobs with no_agent=true are exempt."
+            )
+
+        prev_was_llm = not bool(prev.get("no_agent"))
+        prev_enabled = _job_will_be_enabled(prev)
+        prev_complete = prev_was_llm and _llm_admission_complete(prev)
+
+        # Exact grandfathering: already-enabled incomplete LLM may re-persist.
+        if prev_was_llm and prev_enabled and not prev_complete:
+            continue
+
+        if prev_was_llm and prev_enabled and prev_complete:
+            raise LlmCronAdmissionError(
+                "LLM cron admission failed: cannot clear category and/or "
+                "material_result_criterion on an enabled LLM cron. Keep both "
+                "declarations, or pause/disable the job before removing them. "
+                "Never auto-disable or silently rewrite admission fields."
+            )
+
+        # Enable / no_agent→LLM / other transitions into incomplete enabled LLM.
+        check_llm_admission_for_enable(
+            no_agent=job.get("no_agent"),
+            category=job.get("category"),
+            material_result_criterion=job.get("material_result_criterion"),
+        )
 
 
 @dataclass(frozen=True)
@@ -993,6 +1108,12 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
+    # Central admission lifecycle gate — every store write (public save_jobs,
+    # update/create, scheduler bookkeeping, import/restore) funnels here.
+    # Rejects new/stripped incomplete enabled LLM crons; grandfathered
+    # already-enabled incomplete records continue. Never auto-disables.
+    validate_llm_admission_on_persist(jobs)
+
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
@@ -1012,7 +1133,13 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+    """Save all jobs to storage.
+
+    Enforces the LLM-cron admission lifecycle invariant centrally: new enabled
+    LLM crons must declare category + material_result_criterion; stripping
+    those fields from an enabled compliant record is rejected; already-enabled
+    grandfathered incomplete records may continue through unrelated writes.
+    """
     with _jobs_lock():
         _save_jobs_unlocked(jobs)
 
@@ -1583,6 +1710,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     no_agent=False,
                     category=updated.get("category"),
                     material_result_criterion=updated.get("material_result_criterion"),
+                )
+            # Refuse edits that clear admission on an already-enabled compliant
+            # LLM cron. Explicit here so update_job fails before the store write
+            # with a clear message; save_jobs enforces the same invariant for
+            # every other write path.
+            elif (
+                will_be_enabled
+                and was_enabled
+                and not bool(updated.get("no_agent"))
+                and _llm_admission_complete(job)
+                and not _llm_admission_complete(updated)
+            ):
+                raise LlmCronAdmissionError(
+                    "LLM cron admission failed: cannot clear category and/or "
+                    "material_result_criterion on an enabled LLM cron. Keep both "
+                    "declarations, or pause/disable the job before removing them. "
+                    "Never auto-disable or silently rewrite admission fields."
                 )
 
             jobs[i] = updated

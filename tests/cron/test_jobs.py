@@ -24,6 +24,62 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+from tests.fixtures.cron_llm_admission import LEGACY_TEST_LLM_ADMISSION
+
+
+def _enrich_job_with_test_admission(job):
+    """Fill mandatory LLM admission fields on incomplete enabled seed records.
+
+    Production ``save_jobs`` rejects new incomplete enabled LLM crons. Legacy
+    unit tests seed hand-built job dicts without those fields; this helper is
+    test-only and never weakens the production gate.
+    """
+    if not isinstance(job, dict):
+        return job
+    if bool(job.get("no_agent")):
+        return job
+    # Treat missing enabled as True to match store semantics.
+    if job.get("enabled", True) is False:
+        return job
+    state = str(job.get("state") or "").strip()
+    if state == "paused":
+        return job
+    cat = job.get("category", None)
+    crit = job.get("material_result_criterion", None)
+    if cat is not None and crit is not None:
+        return job
+    enriched = dict(job)
+    if cat is None:
+        enriched["category"] = LEGACY_TEST_LLM_ADMISSION["category"]
+    if crit is None:
+        enriched["material_result_criterion"] = LEGACY_TEST_LLM_ADMISSION[
+            "material_result_criterion"
+        ]
+    return enriched
+
+
+@pytest.fixture(autouse=True)
+def _save_jobs_admission_test_defaults(monkeypatch):
+    """Inject admission defaults into save_jobs seeds for this legacy suite.
+
+    Mirrors the create_job test-only defaults in tests/conftest.py. The focused
+    admission suite (test_llm_admission_policy.py) exercises the real gate
+    without this wrapper.
+    """
+    import cron.jobs as jobs_mod
+
+    real_save = jobs_mod.save_jobs
+
+    def save_jobs_with_test_admission_defaults(jobs):
+        if isinstance(jobs, list):
+            jobs = [_enrich_job_with_test_admission(j) for j in jobs]
+        return real_save(jobs)
+
+    monkeypatch.setattr(jobs_mod, "save_jobs", save_jobs_with_test_admission_defaults)
+    monkeypatch.setattr(
+        "tests.cron.test_jobs.save_jobs", save_jobs_with_test_admission_defaults
+    )
+    yield
 
 
 # =========================================================================
