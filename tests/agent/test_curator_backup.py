@@ -435,8 +435,14 @@ def test_rollback_restores_cron_skill_links(backup_env):
     _write_skill(backup_env["skills"], "umbrella")
 
     cj = _reload_cron_jobs(home)
-    cj.create_job(name="weekly", prompt="p", schedule="every 7d",
-                  skills=["alpha", "beta"])
+    cj.create_job(
+        name="weekly",
+        prompt="p",
+        schedule="every 7d",
+        skills=["alpha", "beta"],
+        category="necessary_as_is",
+        material_result_criterion="verify curator rollback restores cron skill links",
+    )
 
     snap = cb.snapshot_skills(reason="pre-curator-run")
     assert snap is not None
