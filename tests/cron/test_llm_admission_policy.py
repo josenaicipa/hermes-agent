@@ -1,0 +1,417 @@
+"""LLM-cron admission policy — category + material-result criterion.
+
+Every new enabled LLM cron must declare:
+  1) category ∈ {event, justified_cadence, necessary_as_is}
+  2) non-empty material_result_criterion
+
+Deterministic no_agent jobs are exempt. Existing enabled jobs without the
+fields remain readable and enabled (grandfathered). Resume/reactivate of an
+LLM job missing either field fails closed.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+
+@pytest.fixture
+def hermes_env(tmp_path, monkeypatch):
+    """Isolate HERMES_HOME and exercise the real admission gate.
+
+    This module is excluded from the suite-wide test-only create_job
+    admission defaults (see ``_cron_llm_admission_test_defaults`` in
+    ``tests/conftest.py``), so create/resume hit production fail-closed
+    behavior with no env-controlled bypass.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "scripts").mkdir()
+    (home / "cron").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import importlib
+    import hermes_constants
+    importlib.reload(hermes_constants)
+    import cron.jobs
+    importlib.reload(cron.jobs)
+
+    # Rebind tool-module imports after reload so create/resume hit the
+    # current jobs.py implementation under this HERMES_HOME.
+    try:
+        import tools.cronjob_tools as cronjob_tools_mod
+
+        monkeypatch.setattr(cronjob_tools_mod, "create_job", cron.jobs.create_job)
+        monkeypatch.setattr(cronjob_tools_mod, "resume_job", cron.jobs.resume_job)
+        monkeypatch.setattr(cronjob_tools_mod, "update_job", cron.jobs.update_job)
+        monkeypatch.setattr(cronjob_tools_mod, "get_job", cron.jobs.get_job)
+        monkeypatch.setattr(cronjob_tools_mod, "list_jobs", cron.jobs.list_jobs)
+        monkeypatch.setattr(cronjob_tools_mod, "pause_job", cron.jobs.pause_job)
+        monkeypatch.setattr(cronjob_tools_mod, "remove_job", cron.jobs.remove_job)
+        monkeypatch.setattr(cronjob_tools_mod, "resolve_job_ref", cron.jobs.resolve_job_ref)
+    except Exception:
+        pass
+
+    return home
+
+
+# ---------------------------------------------------------------------------
+# create_job data layer
+# ---------------------------------------------------------------------------
+
+
+def test_create_llm_job_without_admission_rejected(hermes_env):
+    from cron.jobs import create_job
+
+    with pytest.raises(ValueError, match="material_result_criterion|category"):
+        create_job(prompt="sync CRM to calendar", schedule="every 1h", deliver="local")
+
+
+def test_create_llm_job_missing_only_category_rejected(hermes_env):
+    from cron.jobs import create_job
+
+    with pytest.raises(ValueError, match="category"):
+        create_job(
+            prompt="sync CRM to calendar",
+            schedule="every 1h",
+            deliver="local",
+            material_result_criterion="CRM event X exists on Calendar",
+        )
+
+
+def test_create_llm_job_missing_only_criterion_rejected(hermes_env):
+    from cron.jobs import create_job
+
+    with pytest.raises(ValueError, match="material_result_criterion"):
+        create_job(
+            prompt="sync CRM to calendar",
+            schedule="every 1h",
+            deliver="local",
+            category="event",
+        )
+
+
+def test_create_llm_job_invalid_category_rejected(hermes_env):
+    from cron.jobs import create_job
+
+    with pytest.raises(ValueError, match="category"):
+        create_job(
+            prompt="sync CRM to calendar",
+            schedule="every 1h",
+            deliver="local",
+            category="vibes",
+            material_result_criterion="something verifiable happened",
+        )
+
+
+def test_create_llm_job_with_admission_succeeds_and_persists(hermes_env):
+    from cron.jobs import create_job, get_job
+
+    job = create_job(
+        prompt="sync CRM to calendar",
+        schedule="every 1h",
+        deliver="local",
+        category="justified_cadence",
+        material_result_criterion="At least one CRM change mirrored to Calendar with matching IDs",
+    )
+    assert job["enabled"] is True
+    assert job["category"] == "justified_cadence"
+    assert "mirrored to Calendar" in job["material_result_criterion"]
+
+    reloaded = get_job(job["id"])
+    assert reloaded is not None
+    assert reloaded["enabled"] is True
+    assert reloaded["category"] == "justified_cadence"
+    assert reloaded["material_result_criterion"] == job["material_result_criterion"]
+
+
+@pytest.mark.parametrize("category", ["event", "justified_cadence", "necessary_as_is"])
+def test_create_llm_job_accepts_all_allowed_categories(hermes_env, category):
+    from cron.jobs import create_job
+
+    job = create_job(
+        prompt="do the thing",
+        schedule="every 6h",
+        deliver="local",
+        category=category,
+        material_result_criterion="verifiable outcome X",
+    )
+    assert job["category"] == category
+    assert job["enabled"] is True
+
+
+def test_create_no_agent_job_exempt_from_admission(hermes_env):
+    from cron.jobs import create_job
+
+    script = hermes_env / "scripts" / "watchdog.sh"
+    script.write_text("#!/bin/bash\necho ok\n")
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="watchdog.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    assert job["no_agent"] is True
+    assert job["enabled"] is True
+    # Admission fields are optional/absent for script-only jobs.
+    assert not job.get("category")
+    assert not job.get("material_result_criterion")
+
+
+# ---------------------------------------------------------------------------
+# Grandfathering — existing enabled jobs without fields stay enabled
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_enabled_llm_job_loads_and_stays_enabled(hermes_env):
+    """Jobs written before the policy remain readable and enabled."""
+    from cron.jobs import JOBS_FILE, ensure_dirs, get_job, list_jobs, load_jobs, save_jobs
+
+    ensure_dirs()
+    legacy = {
+        "id": "legacy44crm",
+        "name": "CRM↔Calendar #44",
+        "prompt": "Sync CRM contacts to Google Calendar",
+        "skills": [],
+        "skill": None,
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "script": None,
+        "no_agent": False,
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+        "schedule_display": "every 1h",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": "2030-01-01T00:00:00+00:00",
+        "last_run_at": None,
+        "last_status": None,
+        "last_error": None,
+        "deliver": "local",
+        "origin": None,
+        # Intentionally omit category + material_result_criterion
+    }
+    save_jobs([legacy])
+
+    loaded = load_jobs()
+    assert len(loaded) == 1
+    assert loaded[0]["enabled"] is True
+    assert "category" not in loaded[0] or not loaded[0].get("category")
+
+    fetched = get_job("legacy44crm")
+    assert fetched is not None
+    assert fetched["enabled"] is True
+    assert fetched["name"] == "CRM↔Calendar #44"
+
+    active = list_jobs(include_disabled=False)
+    assert any(j["id"] == "legacy44crm" for j in active)
+    assert JOBS_FILE.exists()
+
+
+# ---------------------------------------------------------------------------
+# resume / reactivate fails closed without admission; succeeds after set
+# ---------------------------------------------------------------------------
+
+
+def test_resume_llm_job_missing_admission_fails_closed(hermes_env):
+    from cron.jobs import pause_job, resume_job, save_jobs, ensure_dirs
+
+    ensure_dirs()
+    legacy = {
+        "id": "paused44",
+        "name": "CRM↔Calendar #44 paused",
+        "prompt": "Sync CRM to Calendar",
+        "skills": [],
+        "skill": None,
+        "no_agent": False,
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+        "schedule_display": "every 1h",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": False,
+        "state": "paused",
+        "paused_at": "2026-06-01T00:00:00+00:00",
+        "paused_reason": "operator paused",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": None,
+        "deliver": "local",
+        "origin": None,
+    }
+    save_jobs([legacy])
+
+    with pytest.raises(ValueError, match="material_result_criterion|category|admission"):
+        resume_job("paused44")
+
+
+def test_resume_llm_job_succeeds_after_admission_set(hermes_env):
+    from cron.jobs import get_job, resume_job, save_jobs, ensure_dirs, update_job
+
+    ensure_dirs()
+    legacy = {
+        "id": "paused44b",
+        "name": "CRM↔Calendar #44",
+        "prompt": "Sync CRM to Calendar",
+        "skills": [],
+        "skill": None,
+        "no_agent": False,
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+        "schedule_display": "every 1h",
+        "repeat": {"times": None, "completed": 0},
+        "enabled": False,
+        "state": "paused",
+        "paused_at": "2026-06-01T00:00:00+00:00",
+        "paused_reason": "operator paused",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": None,
+        "deliver": "local",
+        "origin": None,
+    }
+    save_jobs([legacy])
+
+    update_job(
+        "paused44b",
+        {
+            "category": "necessary_as_is",
+            "material_result_criterion": "CRM contact changes appear on Calendar within the hour",
+        },
+    )
+    resumed = resume_job("paused44b")
+    assert resumed is not None
+    assert resumed["enabled"] is True
+    assert resumed["state"] == "scheduled"
+    assert resumed["category"] == "necessary_as_is"
+    assert "Calendar" in resumed["material_result_criterion"]
+
+    assert get_job("paused44b")["enabled"] is True
+
+
+def test_resume_no_agent_job_exempt(hermes_env):
+    from cron.jobs import create_job, pause_job, resume_job
+
+    script = hermes_env / "scripts" / "w.sh"
+    script.write_text("echo hi\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="w.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    pause_job(job["id"], reason="temp")
+    resumed = resume_job(job["id"])
+    assert resumed["enabled"] is True
+    assert resumed["no_agent"] is True
+
+
+# ---------------------------------------------------------------------------
+# cronjob tool surface
+# ---------------------------------------------------------------------------
+
+
+def test_cronjob_tool_create_llm_without_admission_fails(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    result = json.loads(
+        cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="sync CRM to calendar",
+            deliver="local",
+        )
+    )
+    assert result.get("success") is False
+    err = result.get("error", "")
+    assert "category" in err or "material_result_criterion" in err
+
+
+def test_cronjob_tool_create_llm_with_admission_succeeds(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    result = json.loads(
+        cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="sync CRM to calendar",
+            deliver="local",
+            category="event",
+            material_result_criterion="New CRM deal produces a Calendar event with matching deal id",
+        )
+    )
+    assert result.get("success") is True
+    job = result["job"]
+    assert job.get("category") == "event"
+    assert "deal id" in (job.get("material_result_criterion") or "")
+
+
+def test_cronjob_tool_create_no_agent_still_exempt(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    script = hermes_env / "scripts" / "alert.sh"
+    script.write_text("#!/bin/bash\necho alert\n")
+
+    result = json.loads(
+        cronjob(
+            action="create",
+            schedule="every 5m",
+            script="alert.sh",
+            no_agent=True,
+            deliver="local",
+        )
+    )
+    assert result.get("success") is True
+    assert result["job"]["no_agent"] is True
+
+
+def test_cronjob_tool_resume_missing_admission_fails(hermes_env):
+    from cron.jobs import ensure_dirs, save_jobs
+    from tools.cronjob_tools import cronjob
+
+    ensure_dirs()
+    save_jobs(
+        [
+            {
+                "id": "toolpause44",
+                "name": "CRM↔Calendar #44",
+                "prompt": "Sync",
+                "skills": [],
+                "skill": None,
+                "no_agent": False,
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+                "schedule_display": "every 1h",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": False,
+                "state": "paused",
+                "paused_at": "2026-06-01T00:00:00+00:00",
+                "paused_reason": "paused",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "next_run_at": None,
+                "deliver": "local",
+                "origin": None,
+            }
+        ]
+    )
+
+    result = json.loads(cronjob(action="resume", job_id="toolpause44"))
+    assert result.get("success") is False
+    err = result.get("error", "")
+    assert "category" in err or "material_result_criterion" in err or "admission" in err
+
+
+def test_cronjob_schema_documents_admission_fields():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    props = CRONJOB_SCHEMA["parameters"]["properties"]
+    assert "category" in props
+    assert "material_result_criterion" in props
+    cat = props["category"]
+    # Allowed values must be enumerable for the model.
+    enum = cat.get("enum") or []
+    assert set(enum) == {"event", "justified_cadence", "necessary_as_is"}
+    crit_desc = props["material_result_criterion"]["description"].lower()
+    assert "verif" in crit_desc or "material" in crit_desc

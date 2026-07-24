@@ -608,6 +608,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("category"):
+        result["category"] = job["category"]
+    if job.get("material_result_criterion"):
+        result["material_result_criterion"] = job["material_result_criterion"]
     return result
 
 
@@ -848,6 +852,8 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    category: Optional[str] = None,
+    material_result_criterion: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -865,7 +871,8 @@ def cronjob(
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
             #   - no_agent=False (default) → at least one of prompt/skills must
-            #     be set, same as before.
+            #     be set, same as before. LLM jobs also require admission
+            #     declarations (category + material_result_criterion).
             if _no_agent:
                 if not script:
                     return tool_error(
@@ -921,6 +928,8 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                category=category,
+                material_result_criterion=material_result_criterion,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -1115,6 +1124,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if category is not None:
+                updates["category"] = category
+            if material_result_criterion is not None:
+                updates["material_result_criterion"] = material_result_criterion
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -1155,6 +1168,14 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
+LLM admission policy: every NEW enabled LLM cron (no_agent=false) MUST declare
+category (event | justified_cadence | necessary_as_is) AND a non-empty
+material_result_criterion describing the verifiable outcome that counts.
+Without both, create fails closed. The same rule applies when resuming a paused
+LLM cron that lacks either field — set them via update first. no_agent=true
+script-only jobs are exempt. Existing enabled jobs without these fields are
+grandfathered until paused and reactivated.
+
 NOTE: The agent's final response is auto-delivered to the target. Put the primary
 user-facing content in the final response. Cron jobs run autonomously with no user
 present — they cannot ask questions or request clarification.
@@ -1165,7 +1186,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. For LLM jobs (no_agent=false), also declare category and material_result_criterion."
             },
             "job_id": {
                 "type": "string",
@@ -1230,7 +1251,30 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "(c) non-zero exit / timeout sends an error alert so a broken watchdog can't fail silently. "
                     "\n\n"
                     "WHEN TO USE True: recurring script-only pings where the script itself produces the exact message text (memory/disk/GPU watchdogs, threshold alerts, heartbeats, CI notifications, API pollers with a fixed output shape). "
-                    "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
+                    "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content. "
+                    "LLM jobs (False) MUST also declare category + material_result_criterion at create (and before resume if missing)."
+                ),
+            },
+            "category": {
+                "type": "string",
+                "enum": ["event", "justified_cadence", "necessary_as_is"],
+                "description": (
+                    "REQUIRED for new enabled LLM crons (no_agent=false). Admission category: "
+                    "'event' (fires on a discrete event/condition), "
+                    "'justified_cadence' (recurring on a justified schedule), "
+                    "'necessary_as_is' (must run as specified; no thinner alternative). "
+                    "Invalid values fail closed. Exempt when no_agent=true. "
+                    "On update, set this before resume if a paused LLM job is missing it."
+                ),
+            },
+            "material_result_criterion": {
+                "type": "string",
+                "description": (
+                    "REQUIRED for new enabled LLM crons (no_agent=false). Non-empty description of "
+                    "the verifiable material result that counts as success for this job "
+                    "(e.g. 'CRM deal X has a Calendar event with matching deal id'). "
+                    "Empty/missing values fail closed on create and on resume/reactivate. "
+                    "Exempt when no_agent=true. On update, set this before resume if missing."
                 ),
             },
             "context_from": {
@@ -1314,6 +1358,8 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        category=args.get("category"),
+        material_result_criterion=args.get("material_result_criterion"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

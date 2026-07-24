@@ -70,6 +70,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--category",
+        choices=("event", "justified_cadence", "necessary_as_is"),
+        help="Required for LLM jobs: event, justified_cadence, or necessary_as_is.",
+    )
+    cron_create.add_argument(
+        "--material-result-criterion",
+        dest="material_result_criterion",
+        help="Required for LLM jobs: verifiable outcome that counts as a material result.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +143,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--category",
+        choices=("event", "justified_cadence", "necessary_as_is"),
+        help="Set the LLM admission category before resume/reactivation.",
+    )
+    cron_edit.add_argument(
+        "--material-result-criterion",
+        dest="material_result_criterion",
+        help="Set the verifiable outcome required before resume/reactivation.",
     )
 
     # lifecycle actions

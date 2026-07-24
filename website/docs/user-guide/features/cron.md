@@ -29,6 +29,15 @@ At creation, an unpinned job (one you don't give an explicit `provider`/`model`)
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
 
+:::warning LLM admission policy
+Every **new enabled LLM cron** (anything that is not `no_agent=true`) must declare at creation:
+
+1. **`category`** — one of `event`, `justified_cadence`, or `necessary_as_is`
+2. **`material_result_criterion`** — a non-empty description of the verifiable outcome that counts as success
+
+Without both, create fails closed (the job is not enabled). The same rule applies when **resuming/reactivating** a paused LLM cron that lacks either field — set them via `update` first. Deterministic `no_agent=true` script-only jobs are exempt. Existing enabled jobs written before this policy remain enabled (grandfathered) until paused and reactivated.
+:::
+
 ## Creating scheduled tasks
 
 ### In chat with `/cron`

@@ -101,6 +101,84 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
+# Permanent LLM-cron admission policy: every new or reactivated agentic
+# (non-no_agent) cron must declare a category + material-result criterion
+# before it may be enabled. Existing enabled jobs without these fields are
+# grandfathered on load; resume/reactivate fails closed until both are set.
+LLM_ADMISSION_CATEGORIES = frozenset(
+    {"event", "justified_cadence", "necessary_as_is"}
+)
+
+
+class LlmCronAdmissionError(ValueError):
+    """Raised when an LLM cron lacks required admission declarations."""
+
+
+def normalize_llm_admission_category(value: Any) -> Optional[str]:
+    """Return a stripped category string, or None when absent/blank."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def normalize_material_result_criterion(value: Any) -> Optional[str]:
+    """Return a stripped non-empty criterion string, or None when absent/blank."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def check_llm_admission_for_enable(
+    *,
+    no_agent: Any = False,
+    category: Any = None,
+    material_result_criterion: Any = None,
+) -> None:
+    """Fail closed if an LLM cron is missing admission fields required to enable.
+
+    Deterministic ``no_agent=True`` script-only jobs are exempt. Invalid
+    categories always fail closed for LLM jobs.
+    """
+    if bool(no_agent):
+        return
+
+    cat = normalize_llm_admission_category(category)
+    crit = normalize_material_result_criterion(material_result_criterion)
+    problems: List[str] = []
+    if cat is None:
+        problems.append("category is required")
+    elif cat not in LLM_ADMISSION_CATEGORIES:
+        problems.append(
+            "category must be one of "
+            f"{sorted(LLM_ADMISSION_CATEGORIES)}, got {cat!r}"
+        )
+    if crit is None:
+        problems.append("material_result_criterion is required (non-empty)")
+    if not problems:
+        return
+
+    allowed = ", ".join(sorted(LLM_ADMISSION_CATEGORIES))
+    raise LlmCronAdmissionError(
+        "LLM cron admission failed: "
+        + "; ".join(problems)
+        + ". Every new or reactivated LLM cron must declare category "
+        f"(one of: {allowed}) and a non-empty material_result_criterion "
+        "describing the verifiable material result. Script-only jobs with "
+        "no_agent=true are exempt."
+    )
+
+
+def _job_will_be_enabled(job: Dict[str, Any]) -> bool:
+    """True when a job record is in a schedulable (enabled, non-paused) state."""
+    if not job.get("enabled", True):
+        return False
+    state = _coerce_job_text(job.get("state")).strip()
+    if state == "paused":
+        return False
+    return True
+
 
 @dataclass(frozen=True)
 class _CronStorePaths:
@@ -1093,6 +1171,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    category: Optional[str] = None,
+    material_result_criterion: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1137,6 +1217,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        category: Required for new LLM crons (not ``no_agent``). One of
+                ``event``, ``justified_cadence``, ``necessary_as_is``.
+        material_result_criterion: Required for new LLM crons. Non-empty
+                description of the verifiable material result that counts as
+                success for this job.
 
     Returns:
         The created job dict
@@ -1169,6 +1254,8 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_category = normalize_llm_admission_category(category)
+    normalized_criterion = normalize_material_result_criterion(material_result_criterion)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1178,6 +1265,14 @@ def create_job(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
         )
+
+    # LLM admission policy: new enabled agentic crons must declare category +
+    # material-result criterion. Script-only no_agent jobs are exempt.
+    check_llm_admission_for_enable(
+        no_agent=normalized_no_agent,
+        category=normalized_category,
+        material_result_criterion=normalized_criterion,
+    )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1259,6 +1354,13 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    # Persist admission declarations for LLM jobs (and optional values on
+    # no_agent jobs if a caller sets them). Absent keys remain valid for
+    # grandfathered records loaded from older JSON.
+    if normalized_category is not None:
+        job["category"] = normalized_category
+    if normalized_criterion is not None:
+        job["material_result_criterion"] = normalized_criterion
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1362,7 +1464,35 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            # Normalize admission fields when present so empty strings clear
+            # and invalid categories fail closed before persistence.
+            if "category" in updates:
+                raw_cat = updates["category"]
+                if raw_cat in {None, ""}:
+                    updates["category"] = None
+                else:
+                    cat = normalize_llm_admission_category(raw_cat)
+                    if cat is None or cat not in LLM_ADMISSION_CATEGORIES:
+                        raise LlmCronAdmissionError(
+                            "LLM cron admission failed: category must be one of "
+                            f"{sorted(LLM_ADMISSION_CATEGORIES)}, got {raw_cat!r}."
+                        )
+                    updates["category"] = cat
+            if "material_result_criterion" in updates:
+                raw_crit = updates["material_result_criterion"]
+                if raw_crit in {None, ""}:
+                    updates["material_result_criterion"] = None
+                else:
+                    crit = normalize_material_result_criterion(raw_crit)
+                    if crit is None:
+                        raise LlmCronAdmissionError(
+                            "LLM cron admission failed: material_result_criterion "
+                            "must be a non-empty string."
+                        )
+                    updates["material_result_criterion"] = crit
+
             previous_inference_axes = _normalized_inference_axes(job)
+            was_enabled = _job_will_be_enabled(job)
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
@@ -1431,6 +1561,30 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            # Fail closed when reactivating/enabling an LLM cron that still
+            # lacks admission declarations. Grandfathered jobs that are already
+            # enabled may keep running and may receive non-enable updates.
+            will_be_enabled = _job_will_be_enabled(updated)
+            if will_be_enabled and not was_enabled:
+                check_llm_admission_for_enable(
+                    no_agent=updated.get("no_agent"),
+                    category=updated.get("category"),
+                    material_result_criterion=updated.get("material_result_criterion"),
+                )
+            # Flipping no_agent off on an already-enabled job turns it into an
+            # LLM cron — require admission on that transition too.
+            elif (
+                will_be_enabled
+                and was_enabled
+                and not bool(updated.get("no_agent"))
+                and bool(job.get("no_agent"))
+            ):
+                check_llm_admission_for_enable(
+                    no_agent=False,
+                    category=updated.get("category"),
+                    material_result_criterion=updated.get("material_result_criterion"),
+                )
+
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -1459,6 +1613,9 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
+    # Past one-shot check first — preserve the established "in the past"
+    # ValueError semantics. Admission runs after so a never-fireable one-shot
+    # is rejected for schedule reasons rather than missing admission fields.
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
@@ -1466,6 +1623,18 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
+
+    # Admission is also enforced inside update_job on the enable transition;
+    # check here so the error message is immediate and clear for the
+    # resume/reactivate path (including paused CRM↔Calendar #44-style jobs).
+    # Already-enabled grandfathered jobs are not re-gated.
+    if not _job_will_be_enabled(job):
+        check_llm_admission_for_enable(
+            no_agent=job.get("no_agent"),
+            category=job.get("category"),
+            material_result_criterion=job.get("material_result_criterion"),
+        )
+
     return update_job(
         job["id"],
         {
@@ -1483,6 +1652,15 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    # Reactivate path — same admission gate as resume for LLM jobs that are
+    # currently disabled/paused. Already-enabled grandfathered jobs pass
+    # because they are not transitioning into enabled.
+    if not _job_will_be_enabled(job):
+        check_llm_admission_for_enable(
+            no_agent=job.get("no_agent"),
+            category=job.get("category"),
+            material_result_criterion=job.get("material_result_criterion"),
+        )
     return update_job(
         job["id"],
         {

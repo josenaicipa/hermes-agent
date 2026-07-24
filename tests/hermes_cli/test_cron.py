@@ -19,6 +19,84 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
+    def test_create_forwards_llm_admission_fields(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_api(**kwargs):
+            captured.update(kwargs)
+            return {
+                "success": True,
+                "job_id": "job-admit",
+                "name": "admitted",
+                "schedule": "every 60m",
+                "next_run_at": "2030-01-01T00:00:00+00:00",
+                "job": {},
+            }
+
+        monkeypatch.setattr(cron_cli, "_cron_api", fake_api)
+        rc = cron_cli.cron_create(Namespace(
+            schedule="every 1h",
+            prompt="produce a report",
+            name="admitted",
+            deliver="local",
+            repeat=None,
+            skill=None,
+            skills=None,
+            script=None,
+            workdir=None,
+            no_agent=False,
+            category="justified_cadence",
+            material_result_criterion="A dated report is written and delivered",
+        ))
+
+        assert rc == 0
+        assert captured["category"] == "justified_cadence"
+        assert captured["material_result_criterion"] == "A dated report is written and delivered"
+        assert "Created job" in capsys.readouterr().out
+
+    def test_edit_forwards_llm_admission_fields(self, monkeypatch, capsys):
+        captured = {}
+        # cron_edit imports resolve_job_ref locally, so supply a real isolated
+        # job and replace only the tool transport being asserted here.
+        monkeypatch.setattr("cron.jobs.resolve_job_ref", lambda _ref: {"id": "job-admit", "skills": []})
+
+        def fake_api(**kwargs):
+            captured.update(kwargs)
+            return {
+                "success": True,
+                "job": {
+                    "job_id": "job-admit",
+                    "name": "admitted",
+                    "schedule": "every 60m",
+                    "skills": [],
+                },
+            }
+
+        monkeypatch.setattr(cron_cli, "_cron_api", fake_api)
+        rc = cron_cli.cron_edit(Namespace(
+            job_id="job-admit",
+            schedule=None,
+            prompt=None,
+            name=None,
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            clear_skills=False,
+            add_skills=None,
+            remove_skills=None,
+            script=None,
+            workdir=None,
+            no_agent=None,
+            category="event",
+            material_result_criterion="An upstream event creates one verified result",
+        ))
+
+        assert rc == 0
+        assert captured["category"] == "event"
+        assert captured["material_result_criterion"] == "An upstream event creates one verified result"
+        assert "Updated job" in capsys.readouterr().out
+
     def test_pause_resume_run(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Check server status", schedule="every 1h")
 
