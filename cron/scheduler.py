@@ -3498,8 +3498,34 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Autonomous limits: resolve a fixed positive profile BEFORE constructing
+        # AIAgent so unknown/sentinel/nonpositive profiles fail closed without a
+        # model spawn. max_iterations is the profile's max_turns (not global
+        # agent.max_turns). no_agent script-only jobs never reach this path.
+        from cron.autonomous_limits import (
+            AutonomousLimitError,
+            AutonomousProfileError,
+            resolve_autonomous_profile,
+            run_with_autonomous_limits,
+        )
+
+        try:
+            _auto_profile = resolve_autonomous_profile(job, _cfg)
+        except AutonomousProfileError as _profile_exc:
+            raise RuntimeError(
+                f"Cron autonomous profile rejected before agent spawn: {_profile_exc}"
+            ) from _profile_exc
+        max_iterations = _auto_profile.max_turns
+        logger.info(
+            "Job '%s': autonomous profile=%s timeout=%ss max_turns=%s "
+            "token_budget=%s usd_budget=%s",
+            job_id,
+            _auto_profile.name,
+            _auto_profile.timeout_seconds,
+            _auto_profile.max_turns,
+            _auto_profile.token_budget,
+            _auto_profile.usd_budget,
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3807,64 +3833,40 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
+        # thread used by the autonomous-limits supervisor.
         _cron_context = contextvars.copy_context()
+        # Supervised run: wall-clock hard timeout, max turns, token/USD budget,
+        # plus the existing inactivity watchdog. max_iterations_reached is
+        # treated as limit_reason=max-turns failure (never successful delivery).
         # Pass task_id so the per-task cwd override registered above actually
         # reaches the tool calls; it matches the agent's session_id so sandbox
         # teardown (cleanup_vm) targets the same key.
-        _cron_future = _cron_pool.submit(
-            _cron_context.run, agent.run_conversation, prompt, task_id=_job_task_id
-        )
-        setattr(agent, "_cron_worker_future", _cron_future)
-        _inactivity_timeout = False
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    _heartbeat_run_claim_if_due()
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
+            result = run_with_autonomous_limits(
+                agent,
+                _auto_profile,
+                prompt=prompt,
+                task_key=str(job_id),
+                task_id=_job_task_id,
+                poll_interval=_POLL_INTERVAL,
+                heartbeat_fn=_heartbeat_run_claim_if_due,
+                inactivity_limit=_cron_inactivity_limit,
+                context=_cron_context,
+            )
+        except AutonomousLimitError as _limit_exc:
+            # Re-raise so the outer except builds the failure delivery; the
+            # exception string already carries limit_reason=/limit_count=/action=
+            # for Discord/chat alerts.
+            logger.error(
+                "Job '%s' autonomous limit: %s",
+                job_name,
+                _limit_exc,
+            )
             raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-
-        if _inactivity_timeout:
-            # Build diagnostic summary from the agent's activity tracker.
+        except TimeoutError as _idle_exc:
+            # Inactivity path preserved from the pre-limits watchdog.
             _activity = {}
             if hasattr(agent, "get_activity_summary"):
                 try:
@@ -3876,7 +3878,6 @@ def run_job(
             _cur_tool = _activity.get("current_tool")
             _iter_n = _activity.get("api_call_count", 0)
             _iter_max = _activity.get("max_iterations", 0)
-
             logger.error(
                 "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
@@ -3884,13 +3885,11 @@ def run_job(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
+                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit or 0)}s) "
                 f"— last activity: {_last_desc}"
-            )
+            ) from _idle_exc
 
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
@@ -3905,27 +3904,19 @@ def run_job(
         # would otherwise be delivered as if it were the agent's reply and the
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
+        #
+        # max_iterations_reached is already converted to AutonomousLimitError
+        # inside run_with_autonomous_limits (limit_reason=max-turns) — never
+        # treat it as a successful fallback delivery here.
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
-            result.get("failed") is not True
-            and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
-        )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if result.get("failed") is True or result.get("completed") is False:
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
-            logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
-            )
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.

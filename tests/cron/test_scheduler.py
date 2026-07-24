@@ -1487,13 +1487,12 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "all good"
 
-    def test_run_job_delivers_max_iteration_fallback_summary(self, tmp_path):
-        """Cron should deliver a usable max-iteration fallback summary.
+    def test_run_job_marks_max_iteration_fallback_as_limit_failure(self, tmp_path):
+        """Exhausting max turns is a bounded failure, never a success delivery.
 
-        A cron run can exhaust the iteration budget, get a final text summary
-        from the no-tools fallback call, and still have ``completed=False`` in
-        the generic agent result. That should not make cron raise the report
-        text as a RuntimeError.
+        A final no-tools fallback may still exist, but the scheduler must surface
+        ``limit_reason=max-turns`` and the one-rescope action instead of marking
+        the cron run healthy.
         """
         job = {
             "id": "summary-job",
@@ -1528,11 +1527,13 @@ class TestRunJobSessionPersistence:
 
             success, output, final_response, error = run_job(job)
 
-        assert success is True
-        assert error is None
-        assert final_response == "final fallback report"
-        assert "final fallback report" in output
-        assert "(FAILED)" not in output
+        assert success is False
+        assert error is not None
+        combined = "\n".join(str(value or "") for value in (output, final_response, error))
+        assert "limit_reason=max-turns" in combined
+        assert "limit_count=1" in combined
+        assert "action=rescope-permitted" in combined
+        assert "(FAILED)" in output
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
