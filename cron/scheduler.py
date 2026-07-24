@@ -291,6 +291,14 @@ from cron.jobs import (
     new_fire_claim_owner,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.agentic_efficiency import (
+    AgenticTipoError,
+    OnceOnlyAgenticRecorder,
+    append_agentic_efficiency,
+    classify_resultado_material,
+    record_agentic_efficiency_once,
+    resolve_agentic_tipo,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3195,6 +3203,14 @@ def run_job(
     _eff_config = None
     _compression_override = None
     _eff_started = time.monotonic()
+    # Agentic-efficiency ledger: resolve tipo before model dispatch; append
+    # exactly once for any attempt that reaches the model path (success,
+    # failure, or autonomous limit). no_agent short-circuits above never set
+    # this recorder.
+    _agentic_recorder: Optional[OnceOnlyAgenticRecorder] = None
+    _agentic_model_attempted = False
+    _agentic_messages: list = []
+    _agentic_result: Optional[dict] = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -3527,6 +3543,19 @@ def run_job(
             _auto_profile.usd_budget,
         )
 
+        # Agentic-efficiency tipo is resolved before AIAgent construction so
+        # invalid agentic_execution_type fails closed with no model call and
+        # no ledger row.
+        try:
+            _agentic_tipo = resolve_agentic_tipo(
+                job, profile_name=getattr(_auto_profile, "name", None)
+            )
+        except AgenticTipoError as _tipo_exc:
+            raise RuntimeError(
+                f"Cron agentic_execution_type rejected before agent spawn: {_tipo_exc}"
+            ) from _tipo_exc
+        _agentic_recorder = OnceOnlyAgenticRecorder(_agentic_tipo)
+
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
 
@@ -3844,6 +3873,9 @@ def run_job(
         # reaches the tool calls; it matches the agent's session_id so sandbox
         # teardown (cleanup_vm) targets the same key.
         try:
+            # Model path reached: any return or exception from here records
+            # exactly one agentic_efficiency row (including limits/failures).
+            _agentic_model_attempted = True
             result = run_with_autonomous_limits(
                 agent,
                 _auto_profile,
@@ -3855,6 +3887,9 @@ def run_job(
                 inactivity_limit=_cron_inactivity_limit,
                 context=_cron_context,
             )
+            _agentic_result = result if isinstance(result, dict) else None
+            if isinstance(result, dict):
+                _agentic_messages = list(result.get("messages") or [])
         except AutonomousLimitError as _limit_exc:
             # Re-raise so the outer except builds the failure delivery; the
             # exception string already carries limit_reason=/limit_count=/action=
@@ -3976,6 +4011,16 @@ def run_job(
                 model=str(model),
                 provider=str(runtime.get("provider") or ""),
             )
+        # Exactly one agentic_efficiency row for this successful model-path run.
+        # Ledger write failures propagate (fail closed) and are not retried.
+        if _agentic_model_attempted and _agentic_recorder is not None:
+            _agentic_tokens = int(getattr(agent, "session_total_tokens", 0) or 0)
+            record_agentic_efficiency_once(
+                _agentic_recorder,
+                messages=_agentic_messages,
+                tokens=_agentic_tokens,
+                workdir=_job_workdir,
+            )
         return True, output, final_response, None
         
     except Exception as e:
@@ -4018,6 +4063,41 @@ def run_job(
                     job,
                     error_msg,
                     _eff_decision.fingerprint,
+                )
+
+        # Model-path failures (including AutonomousLimitError) still record
+        # exactly once. Pre-dispatch failures leave _agentic_model_attempted
+        # False and skip the ledger. A ledger write failure here replaces the
+        # job error so the failure is visible and not silently dropped.
+        if _agentic_model_attempted and _agentic_recorder is not None:
+            try:
+                _agentic_tokens = 0
+                if agent is not None:
+                    _agentic_tokens = int(
+                        getattr(agent, "session_total_tokens", 0) or 0
+                    )
+                if (
+                    not _agentic_messages
+                    and isinstance(_agentic_result, dict)
+                ):
+                    _agentic_messages = list(
+                        _agentic_result.get("messages") or []
+                    )
+                record_agentic_efficiency_once(
+                    _agentic_recorder,
+                    messages=_agentic_messages,
+                    tokens=_agentic_tokens,
+                    workdir=_job_workdir,
+                )
+            except Exception as _ledger_exc:
+                error_msg = (
+                    f"{type(_ledger_exc).__name__}: {_ledger_exc} "
+                    f"(while recording agentic_efficiency; original: {error_msg})"
+                )
+                logger.exception(
+                    "Job '%s': agentic_efficiency ledger write failed: %s",
+                    job_name,
+                    _ledger_exc,
                 )
 
         output = f"""# Cron Job: {job_name} (FAILED)
