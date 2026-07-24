@@ -6257,6 +6257,30 @@ def _get_cached_client(
 # silently fell back to the user's main provider, sending OpenAI model names
 # to e.g. DeepSeek and producing cryptic ``unknown variant 'image_url'``
 # errors (issue #31179).
+_AUX_TASK_OVERRIDE: contextvars.ContextVar[dict[str, dict[str, Optional[str]]]] = contextvars.ContextVar(
+    "auxiliary_task_override", default={}
+)
+
+
+@contextlib.contextmanager
+def auxiliary_task_override(task: str, *, provider: str, model: str):
+    """Temporarily override one auxiliary task in the current async context.
+
+    The mapping is copied before mutation so sibling ``copy_context``/asyncio
+    tasks cannot observe each other's cron-specific compression route.
+    """
+    task_name = str(task or "").strip()
+    if not task_name:
+        raise ValueError("auxiliary task override requires a task name")
+    current = dict(_AUX_TASK_OVERRIDE.get())
+    current[task_name] = {"provider": str(provider).strip(), "model": str(model).strip()}
+    token = _AUX_TASK_OVERRIDE.set(current)
+    try:
+        yield
+    finally:
+        _AUX_TASK_OVERRIDE.reset(token)
+
+
 _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
     "openai": "https://api.openai.com/v1",
 }
@@ -6294,6 +6318,13 @@ def _resolve_task_provider_model(
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        # A ContextVar override is narrower than config and wider than explicit
+        # call arguments. It is used by cron compaction without mutating the
+        # process-global auxiliary.compression configuration.
+        task_override = _AUX_TASK_OVERRIDE.get().get(task)
+        if task_override:
+            cfg_provider = task_override.get("provider") or cfg_provider
+            cfg_model = task_override.get("model") or cfg_model
         # Resolve key_env → env var when api_key is not set directly
         if not cfg_api_key:
             cfg_key_env = str(

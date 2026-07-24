@@ -2295,8 +2295,12 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
-    """Build the effective prompt for a cron job, optionally loading one or more skills first.
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    dynamic_capture: Optional[list[str]] = None,
+) -> str:
+    """Build a cron prompt with static instructions first and runtime data last.
 
     Args:
         job: The cron job dict.
@@ -2305,9 +2309,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        dynamic_capture: Optional list populated with bounded runtime blocks for
+            code-level frontier fingerprinting and clean redesign packages.
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
+    dynamic_parts: list[str] = []
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
@@ -2325,25 +2332,35 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             success, script_output = _run_job_script(
                 script_path, workdir=job.get("workdir")
             )
+        _eff_job_cfg = job.get("context_efficiency")
+        _eff_enabled = isinstance(_eff_job_cfg, dict) and _eff_job_cfg.get("enabled") is True
+        bounded_script_output = script_output
+        if _eff_enabled and script_output:
+            from cron.context_efficiency import format_script_context
+
+            bounded_script_output = format_script_context(
+                job,
+                success,
+                script_output,
+                hermes_home=_get_hermes_home(),
+            )
         if success:
-            if script_output:
-                prompt = (
+            if bounded_script_output:
+                dynamic_parts.append(
                     "## Script Output\n"
                     "The following data was collected by a pre-run script. "
                     "Use it as context for your analysis.\n\n"
-                    f"```\n{script_output}\n```\n\n"
-                    f"{prompt}"
+                    f"```\n{bounded_script_output}\n```"
                 )
                 has_injected_data = True
             else:
                 # Script produced no output — nothing to report, skip AI call.
                 return None
         else:
-            prompt = (
+            dynamic_parts.append(
                 "## Script Error\n"
                 "The data-collection script failed. Report this to the user.\n\n"
-                f"```\n{script_output}\n```\n\n"
-                f"{prompt}"
+                f"```\n{bounded_script_output}\n```"
             )
             has_injected_data = True
 
@@ -2382,12 +2399,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
                     latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
                 if latest_output:
-                    prompt = (
+                    dynamic_parts.append(
                         f"## Output from job '{source_job_id}'\n"
                         "The following is the most recent output from a preceding "
                         "cron job. Use it as context for your analysis.\n\n"
-                        f"```\n{latest_output}\n```\n\n"
-                        f"{prompt}"
+                        f"```\n{latest_output}\n```"
                     )
                     has_injected_data = True
                 else:
@@ -2410,6 +2426,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
+
+    def _append_dynamic_tail(static_prompt: str) -> str:
+        if not dynamic_parts:
+            return static_prompt
+        if dynamic_capture is not None:
+            dynamic_capture.extend(dynamic_parts)
+        return static_prompt + "\n\n" + "\n\n".join(dynamic_parts)
+
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -2419,7 +2443,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
         return _scan_assembled_cron_prompt(
-            prompt,
+            _append_dynamic_tail(prompt),
             job,
             has_skills=False,
             has_injected_data=has_injected_data,
@@ -2499,7 +2523,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    assembled = _append_dynamic_tail("\n".join(parts))
+    return _scan_assembled_cron_prompt(
+        assembled,
+        job,
+        has_skills=True,
+        has_injected_data=has_injected_data,
+        user_prompt=user_prompt,
+    )
 
 
 def _scan_assembled_cron_prompt(
@@ -3116,8 +3147,13 @@ def run_job(
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    _eff_dynamic_parts: list[str] = []
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=prerun_script,
+            dynamic_capture=_eff_dynamic_parts,
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3154,6 +3190,11 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _eff_gate = None
+    _eff_decision = None
+    _eff_config = None
+    _compression_override = None
+    _eff_started = time.monotonic()
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -3341,6 +3382,71 @@ def run_job(
                             model = _default
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+        # Context-efficiency is double-gated: the profile config enables the
+        # feature and each migrated job opts in explicitly. This keeps unrelated
+        # cron jobs bit-for-bit compatible and gives the weekly rollback a safe
+        # per-job kill switch.
+        _job_eff = job.get("context_efficiency")
+        _job_eff_enabled = isinstance(_job_eff, dict) and _job_eff.get("enabled") is True
+        _cfg_map = _cfg if isinstance(_cfg, dict) else {}
+        _cron_cfg = _cfg_map.get("cron") if isinstance(_cfg_map.get("cron"), dict) else {}
+        _raw_eff_cfg = _cron_cfg.get("context_efficiency") if isinstance(_cron_cfg, dict) else {}
+        if _job_eff_enabled:
+            from cron.context_efficiency import (
+                ContextEfficiencyGate,
+                EfficiencyConfig,
+                GEMINI_COMPRESSION_MODEL,
+                GEMINI_COMPRESSION_PROVIDER,
+            )
+            from agent.auxiliary_client import auxiliary_task_override
+
+            _eff_config = EfficiencyConfig.from_mapping(_raw_eff_cfg)
+            if not _eff_config.enabled:
+                raise RuntimeError(
+                    "cron context_efficiency is enabled on the job but disabled in profile config"
+                )
+            _eff_gate = ContextEfficiencyGate(_get_hermes_home(), _eff_config)
+            _eff_decision = _eff_gate.before_run(
+                job,
+                dynamic_input="\n\n".join(_eff_dynamic_parts),
+            )
+            if _eff_decision.dynamic_append:
+                prompt = _scan_assembled_cron_prompt(
+                    prompt
+                    + "\n\n## Fresh boundary redesign (runtime data; apply once)\n"
+                    + _eff_decision.dynamic_append,
+                    job,
+                    has_injected_data=True,
+                    user_prompt=str(job.get("prompt") or ""),
+                )
+            if not _eff_decision.allow:
+                _eff_gate.record_blocker(
+                    job,
+                    _eff_decision.reason or "context-efficiency gate blocked this frontier",
+                    _eff_decision.fingerprint,
+                )
+                _aged_alert = _eff_gate.blocker_alert(
+                    job, _eff_decision.fingerprint
+                )
+                _eff_gate.record_outcome(
+                    job,
+                    _eff_decision.fingerprint,
+                    "blocker",
+                    material=bool(_aged_alert),
+                )
+                _gate_doc = (
+                    f"# Cron Job: {job_name}\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Context-efficiency gate:** {_eff_decision.reason or 'blocked'}\n"
+                )
+                return True, _gate_doc, _aged_alert or SILENT_MARKER, None
+            _compression_override = auxiliary_task_override(
+                "compression",
+                provider=GEMINI_COMPRESSION_PROVIDER,
+                model=GEMINI_COMPRESSION_MODEL,
+            )
+            _compression_override.__enter__()
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
@@ -3622,6 +3728,17 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if _eff_config is not None:
+            from cron.context_efficiency import apply_cron_compaction_ceiling
+
+            _applied_ceiling = apply_cron_compaction_ceiling(agent, _eff_config)
+            logger.info(
+                "Job '%s': context compaction ceiling=%s provider=%s model=%s",
+                job_id,
+                _applied_ceiling,
+                "google-gemini-cli",
+                "Gemini 3.5 Flash (Medium)",
+            )
         # Keep execution-owned resources attached to the agent so teardown can
         # wait for a timed-out worker to finish before closing its sandbox or DB.
         setattr(
@@ -3855,12 +3972,63 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        if _eff_gate is not None and _eff_decision is not None:
+            _usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
+            _is_noop = not final_response.strip() or final_response.strip() == SILENT_MARKER
+            _eff_gate.record_outcome(
+                job,
+                _eff_decision.fingerprint,
+                "valid_noop" if _is_noop else "success",
+                material=not _is_noop,
+                usage=_usage,
+                duration_seconds=time.monotonic() - _eff_started,
+                model=str(model),
+                provider=str(runtime.get("provider") or ""),
+            )
         return True, output, final_response, None
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+        if _eff_gate is not None and _eff_decision is not None:
+            _attempted = ""
+            if agent is not None and hasattr(agent, "get_activity_summary"):
+                try:
+                    _activity = agent.get_activity_summary()
+                    _attempted = json.dumps(
+                        {
+                            key: _activity.get(key)
+                            for key in (
+                                "last_activity_desc",
+                                "current_tool",
+                                "api_call_count",
+                                "max_iterations",
+                            )
+                            if key in _activity
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                except Exception:
+                    _attempted = "activity summary unavailable"
+            _eff_gate.record_outcome(
+                job,
+                _eff_decision.fingerprint,
+                "failure",
+                error=error_msg,
+                attempted=_attempted,
+                duration_seconds=time.monotonic() - _eff_started,
+                model=str(locals().get("model") or job.get("model") or ""),
+                provider=str((locals().get("runtime") or {}).get("provider") or ""),
+            )
+            _lower_error = error_msg.lower()
+            if any(marker in _lower_error for marker in ("timeout", "timed out", "quota", "credit", "402", "rate limit")):
+                _eff_gate.record_blocker(
+                    job,
+                    error_msg,
+                    _eff_decision.fingerprint,
+                )
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -3880,6 +4048,15 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if _compression_override is not None:
+            try:
+                _compression_override.__exit__(None, None, None)
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to restore compression auxiliary override",
+                    job_id,
+                    exc_info=True,
+                )
         # If agent construction failed, no lifecycle owner exists to reclaim
         # resources; clean those directly.  Otherwise _teardown_cron_agent owns
         # both sandbox and session-store cleanup, and may defer them until the
