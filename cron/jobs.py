@@ -994,56 +994,177 @@ def get_ticker_success_age() -> Optional[float]:
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
-    jobs_file = _current_cron_store().jobs_file
-    ensure_dirs()
-    if not jobs_file.exists():
-        return []
+# Legacy on-disk shapes that load tolerates but never rewrites. Explicit
+# ``repair_legacy_jobs_store`` / ``hermes cron repair`` owns canonicalize.
+_LEGACY_FORMAT_BARE_LIST = "bare_list"
+_LEGACY_FORMAT_CONTROL_CHARS = "control_chars"
 
-    _strict_retry = False  # track whether we used the strict=False fallback
+# Process-global: one warning per (canonical jobs.json path, legacy format).
+# Never includes job content — path + format only.
+_legacy_store_warnings_emitted: Set[Tuple[str, str]] = set()
+_legacy_store_warnings_lock = threading.Lock()
 
+
+def _canonical_jobs_path(jobs_file: Path) -> str:
+    """Stable path key for warn-once (resolve when possible)."""
+    try:
+        return str(jobs_file.resolve())
+    except OSError:
+        return str(jobs_file)
+
+
+def _warn_legacy_jobs_store_once(jobs_file: Path, legacy_format: str) -> None:
+    """Emit at most one legacy-format warning per process + path + format."""
+    key = (_canonical_jobs_path(jobs_file), legacy_format)
+    with _legacy_store_warnings_lock:
+        if key in _legacy_store_warnings_emitted:
+            return
+        _legacy_store_warnings_emitted.add(key)
+    path = _canonical_jobs_path(jobs_file)
+    if legacy_format == _LEGACY_FORMAT_BARE_LIST:
+        logger.warning(
+            "Legacy cron jobs store at %s uses a bare JSON list "
+            '(expected {"jobs": [...]}). Load is read-only; '
+            "run 'hermes cron repair' to canonicalize the store.",
+            path,
+        )
+    elif legacy_format == _LEGACY_FORMAT_CONTROL_CHARS:
+        logger.warning(
+            "Legacy cron jobs store at %s contains unescaped control "
+            "characters. Load is read-only; run 'hermes cron repair' "
+            "to canonicalize the store.",
+            path,
+        )
+    else:
+        logger.warning(
+            "Legacy cron jobs store at %s uses a non-canonical format "
+            "(%s). Load is read-only; run 'hermes cron repair' to "
+            "canonicalize the store.",
+            path,
+            legacy_format,
+        )
+
+
+def _read_jobs_payload(jobs_file: Path) -> Tuple[Any, Optional[str]]:
+    """Parse jobs.json without mutating disk.
+
+    Returns ``(data, legacy_format)`` where ``legacy_format`` is one of
+    ``bare_list`` / ``control_chars`` / ``None`` (canonical dict envelope
+    that parsed under strict JSON).
+    """
+    strict_retry = False
     try:
         # utf-8-sig: Windows Notepad / PowerShell 5.1 Set-Content -Encoding UTF8
         # write a leading BOM; json.load under plain utf-8 raises
         # JSONDecodeError("Unexpected UTF-8 BOM") and takes down cron.
-        with open(jobs_file, 'r', encoding='utf-8-sig') as f:
+        with open(jobs_file, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
-        _strict_retry = True
+        strict_retry = True
         try:
-            with open(jobs_file, 'r', encoding='utf-8-sig') as f:
+            with open(jobs_file, "r", encoding="utf-8-sig") as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
-            logger.error("Failed to auto-repair jobs.json: %s", e)
-            raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+            logger.error("Failed to parse jobs.json: %s", e)
+            raise RuntimeError(
+                f"Cron database corrupted and unrepairable: {e}"
+            ) from e
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
 
-    # Validate the top-level JSON shape: accept a dict (expected) or a bare
-    # list (auto-repair). Anything else (str/number/null) is corruption that
-    # would otherwise raise an uncaught AttributeError on ``.get()`` and take
-    # down the whole cron subsystem.
     if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
-            # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
-            logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-        return jobs
+        if strict_retry:
+            return data, _LEGACY_FORMAT_CONTROL_CHARS
+        return data, None
     if isinstance(data, list):
-        # Bare array — likely saved/edited outside save_jobs(). Wrap it back
-        # into the expected {"jobs": [...]} structure.
-        if data:
-            save_jobs(data)
-            logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return data
-
+        return data, _LEGACY_FORMAT_BARE_LIST
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
     )
+
+
+def _jobs_list_from_payload(data: Any) -> List[Dict[str, Any]]:
+    """Extract the jobs list from a parsed payload (dict envelope or bare list)."""
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        if jobs is None:
+            return []
+        if not isinstance(jobs, list):
+            raise RuntimeError(
+                "Cron database corrupted: expected 'jobs' to be a list, "
+                f"got {type(jobs).__name__}"
+            )
+        return jobs
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(
+        f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
+    )
+
+
+def load_jobs() -> List[Dict[str, Any]]:
+    """Load all jobs from storage.
+
+    Pure read on every path: never creates directories, never rewrites
+    ``jobs.json``, and never mutates parent paths. Missing store → ``[]``.
+    Legacy bare-list and control-character stores are parsed in-memory and
+    returned as-is; a one-shot warning points operators at
+    ``hermes cron repair``.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+
+    data, legacy_format = _read_jobs_payload(jobs_file)
+    if legacy_format is not None:
+        _warn_legacy_jobs_store_once(jobs_file, legacy_format)
+    return _jobs_list_from_payload(data)
+
+
+def repair_legacy_jobs_store() -> Dict[str, Any]:
+    """Canonicalize a legacy/hand-edited jobs.json via the central write gate.
+
+    - Missing store → no-op (no directory creation).
+    - Canonical strict dict envelope → no-op (bytes untouched).
+    - Legacy bare list or control-character JSON → parse, then call
+      ``_save_jobs_unlocked`` under the existing jobs lock so the admission
+      lifecycle gate applies. Policy-valid / no_agent / disabled incomplete
+      records are rewritten to the canonical ``{"jobs": [...], "updated_at": ...}``
+      envelope. Any enabled incomplete LLM record raises
+      ``LlmCronAdmissionError`` and leaves disk byte-identical — never
+      auto-disables or invents admission fields.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    # Check before taking the lock so a never-used profile does not get a
+    # cron directory created solely by a no-op repair.
+    if not jobs_file.exists():
+        return {"changed": False, "jobs": 0, "reason": "missing"}
+
+    with _jobs_lock():
+        if not jobs_file.exists():
+            return {"changed": False, "jobs": 0, "reason": "missing"}
+
+        data, legacy_format = _read_jobs_payload(jobs_file)
+        jobs = _jobs_list_from_payload(data)
+        if legacy_format is None:
+            return {
+                "changed": False,
+                "jobs": len(jobs),
+                "reason": "canonical",
+            }
+
+        before = jobs_file.read_bytes()
+        # Central gate: validates admission first; raises before any write.
+        _save_jobs_unlocked(jobs)
+        after = jobs_file.read_bytes()
+        return {
+            "changed": after != before,
+            "jobs": len(jobs),
+            "reason": "repaired",
+            "format": legacy_format,
+        }
 
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):

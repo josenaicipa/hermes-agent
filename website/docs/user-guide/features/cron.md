@@ -210,6 +210,7 @@ hermes cron remove <job_id_or_name>
 hermes cron edit <job_id_or_name> [...flags]
 hermes cron status
 hermes cron tick
+hermes cron repair
 ```
 
 What they do:
@@ -219,6 +220,24 @@ What they do:
 - `run` — trigger the job on the next scheduler tick
 - `remove` — delete it entirely
 - `edit` — modify schedule, prompt, delivery, etc.
+- `repair` — canonicalize a legacy/hand-edited `jobs.json` (see below)
+
+### Repairing a legacy jobs store
+
+Reading cron jobs is always **read-only**. If `~/.hermes/cron/jobs.json` is a bare JSON list (hand-edited outside Hermes) or contains unescaped control characters, Hermes still loads the jobs for listing and scheduling, preserves the exact on-disk bytes, and emits a one-time warning pointing at repair. It never auto-rewrites the file on load.
+
+To rewrite the store into the canonical `{"jobs": [...], "updated_at": ...}` envelope:
+
+```bash
+hermes cron repair
+```
+
+Repair goes through the same central write gate as every other jobs-store mutation:
+
+- policy-valid LLM jobs, `no_agent` script jobs, and disabled/paused incomplete records are canonicalized
+- an **enabled incomplete LLM** record (missing `category` / `material_result_criterion`) is rejected with a clear admission error and the file is left **byte-identical** — repair never auto-disables jobs or invents admission fields
+
+If repair fails closed, set the missing admission fields with `hermes cron edit` (or pause/disable the job), then run `hermes cron repair` again.
 
 **Name-based lookup.** All four mutating verbs (`pause`, `resume`, `run`, `remove`, `edit`) plus the agent's `cronjob` tool now accept a job **name** (case-insensitive) in place of the hex ID. The agent and CLI both prefer an exact ID match if one exists; ambiguous name matches (multiple jobs sharing the same name) are refused with the full list of candidate IDs so you can pick one explicitly. Names are not unique, so this guard is load-bearing — it prevents silently mutating the wrong job when two share a name.
 

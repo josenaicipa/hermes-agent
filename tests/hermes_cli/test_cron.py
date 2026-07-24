@@ -313,6 +313,71 @@ class TestGatewayNotRunningWarning:
         assert "Gateway is not running" in out
 
 
+class TestCronRepairCommand:
+    """``hermes cron repair`` explicitly canonicalizes legacy jobs.json stores."""
+
+    def test_repair_bare_list_success(self, tmp_cron_dir, capsys):
+        import json
+        from cron.jobs import JOBS_FILE
+        from tests.fixtures.cron_llm_admission import LEGACY_TEST_LLM_ADMISSION
+
+        bare = [
+            {
+                "id": "clipair001",
+                "name": "cli-ok",
+                "enabled": True,
+                "prompt": "work",
+                "schedule": {
+                    "kind": "interval",
+                    "minutes": 60,
+                    "display": "every 60m",
+                },
+                "category": LEGACY_TEST_LLM_ADMISSION["category"],
+                "material_result_criterion": LEGACY_TEST_LLM_ADMISSION[
+                    "material_result_criterion"
+                ],
+            }
+        ]
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(json.dumps(bare).encode("utf-8"))
+
+        rc = cron_command(Namespace(cron_command="repair"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "repair" in out.lower() or "canonical" in out.lower()
+        on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        assert isinstance(on_disk, dict)
+        assert [j["id"] for j in on_disk["jobs"]] == ["clipair001"]
+
+    def test_repair_enabled_incomplete_returns_nonzero(self, tmp_cron_dir, capsys):
+        import json
+        from cron.jobs import JOBS_FILE
+
+        bare = [
+            {
+                "id": "clibad0001",
+                "name": "cli-bad",
+                "enabled": True,
+                "prompt": "work",
+                "schedule": {
+                    "kind": "interval",
+                    "minutes": 60,
+                    "display": "every 60m",
+                },
+            }
+        ]
+        original = json.dumps(bare).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+
+        rc = cron_command(Namespace(cron_command="repair"))
+        captured = capsys.readouterr()
+        combined = (captured.out or "") + (captured.err or "")
+        assert rc == 1
+        assert "admission" in combined.lower()
+        assert JOBS_FILE.read_bytes() == original
+
+
 class TestExternalCronProviderStatus:
     """With an external cron provider (e.g. Chronos), jobs fire via a
     NAS-mediated webhook, NOT the in-process ticker. The ticker-heartbeat /

@@ -185,5 +185,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+
+    # cron repair — explicit canonicalize of legacy/hand-edited jobs.json
+    cron_subparsers.add_parser(
+        "repair",
+        help=(
+            "Canonicalize a legacy/hand-edited jobs.json (bare list or "
+            "control-character JSON). Fails closed on enabled incomplete LLM jobs."
+        ),
+    )
+
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)
