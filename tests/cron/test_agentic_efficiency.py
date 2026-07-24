@@ -6,6 +6,7 @@ scheduler integration that appends exactly once per agentic model-path attempt.
 
 from __future__ import annotations
 
+import concurrent.futures
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -280,9 +281,11 @@ class TestClassifyResultadoMaterial:
         ]
         assert classify_resultado_material(messages) == "no"
 
-    def test_write_file_bytes_written_is_si(self):
+    def test_write_file_bytes_written_is_si(self, tmp_path):
         from cron.agentic_efficiency import classify_resultado_material
 
+        target = tmp_path / "a.py"
+        target.write_text("material", encoding="utf-8")
         messages = [
             {
                 "role": "assistant",
@@ -300,10 +303,27 @@ class TestClassifyResultadoMaterial:
                 "role": "tool",
                 "tool_call_id": "w1",
                 "name": "write_file",
-                "content": '{"bytes_written": 12, "resolved_path": "/tmp/a.py"}',
+                "content": (
+                    f'{{"bytes_written": 8, "resolved_path": "{target}"}}'
+                ),
             },
         ]
-        assert classify_resultado_material(messages) == "sí"
+        assert classify_resultado_material(messages, workdir=tmp_path) == "sí"
+
+    def test_write_file_missing_claimed_path_is_no(self, tmp_path):
+        from cron.agentic_efficiency import classify_resultado_material
+
+        missing = tmp_path / "missing.txt"
+        messages = [
+            {
+                "role": "tool",
+                "name": "write_file",
+                "content": (
+                    f'{{"bytes_written": 8, "resolved_path": "{missing}"}}'
+                ),
+            }
+        ]
+        assert classify_resultado_material(messages, workdir=tmp_path) == "no"
 
     def test_write_file_with_error_is_no(self):
         from cron.agentic_efficiency import classify_resultado_material
@@ -425,11 +445,51 @@ class TestClassifyResultadoMaterial:
         messages = [
             {
                 "role": "tool",
-                "name": "web_search",
+                "name": "unknown_tool",
                 "content": '{"success": true, "results": ["hit"]}',
             }
         ]
         assert classify_resultado_material(messages) == "no"
+
+    def test_structured_web_search_new_data_is_si(self):
+        from cron.agentic_efficiency import classify_resultado_material
+
+        messages = [
+            {
+                "role": "tool",
+                "name": "web_search",
+                "content": (
+                    '{"data": {"web": [{"title": "new fact", '
+                    '"url": "https://example.test/fact"}]}}'
+                ),
+            }
+        ]
+        assert classify_resultado_material(messages) == "sí"
+
+    def test_verified_external_action_receipt_is_si(self):
+        from cron.agentic_efficiency import classify_resultado_material
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "function": {
+                            "name": "cronjob",
+                            "arguments": '{"action": "create"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "cronjob",
+                "content": '{"job_id": "job-123", "status": "created"}',
+            },
+        ]
+        assert classify_resultado_material(messages) == "sí"
 
     def test_verified_filesystem_evidence_is_si(self, tmp_path):
         from cron.agentic_efficiency import classify_resultado_material
@@ -463,6 +523,54 @@ class TestClassifyResultadoMaterial:
         assert (
             classify_resultado_material(messages, workdir=tmp_path) == "no"
         )
+
+
+# ---------------------------------------------------------------------------
+# Final worker snapshot
+# ---------------------------------------------------------------------------
+
+
+class TestRecordAfterWorker:
+    def test_pending_future_records_final_messages_and_tokens(
+        self, monkeypatch, tmp_path
+    ):
+        from cron import agentic_efficiency as ae
+
+        _point_ledger(monkeypatch, tmp_path)
+        target = tmp_path / "future.txt"
+        target.write_text("material", encoding="utf-8")
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        agent = MagicMock()
+        agent.session_total_tokens = 5
+        agent._cron_worker_future = future
+        recorder = ae.OnceOnlyAgenticRecorder("gate")
+
+        immediate = ae.record_agentic_efficiency_after_worker(
+            recorder,
+            agent=agent,
+            fallback_result=None,
+            workdir=tmp_path,
+        )
+        assert immediate is False
+        assert not ae.AGENTIC_EFFICIENCY_FILE.exists()
+
+        agent.session_total_tokens = 987
+        future.set_result(
+            {
+                "messages": [
+                    {
+                        "role": "tool",
+                        "name": "write_file",
+                        "content": (
+                            f'{{"bytes_written": 8, "resolved_path": "{target}"}}'
+                        ),
+                    }
+                ]
+            }
+        )
+        assert _all_rows(ae.AGENTIC_EFFICIENCY_FILE) == [
+            ("gate", "sí", 987)
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +738,8 @@ class TestSchedulerAgenticLedger:
         agent = MagicMock()
         agent.session_total_tokens = 7
         agent.close = MagicMock()
+        target = tmp_path / "material.txt"
+        target.write_text("abc", encoding="utf-8")
         messages = [
             {
                 "role": "assistant",
@@ -647,7 +757,9 @@ class TestSchedulerAgenticLedger:
                 "role": "tool",
                 "tool_call_id": "w1",
                 "name": "write_file",
-                "content": '{"bytes_written": 3}',
+                "content": (
+                    f'{{"bytes_written": 3, "resolved_path": "{target}"}}'
+                ),
             },
         ]
         _run_job_with_agent(
@@ -694,18 +806,15 @@ class TestSchedulerAgenticLedger:
             raising=False,
         )
 
-        success, _out, _final, error = _run_job_with_agent(
-            {"id": "j6", "name": "t", "prompt": "hello"},
-            tmp_path=tmp_path,
-            agent=agent,
-        )
-        # Fail closed: agent may have "succeeded" but ledger must surface.
-        # Depending on wiring, either the whole job fails or error is set.
-        assert success is False or error
-        # Exactly zero rows after the failed first attempt (no silent partial).
-        # If a retry path re-appended, that would be a bug — ensure not >1.
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            _run_job_with_agent(
+                {"id": "j6", "name": "t", "prompt": "hello"},
+                tmp_path=tmp_path,
+                agent=agent,
+            )
+        assert calls["n"] == 1
         if ae.AGENTIC_EFFICIENCY_FILE.exists():
-            assert len(_all_rows(ae.AGENTIC_EFFICIENCY_FILE)) <= 1
+            assert _all_rows(ae.AGENTIC_EFFICIENCY_FILE) == []
 
     def test_existing_executions_ledger_unchanged(self, monkeypatch, tmp_path):
         """Rich executions table shape must not grow Task-A columns."""

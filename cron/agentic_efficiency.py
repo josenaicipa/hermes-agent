@@ -7,11 +7,12 @@ tiny: tipo, resultado_material, tokens — nothing else.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from hermes_constants import get_hermes_home
 
@@ -21,11 +22,33 @@ VALID_TIPOS = frozenset({"nueva", "retry", "gate"})
 VALID_RESULTADOS = frozenset({"sí", "no"})
 
 _lock = threading.RLock()
+logger = logging.getLogger(__name__)
 
 # Conservative: only treat these as structured mutation evidence.
 _WRITE_TOOLS = frozenset({"write_file"})
 _PATCH_TOOLS = frozenset({"patch"})
 _TERMINAL_TOOLS = frozenset({"terminal"})
+_DATA_TOOLS = frozenset({"web_search", "web_extract"})
+_EXTERNAL_ACTION_TOOLS = frozenset(
+    {
+        "cronjob",
+        "skill_manage",
+        "memory",
+        "memory_fabric_propose",
+        "image_generate",
+        "text_to_speech",
+        "tool_call",
+    }
+)
+_MUTATING_ACTIONS = frozenset(
+    {"create", "update", "pause", "resume", "remove", "run", "patch", "edit", "delete", "write_file", "add", "replace"}
+)
+_MUTATION_VERBS = frozenset(
+    {"create", "update", "delete", "remove", "send", "post", "publish", "upload", "write", "mutate", "run"}
+)
+_RECEIPT_KEYS = frozenset(
+    {"id", "job_id", "url", "path", "resolved_path", "status", "state", "image", "media", "created", "updated", "deleted", "removed", "sha", "commit"}
+)
 _GIT_COMMIT_RE = re.compile(
     r"(?:^|[;&|]\s*|\n\s*)git\s+commit\b",
     re.IGNORECASE,
@@ -165,19 +188,18 @@ def _is_material_write(payload: Mapping[str, Any], workdir: Optional[Path]) -> b
         return False
     if bytes_written <= 0:
         return False
-    # Optional verification when a concrete path is claimed and workdir is known.
-    # Absence of path is fine: structured bytes_written alone is enough.
     resolved = payload.get("resolved_path") or payload.get("path")
-    if resolved and workdir is not None:
-        try:
-            path = Path(str(resolved))
-            if path.is_absolute() and not path.exists():
-                # Structured tool still reported bytes_written; keep accepting
-                # the structured evidence (tool shape), not prose claims.
-                pass
-        except (TypeError, ValueError, OSError):
-            pass
-    return True
+    if not resolved:
+        return False
+    try:
+        path = Path(str(resolved))
+        if not path.is_absolute():
+            if workdir is None:
+                return False
+            path = workdir / path
+        return path.is_file()
+    except (TypeError, ValueError, OSError):
+        return False
 
 
 def _is_material_patch(payload: Mapping[str, Any]) -> bool:
@@ -197,6 +219,76 @@ def _is_material_git_commit(
     except (TypeError, ValueError):
         return False
     return exit_code == 0
+
+
+def _parse_args(args_s: str) -> Mapping[str, Any]:
+    try:
+        parsed = json.loads(args_s) if args_s else {}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, Mapping) else {}
+
+
+def _has_nonempty_data(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(_has_nonempty_data(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nonempty_data(v) for v in value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None and value is not False
+
+
+def _is_material_data(name: str, payload: Mapping[str, Any]) -> bool:
+    if name not in _DATA_TOOLS or payload.get("error"):
+        return False
+    if name == "web_search":
+        return _has_nonempty_data(payload.get("data") or payload.get("results"))
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and not item.get("error")
+        and _has_nonempty_data(item.get("content"))
+        for item in results
+    )
+
+
+def _has_receipt(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    for key, item in value.items():
+        if key in _RECEIPT_KEYS and _has_nonempty_data(item):
+            return True
+        if isinstance(item, Mapping) and _has_receipt(item):
+            return True
+        if isinstance(item, list) and any(_has_receipt(v) for v in item):
+            return True
+    return False
+
+
+def _is_material_external_action(
+    name: str, payload: Mapping[str, Any], args_s: str
+) -> bool:
+    if name not in _EXTERNAL_ACTION_TOOLS or payload.get("error"):
+        return False
+    args = _parse_args(args_s)
+    if name in {"image_generate", "text_to_speech"}:
+        return _has_receipt(payload)
+    if name == "memory_fabric_propose" and args.get("write") is not True:
+        return False
+    if name == "tool_call":
+        underlying = str(args.get("name") or "").lower()
+        if not any(verb in underlying for verb in _MUTATION_VERBS):
+            return False
+    else:
+        action = str(args.get("action") or "").lower()
+        if action and action not in _MUTATING_ACTIONS:
+            return False
+        if name in {"cronjob", "skill_manage", "memory"} and not action:
+            return False
+    return _has_receipt(payload)
 
 
 def classify_resultado_material(
@@ -227,7 +319,9 @@ def classify_resultado_material(
             continue
         if msg.get("role") != "tool":
             continue
-        name = str(msg.get("name") or "")
+        tid = msg.get("tool_call_id")
+        mapped_name, args_s = call_map.get(str(tid), ("", "")) if tid else ("", "")
+        name = str(msg.get("name") or mapped_name or "")
         payload = _parse_tool_json(msg.get("content"))
         if payload is None:
             continue
@@ -239,14 +333,19 @@ def classify_resultado_material(
             return "sí"
 
         if name in _TERMINAL_TOOLS:
-            tid = msg.get("tool_call_id")
             command = ""
             if tid and str(tid) in call_map:
-                tname, args_s = call_map[str(tid)]
+                tname, terminal_args_s = call_map[str(tid)]
                 if tname in _TERMINAL_TOOLS:
-                    command = _command_from_args(args_s)
+                    command = _command_from_args(terminal_args_s)
             if _is_material_git_commit(payload, command):
                 return "sí"
+
+        if _is_material_data(name, payload):
+            return "sí"
+
+        if _is_material_external_action(name, payload, args_s):
+            return "sí"
 
     return "no"
 
@@ -302,3 +401,53 @@ def record_agentic_efficiency_once(
     if recorder is None:
         return
     recorder.record(messages=messages, tokens=tokens, workdir=workdir)
+
+
+def record_agentic_efficiency_after_worker(
+    recorder: Optional[OnceOnlyAgenticRecorder],
+    *,
+    agent: Any,
+    fallback_result: Optional[Mapping[str, Any]],
+    workdir: Optional[Any] = None,
+    on_error: Optional[Callable[[BaseException], None]] = None,
+) -> bool:
+    """Record from the worker's final snapshot, immediately or via callback.
+
+    Returns ``True`` when recorded synchronously and ``False`` when a callback
+    was attached to an in-flight worker.  This avoids partial tokens/evidence
+    when a hard limit returns control before the worker finishes unwinding.
+    """
+    if recorder is None:
+        return True
+    future = getattr(agent, "_cron_worker_future", None) if agent is not None else None
+
+    def finalize(done_future: Any = None) -> None:
+        result: Any = fallback_result
+        if done_future is not None:
+            try:
+                candidate = done_future.result()
+                if isinstance(candidate, Mapping):
+                    result = candidate
+            except BaseException:
+                pass
+        messages = result.get("messages") if isinstance(result, Mapping) else None
+        tokens = int(getattr(agent, "session_total_tokens", 0) or 0)
+        recorder.record(messages=messages, tokens=tokens, workdir=workdir)
+
+    def callback(done_future: Any) -> None:
+        try:
+            finalize(done_future)
+        except BaseException as exc:
+            if on_error is not None:
+                on_error(exc)
+            else:
+                logger.exception("Deferred agentic-efficiency ledger write failed")
+
+    if future is not None and callable(getattr(future, "done", None)):
+        if not future.done():
+            future.add_done_callback(callback)
+            return False
+        finalize(future)
+        return True
+    finalize()
+    return True

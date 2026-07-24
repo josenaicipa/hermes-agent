@@ -294,9 +294,7 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 from cron.agentic_efficiency import (
     AgenticTipoError,
     OnceOnlyAgenticRecorder,
-    append_agentic_efficiency,
-    classify_resultado_material,
-    record_agentic_efficiency_once,
+    record_agentic_efficiency_after_worker,
     resolve_agentic_tipo,
 )
 
@@ -3209,7 +3207,6 @@ def run_job(
     # this recorder.
     _agentic_recorder: Optional[OnceOnlyAgenticRecorder] = None
     _agentic_model_attempted = False
-    _agentic_messages: list = []
     _agentic_result: Optional[dict] = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
@@ -3888,8 +3885,6 @@ def run_job(
                 context=_cron_context,
             )
             _agentic_result = result if isinstance(result, dict) else None
-            if isinstance(result, dict):
-                _agentic_messages = list(result.get("messages") or [])
         except AutonomousLimitError as _limit_exc:
             # Re-raise so the outer except builds the failure delivery; the
             # exception string already carries limit_reason=/limit_count=/action=
@@ -4011,16 +4006,6 @@ def run_job(
                 model=str(model),
                 provider=str(runtime.get("provider") or ""),
             )
-        # Exactly one agentic_efficiency row for this successful model-path run.
-        # Ledger write failures propagate (fail closed) and are not retried.
-        if _agentic_model_attempted and _agentic_recorder is not None:
-            _agentic_tokens = int(getattr(agent, "session_total_tokens", 0) or 0)
-            record_agentic_efficiency_once(
-                _agentic_recorder,
-                messages=_agentic_messages,
-                tokens=_agentic_tokens,
-                workdir=_job_workdir,
-            )
         return True, output, final_response, None
         
     except Exception as e:
@@ -4065,41 +4050,6 @@ def run_job(
                     _eff_decision.fingerprint,
                 )
 
-        # Model-path failures (including AutonomousLimitError) still record
-        # exactly once. Pre-dispatch failures leave _agentic_model_attempted
-        # False and skip the ledger. A ledger write failure here replaces the
-        # job error so the failure is visible and not silently dropped.
-        if _agentic_model_attempted and _agentic_recorder is not None:
-            try:
-                _agentic_tokens = 0
-                if agent is not None:
-                    _agentic_tokens = int(
-                        getattr(agent, "session_total_tokens", 0) or 0
-                    )
-                if (
-                    not _agentic_messages
-                    and isinstance(_agentic_result, dict)
-                ):
-                    _agentic_messages = list(
-                        _agentic_result.get("messages") or []
-                    )
-                record_agentic_efficiency_once(
-                    _agentic_recorder,
-                    messages=_agentic_messages,
-                    tokens=_agentic_tokens,
-                    workdir=_job_workdir,
-                )
-            except Exception as _ledger_exc:
-                error_msg = (
-                    f"{type(_ledger_exc).__name__}: {_ledger_exc} "
-                    f"(while recording agentic_efficiency; original: {error_msg})"
-                )
-                logger.exception(
-                    "Job '%s': agentic_efficiency ledger write failed: %s",
-                    job_name,
-                    _ledger_exc,
-                )
-
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -4119,6 +4069,25 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        # Record exactly once from the worker's final snapshot.  Hard-limit and
+        # inactivity paths can return while the worker thread is still
+        # unwinding; in that case this attaches a callback before teardown so
+        # messages and token totals are read only after the worker is done.
+        if _agentic_model_attempted and _agentic_recorder is not None:
+            def _log_deferred_ledger_error(_ledger_exc: BaseException) -> None:
+                logger.exception(
+                    "Job '%s': deferred agentic_efficiency ledger write failed: %s",
+                    job_name,
+                    _ledger_exc,
+                )
+
+            record_agentic_efficiency_after_worker(
+                _agentic_recorder,
+                agent=agent,
+                fallback_result=_agentic_result,
+                workdir=_job_workdir,
+                on_error=_log_deferred_ledger_error,
+            )
         if _compression_override is not None:
             try:
                 _compression_override.__exit__(None, None, None)
