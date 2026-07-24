@@ -1225,6 +1225,8 @@ class CLICommandsMixin:
                 "all": False,
                 "prompt": None,
                 "schedule": None,
+                "category": None,
+                "material_result_criterion": None,
                 "positionals": [],
             }
             i = 0
@@ -1264,6 +1266,12 @@ class CLICommandsMixin:
                 elif token == "--schedule" and i + 1 < len(tokens):
                     opts["schedule"] = tokens[i + 1]
                     i += 2
+                elif token == "--category" and i + 1 < len(tokens):
+                    opts["category"] = tokens[i + 1]
+                    i += 2
+                elif token == "--material-result-criterion" and i + 1 < len(tokens):
+                    opts["material_result_criterion"] = tokens[i + 1]
+                    i += 2
                 else:
                     opts["positionals"].append(token)
                     i += 1
@@ -1279,7 +1287,7 @@ class CLICommandsMixin:
             print()
             print("  Commands:")
             print("    /cron list")
-            print('    /cron add "every 2h" "Check server status" [--skill blogwatcher]')
+            print('    /cron add "every 2h" "Check server status" --category event --material-result-criterion "verified status report"')
             print('    /cron edit <job_id> --schedule "every 4h" --prompt "New task"')
             print("    /cron edit <job_id> --skill blogwatcher --skill maps")
             print("    /cron edit <job_id> --remove-skill blogwatcher")
@@ -1356,6 +1364,8 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=skills or None,
+                category=opts["category"],
+                material_result_criterion=opts["material_result_criterion"],
             )
             if result.get("success"):
                 print(f"(^_^)b Created job: {result['job_id']}")
@@ -1402,6 +1412,8 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=final_skills,
+                category=opts["category"],
+                material_result_criterion=opts["material_result_criterion"],
             )
             if result.get("success"):
                 job = result["job"]

@@ -43,21 +43,28 @@ Without both, create fails closed (the job is not enabled). The same rule applie
 ### In chat with `/cron`
 
 ```bash
-/cron add 30m "Remind me to check the build"
-/cron add "every 2h" "Check server status"
-/cron add "every 1h" "Summarize new feed items" --skill blogwatcher
-/cron add "every 1h" "Use both skills and combine the result" --skill blogwatcher --skill maps
+/cron add 30m "Remind me to check the build" --category event --material-result-criterion "reminder delivered"
+/cron add "every 2h" "Check server status" --category justified_cadence --material-result-criterion "verified status report delivered"
+/cron add "every 1h" "Summarize new feed items" --skill blogwatcher --category event --material-result-criterion "summary delivered when new items exist"
+/cron add "every 1h" "Use both skills and combine the result" --skill blogwatcher --skill maps --category event --material-result-criterion "combined brief delivered when new items exist"
 ```
 
 ### From the standalone CLI
 
 ```bash
-hermes cron create "every 2h" "Check server status"
-hermes cron create "every 1h" "Summarize new feed items" --skill blogwatcher
+hermes cron create "every 2h" "Check server status" \
+  --category justified_cadence \
+  --material-result-criterion "verified status report delivered"
+hermes cron create "every 1h" "Summarize new feed items" \
+  --skill blogwatcher \
+  --category event \
+  --material-result-criterion "summary delivered when new items exist"
 hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
   --skill maps \
-  --name "Skill combo"
+  --name "Skill combo" \
+  --category event \
+  --material-result-criterion "combined brief delivered when new items exist"
 ```
 
 ### Through natural conversation
@@ -83,6 +90,8 @@ cronjob(
     prompt="Check the configured feeds and summarize anything new.",
     schedule="0 9 * * *",
     name="Morning feeds",
+    category="justified_cadence",
+    material_result_criterion="verified morning feed summary delivered",
 )
 ```
 
@@ -97,6 +106,8 @@ cronjob(
     prompt="Look for new local events and interesting nearby places, then combine them into one short brief.",
     schedule="every 6h",
     name="Local brief",
+    category="event",
+    material_result_criterion="local brief delivered when new events exist",
 )
 ```
 
@@ -110,7 +121,9 @@ Cron jobs default to running detached from any repo — no `AGENTS.md`, `CLAUDE.
 # Standalone CLI (schedule and prompt are positional)
 hermes cron create "every 1d at 09:00" \
   "Audit open PRs, summarize CI health, and post to #eng" \
-  --workdir /home/me/projects/acme
+  --workdir /home/me/projects/acme \
+  --category justified_cadence \
+  --material-result-criterion "verified CI audit posted to #eng"
 ```
 
 ```python
@@ -120,6 +133,8 @@ cronjob(
     schedule="every 1d at 09:00",
     workdir="/home/me/projects/acme",
     prompt="Audit open PRs, summarize CI health, and post to #eng",
+    category="justified_cadence",
+    material_result_criterion="verified CI audit posted to #eng",
 )
 ```
 
@@ -489,6 +504,8 @@ cronjob(
     prompt="Fetch the top 10 AI/ML stories from Hacker News. Save them to ~/.hermes/data/briefs/raw.md in markdown format with title, URL, and score.",
     schedule="0 7 * * *",
     name="AI News Collector",
+    category="justified_cadence",
+    material_result_criterion="raw brief file contains 10 verified stories",
 )
 
 # Job 2: Triage — receives Job 1's output as context
@@ -499,6 +516,8 @@ cronjob(
     schedule="30 7 * * *",
     context_from="<job1_id>",
     name="AI News Triage",
+    category="justified_cadence",
+    material_result_criterion="ranked brief file contains the top 5 stories",
 )
 
 # Job 3: Ship — receives Job 2's output as context
@@ -508,6 +527,8 @@ cronjob(
     schedule="0 8 * * *",
     context_from="<job2_id>",
     name="AI News Brief",
+    category="justified_cadence",
+    material_result_criterion="three tweet drafts delivered",
 )
 ```
 
@@ -594,6 +615,8 @@ cronjob(
     prompt="...",
     schedule="every 2h",
     repeat=5,
+    category="justified_cadence",
+    material_result_criterion="verifiable task output delivered on each run",
 )
 ```
 
@@ -602,7 +625,7 @@ cronjob(
 The agent-facing API is one tool:
 
 ```python
-cronjob(action="create", ...)
+cronjob(action="create", category="event", material_result_criterion="verified outcome", ...)
 cronjob(action="list")
 cronjob(action="update", job_id="...")
 cronjob(action="pause", job_id="...")
@@ -629,6 +652,8 @@ Tighter per-job control is available via the `enabled_toolsets` field on `cronjo
 cronjob(action="create", name="weekly-news-summary",
         schedule="every sunday 9am",
         enabled_toolsets=["web", "file"],      # just web + file, no terminal/browser/etc.
+        category="justified_cadence",
+        material_result_criterion="verified weekly news summary delivered",
         prompt="Summarize this week's AI news: ...")
 ```
 
@@ -684,6 +709,8 @@ fi
 cronjob(action="create", name="process-feed",
         schedule="every 30m",
         script="feed-changed.sh",
+        category="event",
+        material_result_criterion="feed change summary delivered",
         prompt="A new ~/data/feed.json has landed. Summarize what changed.")
 ```
 
@@ -704,6 +731,8 @@ fi
 cronjob(action="create", name="nightly-analysis",
         schedule="0 9 * * *",
         script="flag-ready.sh",
+        category="event",
+        material_result_criterion="nightly analysis artifact produced",
         prompt="Run the nightly analysis over today's batch.")
 ```
 
@@ -727,6 +756,8 @@ else:
 cronjob(action="create", name="summarize-new-msgs",
         schedule="every 2h",
         script="new-rows.py",
+        category="event",
+        material_result_criterion="new-message summary delivered",
         prompt="Summarize the new messages from the last 2 hours.")
 ```
 
@@ -746,6 +777,8 @@ A cron job can consume the most recent successful output of one or more other jo
 cronjob(action="create", name="daily-digest",
         schedule="every day 7am",
         context_from=["ai-news-fetch", "github-prs-fetch"],
+        category="justified_cadence",
+        material_result_criterion="daily digest delivered from both upstream outputs",
         prompt="Write the daily digest using the outputs above.")
 ```
 

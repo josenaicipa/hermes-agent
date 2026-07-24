@@ -15801,6 +15801,8 @@ def _(rid, params: dict) -> dict:
                         name=jid,
                         schedule=params.get("schedule", ""),
                         prompt=params.get("prompt", ""),
+                        category=params.get("category"),
+                        material_result_criterion=params.get("material_result_criterion"),
                     )
                 ),
             )
