@@ -24,36 +24,24 @@ def hermes_env(tmp_path, monkeypatch):
     admission defaults (see ``_cron_llm_admission_test_defaults`` in
     ``tests/conftest.py``), so create/resume hit production fail-closed
     behavior with no env-controlled bypass.
+
+    ``cron.jobs`` resolves the store from the current HERMES_HOME /
+    ``use_cron_store`` context dynamically — do not reload the module here
+    (reload would desync the suite-wide create_job wrapper in other files).
+
+    Hold an explicit store override for the entire test so production cron
+    calls and raw fixture writes share the same isolated jobs file.  The
+    ContextVar is reset automatically during fixture teardown.
     """
+    import cron.jobs
+
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "scripts").mkdir()
     (home / "cron").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-
-    import importlib
-    import hermes_constants
-    importlib.reload(hermes_constants)
-    import cron.jobs
-    importlib.reload(cron.jobs)
-
-    # Rebind tool-module imports after reload so create/resume hit the
-    # current jobs.py implementation under this HERMES_HOME.
-    try:
-        import tools.cronjob_tools as cronjob_tools_mod
-
-        monkeypatch.setattr(cronjob_tools_mod, "create_job", cron.jobs.create_job)
-        monkeypatch.setattr(cronjob_tools_mod, "resume_job", cron.jobs.resume_job)
-        monkeypatch.setattr(cronjob_tools_mod, "update_job", cron.jobs.update_job)
-        monkeypatch.setattr(cronjob_tools_mod, "get_job", cron.jobs.get_job)
-        monkeypatch.setattr(cronjob_tools_mod, "list_jobs", cron.jobs.list_jobs)
-        monkeypatch.setattr(cronjob_tools_mod, "pause_job", cron.jobs.pause_job)
-        monkeypatch.setattr(cronjob_tools_mod, "remove_job", cron.jobs.remove_job)
-        monkeypatch.setattr(cronjob_tools_mod, "resolve_job_ref", cron.jobs.resolve_job_ref)
-    except Exception:
-        pass
-
-    return home
+    with cron.jobs.use_cron_store(home):
+        yield home
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +150,82 @@ def test_create_no_agent_job_exempt_from_admission(hermes_env):
 
 
 # ---------------------------------------------------------------------------
+# Optional material-criterion allowlist (blueprint/suggestion surface)
+# ---------------------------------------------------------------------------
+
+
+def test_check_admission_allowlist_accepts_listed_criterion():
+    from cron.jobs import (
+        LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        check_llm_admission_for_enable,
+    )
+
+    check_llm_admission_for_enable(
+        category="event",
+        material_result_criterion="alerta_accionable",
+        allowed_material_criteria=LLM_BLUEPRINT_MATERIAL_CRITERIA,
+    )
+
+
+def test_check_admission_allowlist_rejects_unlisted_criterion():
+    from cron.jobs import (
+        LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        LlmCronAdmissionError,
+        check_llm_admission_for_enable,
+    )
+
+    with pytest.raises(LlmCronAdmissionError, match="material_result_criterion") as excinfo:
+        check_llm_admission_for_enable(
+            category="event",
+            material_result_criterion="free-text outcome not in allowlist",
+            allowed_material_criteria=LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        )
+    err = str(excinfo.value)
+    assert "alerta_accionable" in err
+    assert "archivo_entregado" in err
+    assert "integracion_produccion" in err
+    assert "metrica_registrada" in err
+
+
+def test_check_admission_allowlist_lists_both_missing_fields():
+    from cron.jobs import (
+        LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        LlmCronAdmissionError,
+        check_llm_admission_for_enable,
+    )
+
+    with pytest.raises(LlmCronAdmissionError) as excinfo:
+        check_llm_admission_for_enable(
+            allowed_material_criteria=LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        )
+    err = str(excinfo.value)
+    assert "category" in err
+    assert "material_result_criterion" in err
+
+
+def test_check_admission_without_allowlist_accepts_any_nonempty_criterion():
+    from cron.jobs import check_llm_admission_for_enable
+
+    # Existing non-blueprint callers: free-text criteria remain valid.
+    check_llm_admission_for_enable(
+        category="justified_cadence",
+        material_result_criterion="CRM deal id appears on Calendar with matching ids",
+    )
+
+
+def test_check_admission_allowlist_no_agent_exempt():
+    from cron.jobs import (
+        LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        check_llm_admission_for_enable,
+    )
+
+    check_llm_admission_for_enable(
+        no_agent=True,
+        allowed_material_criteria=LLM_BLUEPRINT_MATERIAL_CRITERIA,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Grandfathering — existing enabled jobs without fields stay enabled
 # ---------------------------------------------------------------------------
 
@@ -213,10 +277,11 @@ def _legacy_enabled_incomplete_llm(**overrides):
 
 def test_legacy_enabled_llm_job_loads_and_stays_enabled(hermes_env):
     """Jobs written before the policy remain readable and enabled."""
-    from cron.jobs import JOBS_FILE, ensure_dirs, get_job, list_jobs, load_jobs
+    from cron.jobs import ensure_dirs, get_job, list_jobs, load_jobs
 
     ensure_dirs()
-    _write_raw_jobs(JOBS_FILE, [_legacy_enabled_incomplete_llm()])
+    jobs_file = hermes_env / "cron" / "jobs.json"
+    _write_raw_jobs(jobs_file, [_legacy_enabled_incomplete_llm()])
 
     loaded = load_jobs()
     assert len(loaded) == 1
@@ -230,7 +295,7 @@ def test_legacy_enabled_llm_job_loads_and_stays_enabled(hermes_env):
 
     active = list_jobs(include_disabled=False)
     assert any(j["id"] == "legacy44crm" for j in active)
-    assert JOBS_FILE.exists()
+    assert jobs_file.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -551,16 +616,17 @@ def test_update_job_clearing_admission_via_empty_string_rejected(hermes_env):
 
 def test_save_jobs_rejects_new_enabled_incomplete_llm_record(hermes_env):
     """Public save/import path cannot introduce a new incomplete enabled LLM cron."""
-    from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs, save_jobs
+    from cron.jobs import ensure_dirs, load_jobs, save_jobs
 
     ensure_dirs()
+    jobs_file = hermes_env / "cron" / "jobs.json"
     incomplete = _legacy_enabled_incomplete_llm(id="brandnew99", name="Illicit import")
 
     with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
         save_jobs([incomplete])
 
     # Nothing persisted (or empty store preserved).
-    if JOBS_FILE.exists():
+    if jobs_file.exists():
         assert load_jobs() == []
 
 
@@ -588,11 +654,11 @@ def test_save_jobs_rejects_stripping_fields_from_enabled_compliant_record(hermes
 
 def test_save_jobs_rejects_unrelated_persist_of_legacy_enabled_incomplete(hermes_env):
     """Even bookkeeping cannot persist an enabled LLM cron without declarations."""
-    from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs, save_jobs
+    from cron.jobs import ensure_dirs, load_jobs, save_jobs
 
     ensure_dirs()
     legacy = _legacy_enabled_incomplete_llm()
-    _write_raw_jobs(JOBS_FILE, [legacy])
+    _write_raw_jobs(hermes_env / "cron" / "jobs.json", [legacy])
 
     jobs = load_jobs()
     assert len(jobs) == 1
@@ -613,11 +679,11 @@ def test_save_jobs_rejects_unrelated_persist_of_legacy_enabled_incomplete(hermes
 
 def test_update_job_rejects_any_edit_of_legacy_enabled_incomplete(hermes_env):
     """update_job cannot mutate an enabled legacy LLM until it is classified."""
-    from cron.jobs import JOBS_FILE, ensure_dirs, get_job, update_job
+    from cron.jobs import ensure_dirs, get_job, update_job
 
     ensure_dirs()
     legacy = _legacy_enabled_incomplete_llm()
-    _write_raw_jobs(JOBS_FILE, [legacy])
+    _write_raw_jobs(hermes_env / "cron" / "jobs.json", [legacy])
 
     with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
         update_job("legacy44crm", {"name": "renamed but still incomplete"})

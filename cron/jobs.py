@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any, Set, Tuple, Union
+from typing import Optional, Dict, List, Any, Collection, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,19 @@ LLM_ADMISSION_CATEGORIES = frozenset(
     {"event", "justified_cadence", "necessary_as_is"}
 )
 
+# Standard material-result criteria for skill blueprints, parameterized
+# automation blueprints, and curated/suggestion job specs. Direct cronjob /
+# create_job callers that do not pass an allowlist still accept any non-empty
+# free-text criterion (existing contract).
+LLM_BLUEPRINT_MATERIAL_CRITERIA = frozenset(
+    {
+        "integracion_produccion",
+        "archivo_entregado",
+        "metrica_registrada",
+        "alerta_accionable",
+    }
+)
+
 
 class LlmCronAdmissionError(ValueError):
     """Raised when an LLM cron lacks required admission declarations."""
@@ -137,17 +150,28 @@ def check_llm_admission_for_enable(
     no_agent: Any = False,
     category: Any = None,
     material_result_criterion: Any = None,
+    allowed_material_criteria: Optional[Collection[str]] = None,
 ) -> None:
     """Fail closed if an LLM cron is missing admission fields required to enable.
 
     Deterministic ``no_agent=True`` script-only jobs are exempt. Invalid
     categories always fail closed for LLM jobs.
+
+    When ``allowed_material_criteria`` is omitted, any non-empty criterion is
+    accepted (legacy create_job / cronjob tool surface). When an allowlist is
+    supplied (blueprints / suggestions), the criterion must be one of those
+    exact values; invalid-criterion errors name ``material_result_criterion``
+    and the allowed set. Missing category and criterion are both listed.
     """
     if bool(no_agent):
         return
 
     cat = normalize_llm_admission_category(category)
     crit = normalize_material_result_criterion(material_result_criterion)
+    allowed_set: Optional[frozenset] = None
+    if allowed_material_criteria is not None:
+        allowed_set = frozenset(allowed_material_criteria)
+
     problems: List[str] = []
     if cat is None:
         problems.append("category is required")
@@ -158,16 +182,30 @@ def check_llm_admission_for_enable(
         )
     if crit is None:
         problems.append("material_result_criterion is required (non-empty)")
+    elif allowed_set is not None and crit not in allowed_set:
+        problems.append(
+            "material_result_criterion must be one of "
+            f"{sorted(allowed_set)}, got {crit!r}"
+        )
     if not problems:
         return
 
-    allowed = ", ".join(sorted(LLM_ADMISSION_CATEGORIES))
+    allowed_cats = ", ".join(sorted(LLM_ADMISSION_CATEGORIES))
+    if allowed_set is not None:
+        allowed_crits = ", ".join(sorted(allowed_set))
+        criterion_clause = (
+            f"and material_result_criterion (one of: {allowed_crits})"
+        )
+    else:
+        criterion_clause = (
+            "and a non-empty material_result_criterion describing the "
+            "verifiable material result"
+        )
     raise LlmCronAdmissionError(
         "LLM cron admission failed: "
         + "; ".join(problems)
         + ". Every new or reactivated LLM cron must declare category "
-        f"(one of: {allowed}) and a non-empty material_result_criterion "
-        "describing the verifiable material result. Script-only jobs with "
+        f"(one of: {allowed_cats}) {criterion_clause}. Script-only jobs with "
         "no_agent=true are exempt."
     )
 
