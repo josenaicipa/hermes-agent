@@ -543,6 +543,43 @@ class TestClassifyResultadoMaterial:
         ]
         assert classify_resultado_material(messages) == "no"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            '{"job_id": "j", "failed": true}',
+            '{"job_id": "j", "cancelled": true}',
+            '{"job_id": "j", "result": {"failed": true}}',
+            '{"job_id": "j", "results": [{"failed": true}]}',
+            '{"job_id": "j", "ok": false}',
+            '{"job_id": "j", "status": 500}',
+            '{"job_id": "j", "exit_code": 1}',
+        ],
+    )
+    def test_external_failure_shapes_are_no(self, payload):
+        from cron.agentic_efficiency import classify_resultado_material
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c-failure-shape",
+                        "function": {
+                            "name": "cronjob",
+                            "arguments": '{"action": "create"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c-failure-shape",
+                "name": "cronjob",
+                "content": payload,
+            },
+        ]
+        assert classify_resultado_material(messages) == "no"
+
     def test_verified_filesystem_evidence_is_si(self, tmp_path):
         from cron.agentic_efficiency import classify_resultado_material
 

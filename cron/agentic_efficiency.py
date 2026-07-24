@@ -273,10 +273,23 @@ def _has_receipt(value: Any) -> bool:
 
 def _payload_failed(value: Any) -> bool:
     if isinstance(value, Mapping):
-        if value.get("success") is False or bool(value.get("error")):
+        if value.get("success") is False or value.get("ok") is False:
             return True
-        status = str(value.get("status") or value.get("state") or "").lower()
+        if any(
+            value.get(flag) is True
+            for flag in ("failed", "cancelled", "canceled")
+        ):
+            return True
+        if bool(value.get("error")) or bool(value.get("errors")):
+            return True
+        raw_status = value.get("status") or value.get("state") or ""
+        if isinstance(raw_status, int) and raw_status >= 400:
+            return True
+        status = str(raw_status).lower()
         if status in _FAILED_STATUSES:
+            return True
+        exit_code = value.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
             return True
         return any(_payload_failed(item) for item in value.values())
     if isinstance(value, (list, tuple)):
