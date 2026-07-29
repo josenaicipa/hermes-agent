@@ -110,6 +110,54 @@ def test_foreground_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/live", "bounded_capture": True})]
 
 
+def test_recreated_environment_uses_recorded_session_cwd(monkeypatch):
+    """After idle cleanup removes the env, recreation must retain the session cwd."""
+    created = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace/live"
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "session-recreate-cwd"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _minimal_terminal_config(cwd="/workspace/config"),
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool, "_resolve_container_task_id", lambda value: "default"
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    def fake_create_environment(**kwargs):
+        created.append(kwargs)
+        return FakeEnv()
+
+    monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+    terminal_tool.record_session_cwd(task_id, "/workspace/live")
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert len(created) == 1
+    assert created[0]["cwd"] == "/workspace/live"
+    # Local environments do not need a separate host mount path.
+    assert created[0]["host_cwd"] is None
+
+
 def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
     """Background process launches must also use the recorded session cwd."""
 

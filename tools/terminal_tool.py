@@ -2282,7 +2282,17 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd, host_cwd = resolve_task_environment_paths(task_id, config)
+        # Pass the session's recorded live cwd (if any) as the fallback so
+        # this call agrees with file_tools._get_file_ops's identical
+        # resolve_task_environment_paths(..., fallback_cwd=get_session_cwd(...))
+        # call. Both are "environment creator" call sites per the helper's
+        # contract; whichever one races to create the sandbox first must
+        # compute the same cwd/host_cwd, otherwise a session's last-known
+        # directory (from a prior `cd`) is silently dropped when the
+        # environment is (re)created here instead of from file_tools.
+        cwd, host_cwd = resolve_task_environment_paths(
+            task_id, config, fallback_cwd=get_session_cwd(task_id)
+        )
         default_timeout = config["timeout"]
 
         effective_timeout = timeout or default_timeout

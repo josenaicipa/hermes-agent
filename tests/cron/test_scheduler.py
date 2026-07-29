@@ -1549,6 +1549,37 @@ class TestRunJobSessionPersistence:
         assert success is True
         cleanup_mock.assert_called_once()
 
+    def test_agentic_ledger_failure_happens_after_required_cleanup(self, tmp_path):
+        """A telemetry-only write failure must not bypass run_job teardown."""
+        job = {
+            "id": "ledger-failure-job",
+            "name": "ledger-failure",
+            "prompt": "hello",
+        }
+        order = []
+
+        def fail_ledger(*args, **kwargs):
+            order.append("ledger")
+            raise RuntimeError("ledger unavailable")
+
+        with self._run_job_patches(tmp_path), \
+             patch(
+                 "gateway.session_context.clear_session_vars",
+                 side_effect=lambda tokens: order.append("session-vars"),
+             ), \
+             patch(
+                 "cron.scheduler._teardown_cron_agent",
+                 side_effect=lambda agent, job_id: order.append("teardown"),
+             ), \
+             patch(
+                 "cron.scheduler.record_agentic_efficiency_after_worker",
+                 side_effect=fail_ledger,
+             ):
+            with pytest.raises(RuntimeError, match="ledger unavailable"):
+                run_job(job)
+
+        assert order == ["session-vars", "teardown", "ledger"]
+
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
         """Apply every patch run_job tests need, as one bundle.

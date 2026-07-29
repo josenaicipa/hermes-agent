@@ -7,13 +7,16 @@ that were never declared in the tool's JSON Schema ``parameters.properties``.
 Handlers that unpack ``**args`` into a strict function signature then raise
 ``TypeError: unexpected keyword argument``, silently breaking the tool call.
 
-strip_unrecognized_tool_args() drops any top-level argument key not present
-in the tool's declared schema (unless the schema explicitly opts into
-freeform args via ``"additionalProperties": true``), so hallucinated fields
-never reach handler code, and logs a warning so the occurrence is observable.
+strip_unrecognized_tool_args() drops unknown top-level arguments only for
+simple schemas that explicitly close the object with
+``"additionalProperties": false``. Open, composed, referenced, or
+pattern-based schemas pass through unchanged so valid arguments are never
+silently discarded.
 """
 
 from unittest.mock import patch
+
+import pytest
 
 from model_tools import strip_unrecognized_tool_args
 
@@ -21,7 +24,7 @@ from model_tools import strip_unrecognized_tool_args
 class TestStripUnrecognizedToolArgs:
     """Unit tests for strip_unrecognized_tool_args."""
 
-    def _mock_schema(self, properties, additional_properties=None):
+    def _mock_schema(self, properties, additional_properties: object = False):
         parameters = {"type": "object", "properties": properties}
         if additional_properties is not None:
             parameters["additionalProperties"] = additional_properties
@@ -62,6 +65,41 @@ class TestStripUnrecognizedToolArgs:
             args = {"name": "click", "x": 100, "y": 200}
             result = strip_unrecognized_tool_args("test_tool", args)
             assert result == {"name": "click", "x": 100, "y": 200}
+
+    def test_respects_schema_valued_additional_properties(self):
+        schema = self._mock_schema(
+            {"name": {"type": "string"}},
+            additional_properties={"type": "string"},
+        )
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"name": "click", "selector": "#submit"}
+            result = strip_unrecognized_tool_args("test_tool", args)
+            assert result == args
+
+    def test_open_schema_without_additional_properties_is_not_filtered(self):
+        schema = self._mock_schema({"name": {"type": "string"}}, None)
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"name": "click", "selector": "#submit"}
+            result = strip_unrecognized_tool_args("test_tool", args)
+            assert result == args
+
+    @pytest.mark.parametrize(
+        ("keyword", "value"),
+        [
+            ("allOf", [{"properties": {"extra": {"type": "string"}}}]),
+            ("anyOf", [{"properties": {"extra": {"type": "string"}}}]),
+            ("oneOf", [{"properties": {"extra": {"type": "string"}}}]),
+            ("$ref", "#/$defs/toolArgs"),
+            ("patternProperties", {"^x-": {"type": "string"}}),
+        ],
+    )
+    def test_composed_or_pattern_schema_is_not_filtered(self, keyword, value):
+        schema = self._mock_schema({"name": {"type": "string"}})
+        schema["parameters"][keyword] = value
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"name": "click", "extra": "valid-via-schema"}
+            result = strip_unrecognized_tool_args("test_tool", args)
+            assert result == args
 
     def test_empty_properties_schema_strips_all_hallucinated_args(self):
         """A zero-arg tool (properties: {}) still must not silently accept
@@ -108,8 +146,8 @@ class TestStripUnrecognizedToolArgs:
             for record in caplog.records
         )
 
-    def test_against_real_read_file_schema(self):
-        """Integration check against the actual registered read_file schema."""
+    def test_real_open_read_file_schema_is_not_silently_closed(self):
+        """Missing additionalProperties means open under JSON Schema semantics."""
         args = {"file_path": "/tmp/x", "hallucinated_extra_param": True}
         result = strip_unrecognized_tool_args("read_file", args)
-        assert "hallucinated_extra_param" not in result
+        assert result == args

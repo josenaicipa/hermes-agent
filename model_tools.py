@@ -921,10 +921,10 @@ def strip_unrecognized_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[s
     native edit-tools is the suspected cause; third-party schemas pay the
     price. See: https://simonwillison.net/2026/Jul/4/better-models-worse-tools/
 
-    This strips any top-level key not present in the schema's declared
-    ``properties``, unless the schema explicitly opts into freeform args via
-    ``"additionalProperties": true`` (e.g. the raw CDP bridge or the generic
-    MCP tool_call bridge, which intentionally accept arbitrary shapes).
+    This strips top-level keys only for a simple, closed object schema with
+    explicit top-level ``properties``. Schemas that permit additional keys or
+    use composition, references, or pattern properties are left untouched;
+    flattening those contracts here would silently discard valid arguments.
     Stripped calls are logged as a warning -- grep ``malformed_tool_args`` in
     agent.log for a running count of how often models hallucinate fields --
     so this is observable without changing the tool's success/failure shape.
@@ -945,7 +945,22 @@ def strip_unrecognized_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[s
         return args
 
     parameters = schema.get("parameters") or {}
-    if parameters.get("additionalProperties") is True:
+    if not isinstance(parameters, dict):
+        return args
+
+    # Only an explicit ``additionalProperties: false`` defines a closed
+    # top-level contract safe for this lightweight filter. JSON Schema also
+    # permits a schema object here; that is an allow-contract, not a close.
+    if parameters.get("additionalProperties") is not False:
+        return args
+
+    # Top-level properties can be supplied/expanded by these JSON Schema
+    # constructs. Resolving them correctly requires a validator, so retain all
+    # arguments rather than risk changing third-party/plugin tool semantics.
+    if any(
+        key in parameters
+        for key in ("allOf", "anyOf", "oneOf", "$ref", "patternProperties")
+    ):
         return args
 
     properties = parameters.get("properties")

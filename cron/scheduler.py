@@ -4218,25 +4218,6 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Record exactly once from the worker's final snapshot.  Hard-limit and
-        # inactivity paths can return while the worker thread is still
-        # unwinding; in that case this attaches a callback before teardown so
-        # messages and token totals are read only after the worker is done.
-        if _agentic_model_attempted and _agentic_recorder is not None:
-            def _log_deferred_ledger_error(_ledger_exc: BaseException) -> None:
-                logger.exception(
-                    "Job '%s': deferred agentic_efficiency ledger write failed: %s",
-                    job_name,
-                    _ledger_exc,
-                )
-
-            record_agentic_efficiency_after_worker(
-                _agentic_recorder,
-                agent=agent,
-                fallback_result=_agentic_result,
-                workdir=_job_workdir,
-                on_error=_log_deferred_ledger_error,
-            )
         if _compression_override is not None:
             try:
                 _compression_override.__exit__(None, None, None)
@@ -4275,6 +4256,28 @@ def run_job(
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
+        # Telemetry is deliberately last: a synchronous ledger write can fail
+        # (for example on ENOSPC/read-only storage), but that must never skip
+        # compression restoration, ContextVar cleanup, session finalization,
+        # or agent/resource teardown. Hard-limit and inactivity paths can
+        # return while the worker thread is still unwinding; in that case this
+        # attaches a callback after teardown has been scheduled so messages
+        # and token totals are read only after the worker is done.
+        if _agentic_model_attempted and _agentic_recorder is not None:
+            def _log_deferred_ledger_error(_ledger_exc: BaseException) -> None:
+                logger.exception(
+                    "Job '%s': deferred agentic_efficiency ledger write failed: %s",
+                    job_name,
+                    _ledger_exc,
+                )
+
+            record_agentic_efficiency_after_worker(
+                _agentic_recorder,
+                agent=agent,
+                fallback_result=_agentic_result,
+                workdir=_job_workdir,
+                on_error=_log_deferred_ledger_error,
+            )
 
 
 def _finalize_cron_session(
