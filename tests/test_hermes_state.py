@@ -824,6 +824,100 @@ class TestSessionLifecycle:
         finally:
             db.close()
 
+    def test_profile_fuse_disables_trigram_but_keeps_base_fts(self, tmp_path):
+        """The profile marker removes only optional trigram functionality."""
+        marker = tmp_path / hermes_state._TRIGRAM_FTS_DISABLE_MARKER
+        marker.write_text("recurrent trigram corruption\n", encoding="utf-8")
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            assert db._fts_enabled is True
+            assert db._trigram_available is False
+            assert db._fts_table_exists("messages_fts") is True
+            assert db._fts_table_exists("messages_fts_trigram") is False
+            assert db._conn is not None
+
+            trigger_names = {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert trigger_names == set(hermes_state._BASE_FTS_TRIGGERS)
+
+            db.create_session(session_id="s1", source="cli")
+            db.append_message(
+                "s1", role="user", content="operacion normal disponible"
+            )
+            results = db.search_messages("operacion")
+            assert len(results) == 1
+            assert ">>>operacion<<<" in results[0]["snippet"]
+            assert "normal disponible" in results[0]["snippet"]
+        finally:
+            db.close()
+
+    def test_profile_fuse_handles_legacy_schema_and_safe_reenable(self, tmp_path):
+        """Legacy trigram is removed while fused and rebuilt after fuse removal."""
+        db_path = tmp_path / "state.db"
+        marker = tmp_path / hermes_state._TRIGRAM_FTS_DISABLE_MARKER
+
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="legacy", source="cli")
+            seeded.append_message(
+                "legacy", role="user", content="legacy search 大别山项目"
+            )
+            assert seeded._fts_table_exists("messages_fts_trigram") is True
+        finally:
+            seeded.close()
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("UPDATE schema_version SET version = 10")
+        conn.commit()
+        conn.close()
+        marker.write_text("recurrent trigram corruption\n", encoding="utf-8")
+
+        fused = SessionDB(db_path=db_path)
+        try:
+            assert fused._fts_enabled is True
+            assert fused._trigram_available is False
+            assert fused._fts_table_exists("messages_fts_trigram") is False
+            assert len(fused.search_messages("legacy")) == 1
+            assert len(fused.search_messages("大别山")) == 1
+            assert fused._conn is not None
+            trigger_names = {
+                row[0]
+                for row in fused._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert trigger_names == set(hermes_state._BASE_FTS_TRIGGERS)
+            assert fused._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+        finally:
+            fused.close()
+
+        marker.unlink()
+        restored = SessionDB(db_path=db_path)
+        try:
+            assert restored._trigram_available is True
+            assert restored._fts_table_exists("messages_fts_trigram") is True
+            assert len(restored.search_messages("大别山")) == 1
+            assert restored._conn is not None
+            trigger_names = {
+                row[0]
+                for row in restored._conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'messages_fts%'"
+                ).fetchall()
+            }
+            assert trigger_names == set(hermes_state._FTS_TRIGGERS)
+        finally:
+            restored.close()
+
     def test_existing_fts_tables_do_not_break_without_fts5(
         self, tmp_path, monkeypatch
     ):
@@ -5419,6 +5513,81 @@ class TestVacuum:
         db.append_message(session_id="s1", role="user", content="hi")
         # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
+
+
+class TestWalCheckpoint:
+    def test_try_wal_checkpoint_runs_passive_never_truncate(self, db, monkeypatch):
+        """Periodic checkpoints use PASSIVE; TRUNCATE stays maintenance-only."""
+
+        class _RecordingConnection:
+            """Wraps the real connection, recording every SQL statement."""
+
+            def __init__(self, real_conn):
+                self._real_conn = real_conn
+                self.executed_sql = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.executed_sql.append(sql)
+                return self._real_conn.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self._real_conn.close()
+
+        recorder = _RecordingConnection(db._conn)
+        monkeypatch.setattr(db, "_conn", recorder)
+
+        db._try_wal_checkpoint()
+
+        assert any(
+            "wal_checkpoint(PASSIVE)" in sql for sql in recorder.executed_sql
+        )
+        assert all("TRUNCATE" not in sql for sql in recorder.executed_sql)
+
+    def test_close_uses_passive_checkpoint(self, tmp_path, monkeypatch):
+        """Per-request close must not issue an exclusive TRUNCATE checkpoint."""
+
+        class _RecordingConnection:
+            def __init__(self, real_conn):
+                self._real_conn = real_conn
+                self.executed_sql = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.executed_sql.append(sql)
+                return self._real_conn.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self._real_conn.close()
+
+        session_db = SessionDB(db_path=tmp_path / "close_checkpoint.db")
+        recorder = _RecordingConnection(session_db._conn)
+        monkeypatch.setattr(session_db, "_conn", recorder)
+
+        session_db.close()
+
+        assert any(
+            "wal_checkpoint(PASSIVE)" in sql for sql in recorder.executed_sql
+        )
+        assert all("TRUNCATE" not in sql for sql in recorder.executed_sql)
+        assert session_db._conn is None
+
+    def test_try_wal_checkpoint_execute_failure_logs_warning_and_does_not_raise(
+        self, db, monkeypatch, caplog
+    ):
+        """A failing checkpoint pragma must be swallowed, not propagated."""
+
+        class _BoomConnection:
+            def execute(self, sql, *args, **kwargs):
+                raise sqlite3.OperationalError("simulated checkpoint failure")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(db, "_conn", _BoomConnection())
+
+        with caplog.at_level("WARNING"):
+            db._try_wal_checkpoint()  # must not raise
+
+        assert any(record.levelname == "WARNING" for record in caplog.records)
 
 
 class TestOptimizeFts:

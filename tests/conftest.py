@@ -440,6 +440,73 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _cron_llm_admission_test_defaults(request, monkeypatch):
+    """Inject LLM-cron admission defaults for legacy tests only (test-side).
+
+    Production ``create_job``/``save_jobs`` have no env-controlled escape
+    hatch. Legacy unit tests that predate category/material_result_criterion
+    get defaults via create_job/save_jobs wrappers installed only under
+    pytest. The focused admission suite
+    (``tests/cron/test_llm_admission_policy.py``) opts out so the real
+    fail-closed gate is exercised.
+    """
+    mod = getattr(request, "module", None)
+    mod_name = getattr(mod, "__name__", "") or ""
+    if mod_name.endswith("test_llm_admission_policy"):
+        return
+
+    import cron.jobs as jobs_mod
+    from tests.fixtures.cron_llm_admission import (
+        wrap_create_job_with_test_admission_defaults,
+        wrap_save_jobs_with_test_admission_defaults,
+    )
+
+    real_create = jobs_mod.create_job
+    # If a previous wrapper is already installed (should not happen across
+    # files under process-per-file isolation), unwrap to the real function.
+    if getattr(real_create, "_is_cron_admission_test_wrapper", False):
+        real_create = getattr(real_create, "__wrapped__", real_create)
+
+    wrapped = wrap_create_job_with_test_admission_defaults(real_create)
+    monkeypatch.setattr(jobs_mod, "create_job", wrapped)
+
+    real_save = jobs_mod.save_jobs
+    if getattr(real_save, "_is_cron_admission_test_wrapper", False):
+        real_save = getattr(real_save, "__wrapped__", real_save)
+    wrapped_save = wrap_save_jobs_with_test_admission_defaults(real_save)
+    monkeypatch.setattr(jobs_mod, "save_jobs", wrapped_save)
+
+    # Patch module-level ``from cron.jobs import create_job`` bindings in the
+    # requesting test module so top-level imports still hit the wrapper.
+    if mod is not None and hasattr(mod, "create_job"):
+        bound = getattr(mod, "create_job")
+        if bound is real_create or getattr(
+            bound, "_is_cron_admission_test_wrapper", False
+        ):
+            monkeypatch.setattr(mod, "create_job", wrapped)
+
+    # Same for module-level ``from cron.jobs import save_jobs`` bindings.
+    if mod is not None and hasattr(mod, "save_jobs"):
+        bound = getattr(mod, "save_jobs")
+        if bound is real_save or getattr(
+            bound, "_is_cron_admission_test_wrapper", False
+        ):
+            monkeypatch.setattr(mod, "save_jobs", wrapped_save)
+
+    # tools.cronjob_tools binds create_job at import time.
+    try:
+        import tools.cronjob_tools as cronjob_tools_mod
+
+        bound = getattr(cronjob_tools_mod, "create_job", None)
+        if bound is real_create or getattr(
+            bound, "_is_cron_admission_test_wrapper", False
+        ) or bound is jobs_mod.create_job:
+            monkeypatch.setattr(cronjob_tools_mod, "create_job", wrapped)
+    except Exception:
+        pass
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``

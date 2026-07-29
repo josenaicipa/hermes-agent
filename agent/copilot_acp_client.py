@@ -107,7 +107,11 @@ def _build_subprocess_env() -> dict[str, str]:
     home = _resolve_home_dir()
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
-    apply_subprocess_home_env(env)
+    # Copilot CLI authenticates as the operator (GH Copilot session lives
+    # under the real account home), so keep that identity even when Hermes
+    # itself is running in a container — unless the operator explicitly
+    # opted into profile-home isolation via TERMINAL_HOME_MODE=profile.
+    apply_subprocess_home_env(env, prefer_real=True)
     return env
 
 

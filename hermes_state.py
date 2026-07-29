@@ -43,10 +43,13 @@ from hermes_cli.sqlite_runtime import (
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
+    _BASE_FTS_TRIGGERS,
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
+    _TRIGRAM_FTS_DISABLE_MARKER,
+    _TRIGRAM_FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
     _ephemeral_child_sql,
@@ -989,6 +992,36 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+def _drop_trigram_fts_objects(conn: sqlite3.Connection) -> None:
+    """Drop every ``messages_fts_trigram`` object: the three message triggers,
+    the virtual table (which removes its shadow tables with it), and the
+    ``messages_fts_trigram_src`` source view.
+
+    The trigram triggers are attached to ``messages`` (``AFTER INSERT ON
+    messages``), so ``DROP TABLE`` alone does not remove them — they must be
+    dropped explicitly, or a later message write fires a trigger into a
+    now-absent table. The view is a separate ``sqlite_master`` object type
+    that ``DROP TABLE`` cannot remove, so it needs its own statement — left
+    behind, it is harmless to query but still a residual trigram object a
+    fused profile must not retain. Each statement is guarded because on a
+    still-malformed schema even a ``DROP ... IF EXISTS`` can raise
+    ``OperationalError``.
+    """
+    for trigger in _TRIGRAM_FTS_TRIGGERS:
+        try:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        except sqlite3.OperationalError:
+            pass
+    try:
+        conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+    except sqlite3.OperationalError:
+        pass
+
+
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
@@ -1013,6 +1046,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     Canonical ``sessions`` / ``messages`` rows are never modified. A
     timestamped raw backup is taken first unless ``backup=False``.
 
+    Profile-fuse aware: when the ``.disable-trigram-fts`` marker sits next to
+    state.db, any recovery strategy that runs skips rebuilding the optional
+    trigram index and drops every ``messages_fts_trigram`` object/trigger on
+    success, so a fused profile is never left with (or handed a rebuilt)
+    trigram index. Non-fused recovery preserves trigram exactly as before.
+
     Returns a report dict: ``{repaired: bool, strategy: str|None,
     backup_path: str|None, error: str|None}``.
     """
@@ -1033,6 +1072,26 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["strategy"] = "already_healthy"
         return report
 
+    # Profile-local fuse: when ``.disable-trigram-fts`` sits next to state.db,
+    # recovery must never rebuild, recreate, or leave behind the optional
+    # trigram index. Any strategy that actually runs skips the trigram rebuild
+    # and drops trigram objects/triggers on success via ``_succeed``. The
+    # already-healthy shortcut above is intentionally NOT fuse-normalised —
+    # nothing was recovered, and the SessionDB open path handles a healthy
+    # fused profile — so non-fused and no-op behaviour stays unchanged.
+    trigram_disabled = (db_path.parent / _TRIGRAM_FTS_DISABLE_MARKER).is_file()
+
+    def _succeed(strategy: str) -> Dict[str, Any]:
+        if trigram_disabled:
+            conn = sqlite3.connect(str(db_path), isolation_level=None)
+            try:
+                _drop_trigram_fts_objects(conn)
+            finally:
+                conn.close()
+        report["repaired"] = True
+        report["strategy"] = strategy
+        return report
+
     if backup:
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
@@ -1047,9 +1106,17 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             # The cjk index can only be rebuilt with its tokenizer loaded;
             # best-effort (a tokenizer-less host skips it at the probe below).
             load_fts5_cjk_extension(conn)
-            for table_name in (
-                "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
-            ):
+            if trigram_disabled:
+                # Fuse set: never rebuild the optional trigram index. Remove its
+                # triggers + table up front so the health probe's write cannot
+                # fire a trigram trigger into a stale/corrupt table.
+                _drop_trigram_fts_objects(conn)
+                rebuild_tables = ("messages_fts", "messages_fts_cjk")
+            else:
+                rebuild_tables = (
+                    "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
+                )
+            for table_name in rebuild_tables:
                 try:
                     conn.execute(
                         f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
@@ -1061,13 +1128,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
-            report["repaired"] = True
-            report["strategy"] = "rebuild_fts"
             logger.warning(
                 "state.db FTS indexes rebuilt in place (schema preserved): %s",
                 db_path,
             )
-            return report
+            return _succeed("rebuild_fts")
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db FTS in-place rebuild pass failed: %s", exc)
 
@@ -1114,13 +1179,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         finally:
             conn.close()
         if _db_opens_cleanly(db_path) is None:
-            report["repaired"] = True
-            report["strategy"] = "dedup_schema"
             logger.warning(
                 "state.db schema repaired by de-duplicating sqlite_master "
                 "(FTS index preserved): %s", db_path
             )
-            return report
+            return _succeed("dedup_schema")
     except sqlite3.DatabaseError as exc:
         logger.warning("state.db dedup repair pass failed: %s", exc)
 
@@ -1137,13 +1200,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             conn.close()
         reason = _db_opens_cleanly(db_path)
         if reason is None:
-            report["repaired"] = True
-            report["strategy"] = "drop_fts_rebuild"
             logger.warning(
                 "state.db schema repaired by dropping FTS schema; indexes "
                 "will rebuild from messages on next open: %s", db_path
             )
-            return report
+            return _succeed("drop_fts_rebuild")
         report["error"] = reason
     except sqlite3.DatabaseError as exc:
         report["error"] = str(exc)
@@ -2170,9 +2231,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cannot corrupt B-tree pages under I/O pressure.
 
         PASSIVE does not truncate the WAL file — it stays at its
-        high-water mark.  WAL truncation happens in :meth:`close`
-        (TRUNCATE) and pre-VACUUM checkpoints, which run infrequently
-        under controlled conditions.
+        high-water mark. The remaining TRUNCATE checkpoint is reserved for
+        controlled pre-VACUUM maintenance with writers quiesced.
 
         Previous TRUNCATE strategy caused B-tree corruption on large
         databases (65K+ pages) due to the exclusive-lock I/O pressure
@@ -2192,11 +2252,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
     def close(self):
-        """Close the database connection.
+        """Close the database connection with a non-exclusive checkpoint.
 
         Drains queued token deltas first (the background writer needs the
-        connection), then attempts a TRUNCATE WAL checkpoint so that
-        exiting processes help shrink the WAL file.
+        connection). SessionDB is instantiated per request in gateway and
+        web-server paths, so close() is not necessarily a process shutdown
+        boundary — use PASSIVE here; exclusive TRUNCATE remains reserved for
+        controlled maintenance such as pre-VACUUM while writers are quiesced.
         """
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
@@ -2225,9 +2287,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception as exc:
-                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
+                    logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
 

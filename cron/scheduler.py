@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -281,8 +282,25 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    get_due_jobs,
+    get_job,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    claim_dispatch,
+    claim_job_for_fire,
+    heartbeat_run_claim,
+    heartbeat_fire_claim,
+    new_fire_claim_owner,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.agentic_efficiency import (
+    AgenticTipoError,
+    OnceOnlyAgenticRecorder,
+    record_agentic_efficiency_after_worker,
+    resolve_agentic_tipo,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -423,67 +441,15 @@ def _consume_interrupted_flag(job_id: str) -> bool:
         return False
 
 
-# Sequential (env-mutating) cron jobs — workdir jobs that touch
-# process-global runtime state — must run one at a time, but must NOT block the
-# ticker thread.  A persistent single-thread executor preserves ordering across
-# ticks while keeping dispatch fire-and-forget, the same as the parallel pool.
-_sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
-
-
-class _ReadWriteLock:
-    """Writer-preferring readers-writer lock.
-
-    Guards the process-global ``os.environ["TERMINAL_CWD"]`` override that a
-    workdir cron job applies for the whole of its agent run.  Workdir jobs are
-    writers: they mutate the shared env and need exclusive access.  Workdir-less
-    jobs are readers: they only observe ``TERMINAL_CWD`` (indirectly, via the
-    terminal / file / code-exec tools), so any number of them may run
-    concurrently with each other, but none may run alongside a writer — that is
-    exactly what stops a workdir-less job from picking up another job's workdir
-    override and running its commands in the wrong directory.
-
-    Writer preference bounds the wait for a workdir job (dispatched on the
-    single-thread sequential pool) so a stream of workdir-less readers cannot
-    starve it.
-    """
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
-        self._readers = 0
-        self._writer_active = False
-        self._writers_waiting = 0
-
-    def acquire_read(self) -> None:
-        with self._cond:
-            while self._writer_active or self._writers_waiting > 0:
-                self._cond.wait()
-            self._readers += 1
-
-    def release_read(self) -> None:
-        with self._cond:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    def acquire_write(self) -> None:
-        with self._cond:
-            self._writers_waiting += 1
-            try:
-                while self._writer_active or self._readers > 0:
-                    self._cond.wait()
-            finally:
-                self._writers_waiting -= 1
-            self._writer_active = True
-
-    def release_write(self) -> None:
-        with self._cond:
-            self._writer_active = False
-            self._cond.notify_all()
-
-
-# Serializes the per-job TERMINAL_CWD override against every other concurrently
-# running cron job.  See _ReadWriteLock and run_job for the usage contract.
-_terminal_cwd_lock = _ReadWriteLock()
+# NOTE: A single-thread ``cron-seq`` pool plus a process-global readers/writer
+# lock used to serialize every workdir cron job, because run_job pointed the
+# shared ``os.environ["TERMINAL_CWD"]`` at the job's workdir for its whole agent
+# run. That made one long workdir job block every other workdir cron across
+# unrelated projects (a due job could be claimed/advanced yet wait indefinitely
+# behind the global workdir queue). Per-job cwd is now isolated through the
+# ``_SESSION_CWD`` ContextVar + per-task terminal env overrides (see run_job),
+# so workdir jobs run on the same non-blocking parallel pool as everyone else
+# and no cross-job serialization is required.
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -500,33 +466,13 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
-def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
-    """Return (or create) the persistent single-thread sequential pool.
-
-    A single worker guarantees env-mutating jobs never overlap, even
-    across ticks: a job queued by a newer tick waits for the previous tick's
-    sequential jobs to finish rather than corrupting their os.environ
-    state.
-    """
-    global _sequential_pool
-    if _sequential_pool is None:
-        _sequential_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="cron-seq",
-        )
-    return _sequential_pool
-
-
 def _shutdown_parallel_pool() -> None:
-    """Shut down the persistent pools on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    """Shut down the persistent parallel pool on process exit."""
+    global _parallel_pool, _parallel_pool_max_workers
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
-    if _sequential_pool is not None:
-        _sequential_pool.shutdown(wait=True, cancel_futures=False)
-        _sequential_pool = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -2283,6 +2229,13 @@ def _run_job_script(
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
 
+    script_cwd = path.parent
+    if workdir:
+        requested_cwd = Path(workdir).expanduser()
+        if not requested_cwd.is_dir():
+            return False, f"Workdir not found or not a directory: {requested_cwd}"
+        script_cwd = requested_cwd
+
     try:
         from tools.environments.local import build_subprocess_env
 
@@ -2295,17 +2248,16 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
-        # Use the job's workdir as the subprocess cwd when configured,
-        # otherwise default to the scripts-dir parent (back-compat).
-        # NEVER mutate the Python process cwd — that would leak into
-        # concurrent gateway sessions (#69396).
-        _script_cwd = workdir or str(path.parent)
+        # script_cwd (computed above, with the is_dir() validation) is the
+        # job's workdir when configured, otherwise the scripts-dir parent
+        # (back-compat). NEVER mutate the Python process cwd — that would
+        # leak into concurrent gateway sessions (#69396).
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=_script_cwd,
+            cwd=str(script_cwd),
             env=env,
             **popen_kwargs,
         )
@@ -2353,6 +2305,14 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    def _run_script() -> tuple[bool, str]:
+        # Preserve the historical one-argument call shape when no workdir was
+        # supplied. Besides keeping existing wrappers/test doubles compatible,
+        # this avoids making ``None`` look like an explicitly selected cwd.
+        if workdir is None:
+            return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
+
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -2361,7 +2321,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_script()
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2392,10 +2352,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_script()
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_script()
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2429,8 +2389,12 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
-    """Build the effective prompt for a cron job, optionally loading one or more skills first.
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    dynamic_capture: Optional[list[str]] = None,
+) -> str:
+    """Build a cron prompt with static instructions first and runtime data last.
 
     Args:
         job: The cron job dict.
@@ -2439,9 +2403,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        dynamic_capture: Optional list populated with bounded runtime blocks for
+            code-level frontier fingerprinting and clean redesign packages.
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
+    dynamic_parts: list[str] = []
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
@@ -2456,26 +2423,38 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, workdir=job.get("workdir")
+            )
+        _eff_job_cfg = job.get("context_efficiency")
+        _eff_enabled = isinstance(_eff_job_cfg, dict) and _eff_job_cfg.get("enabled") is True
+        bounded_script_output = script_output
+        if _eff_enabled and script_output:
+            from cron.context_efficiency import format_script_context
+
+            bounded_script_output = format_script_context(
+                job,
+                success,
+                script_output,
+                hermes_home=_get_hermes_home(),
+            )
         if success:
-            if script_output:
-                prompt = (
+            if bounded_script_output:
+                dynamic_parts.append(
                     "## Script Output\n"
                     "The following data was collected by a pre-run script. "
                     "Use it as context for your analysis.\n\n"
-                    f"```\n{script_output}\n```\n\n"
-                    f"{prompt}"
+                    f"```\n{bounded_script_output}\n```"
                 )
                 has_injected_data = True
             else:
                 # Script produced no output — nothing to report, skip AI call.
                 return None
         else:
-            prompt = (
+            dynamic_parts.append(
                 "## Script Error\n"
                 "The data-collection script failed. Report this to the user.\n\n"
-                f"```\n{script_output}\n```\n\n"
-                f"{prompt}"
+                f"```\n{bounded_script_output}\n```"
             )
             has_injected_data = True
 
@@ -2514,12 +2493,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
                     latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
                 if latest_output:
-                    prompt = (
+                    dynamic_parts.append(
                         f"## Output from job '{source_job_id}'\n"
                         "The following is the most recent output from a preceding "
                         "cron job. Use it as context for your analysis.\n\n"
-                        f"```\n{latest_output}\n```\n\n"
-                        f"{prompt}"
+                        f"```\n{latest_output}\n```"
                     )
                     has_injected_data = True
                 else:
@@ -2542,6 +2520,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
+
+    def _append_dynamic_tail(static_prompt: str) -> str:
+        if not dynamic_parts:
+            return static_prompt
+        if dynamic_capture is not None:
+            dynamic_capture.extend(dynamic_parts)
+        return static_prompt + "\n\n" + "\n\n".join(dynamic_parts)
+
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -2551,7 +2537,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
         return _scan_assembled_cron_prompt(
-            prompt,
+            _append_dynamic_tail(prompt),
             job,
             has_skills=False,
             has_injected_data=has_injected_data,
@@ -2631,7 +2617,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    assembled = _append_dynamic_tail("\n".join(parts))
+    return _scan_assembled_cron_prompt(
+        assembled,
+        job,
+        has_skills=True,
+        has_injected_data=has_injected_data,
+        user_prompt=user_prompt,
+    )
 
 
 def _scan_assembled_cron_prompt(
@@ -2750,6 +2743,291 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+class _FireClaimLifecycleError(RuntimeError):
+    """Fire-claim lifecycle refused to continue (pre-execution or mid-run).
+
+    Dedicated lease-loss / start / ownership errors must not leak to callers of
+    ``run_one_job``: they convert to a normal failed/aborted result (False).
+    """
+
+
+class _FireClaimPreExecutionError(_FireClaimLifecycleError):
+    """Refuse to run: fire_claim ownership/preflight/start failed before side effects."""
+
+
+class _FireClaimOwnershipError(_FireClaimPreExecutionError):
+    """Durable fire_claim ownership preflight failed (lost or unavailable)."""
+
+
+class _FireClaimHeartbeatStartError(_FireClaimPreExecutionError):
+    """Fire-claim heartbeat thread could not start; refuse unprotected runs."""
+
+
+class _FireClaimOwnershipLostError(_FireClaimLifecycleError):
+    """Fire-claim ownership was lost mid-run (heartbeat or post-run checkpoint).
+
+    Cooperative boundary only: in-flight agent/tool side effects are not rolled
+    back. Enforceable gate is abort of remaining post-run delivery/mark once the
+    loss is observed (async heartbeat or synchronous exact-owner checkpoint).
+    """
+
+
+class _FireClaimGuard:
+    """Per-run lease-loss signal shared by heartbeat thread and checkpoints.
+
+    Installed in a ContextVar around the full ``run_one_job`` body so heartbeat
+    callbacks and body checkpoints see the same guard. On False or exception the
+    heartbeat thread marks loss atomically; checkpoints inspect the event and
+    reconfirm durable ownership via ``heartbeat_fire_claim``.
+    """
+
+    __slots__ = ("job_id", "expected_owner", "lost", "reason", "error", "_lock")
+
+    def __init__(self, *, job_id: str, expected_owner: str):
+        self.job_id = job_id
+        self.expected_owner = expected_owner
+        self.lost = threading.Event()
+        self.reason: Optional[str] = None
+        self.error: Optional[BaseException] = None
+        self._lock = threading.Lock()
+
+    def mark_lost(
+        self,
+        reason: str,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Atomically record first observed lease loss (idempotent)."""
+        with self._lock:
+            if self.lost.is_set():
+                return
+            self.reason = reason
+            self.error = error
+            self.lost.set()
+
+
+# Per-run guard for the active fire_claim owner. Default None = no claim / no fence.
+_fire_claim_guard: contextvars.ContextVar[Optional[_FireClaimGuard]] = (
+    contextvars.ContextVar("hermes_cron_fire_claim_guard", default=None)
+)
+
+
+def _fire_claim_owner_from_job(job: dict) -> Optional[str]:
+    """Stable fire_claim owner captured from a dispatched job dict, or None."""
+    claim = job.get("fire_claim") if isinstance(job, dict) else None
+    if not isinstance(claim, dict):
+        return None
+    owner = str(claim.get("by") or "")
+    return owner or None
+
+
+def _checkpoint_fire_claim_ownership(
+    job_id: str,
+    expected_owner: Optional[str],
+    *,
+    stage: str,
+) -> None:
+    """Fail closed if this runner no longer holds the durable fire_claim.
+
+    Used by ``_run_one_job_body`` immediately after ``run_job`` returns, before
+    ``_deliver_result``, and immediately before owner-conditional ``mark_job_run``.
+
+    Each checkpoint:
+      1. Inspects the per-run ``_FireClaimGuard`` lost event (async heartbeat).
+      2. Synchronously calls ``heartbeat_fire_claim(job_id, expected_owner=...)``
+         to confirm exact ownership in durable storage.
+
+    False or exception sets loss on the guard and raises
+    ``_FireClaimOwnershipLostError``. No expected owner → no-op (legacy path).
+    """
+    if not expected_owner:
+        return
+
+    guard = _fire_claim_guard.get()
+    prior_lost = bool(guard is not None and guard.lost.is_set())
+    prior_reason = guard.reason if guard is not None else None
+    prior_error = guard.error if guard is not None else None
+
+    try:
+        still_owns = heartbeat_fire_claim(job_id, expected_owner=expected_owner)
+    except Exception as exc:
+        reason = (
+            f"fire_claim ownership checkpoint ({stage}) raised: {exc}"
+        )
+        if guard is not None:
+            guard.mark_lost(reason, exc)
+        raise _FireClaimOwnershipLostError(reason) from exc
+
+    if not still_owns:
+        reason = (
+            f"fire_claim ownership checkpoint ({stage}) failed: durable claim "
+            f"is not held by expected owner {expected_owner!r}"
+        )
+        if guard is not None:
+            guard.mark_lost(reason)
+        raise _FireClaimOwnershipLostError(reason)
+
+    # Sync confirm succeeded, but an earlier async heartbeat already observed
+    # loss — fail closed on the first observed loss (cooperative abort).
+    if prior_lost:
+        reason = prior_reason or (
+            f"fire_claim ownership lost during run (detected at {stage})"
+        )
+        if prior_error is not None:
+            raise _FireClaimOwnershipLostError(reason) from prior_error
+        raise _FireClaimOwnershipLostError(reason)
+
+
+def _mark_job_run_owned(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    *,
+    delivery_error: Optional[str] = None,
+    expected_fire_claim_owner: Optional[str] = None,
+):
+    """Call ``mark_job_run``, passing expected owner only when one is known.
+
+    Legacy scheduled paths (no fire_claim) keep the historical call signature so
+    existing mocks/assert_called_with stay valid. Manual/external fires always
+    pass their captured owner for the owner-conditional gate.
+    """
+    if expected_fire_claim_owner is None:
+        return mark_job_run(
+            job_id, success, error, delivery_error=delivery_error
+        )
+    return mark_job_run(
+        job_id,
+        success,
+        error,
+        delivery_error=delivery_error,
+        expected_fire_claim_owner=expected_fire_claim_owner,
+    )
+
+
+def _run_with_fire_claim_heartbeat(job: dict, fn):
+    """Keep a manual/external ``fire_claim`` fresh while ``fn`` runs.
+
+    Ownership lives on the full ``run_one_job`` lifecycle (execute → save →
+    deliver → mark), not only ``run_job``. Delivery/cleanup can outlive
+    ``FIRE_CLAIM_TTL_SECONDS`` after the agent returns; without a heartbeat
+    across that window the claim looks dead and the ticker can re-dispatch.
+
+    Scheduled ticker runs that won the shared per-fire CAS claim also carry a
+    ``fire_claim`` and take this heartbeat path. Legacy/no-claim jobs take the
+    fast path (call ``fn`` directly). All fire_claim owners are captured from
+    the dispatched job dict and never re-read from storage before compare, so a
+    stale runner cannot extend a replacement owner's claim.
+
+    Before creating/starting the heartbeat thread and before ``fn``,
+    synchronously validate durable ownership via
+    ``heartbeat_fire_claim(expected_owner=stable_owner)``. False or exception
+    raises ``_FireClaimOwnershipError`` so a stale runner never executes script
+    / agent / delivery side effects against a replacement owner's claim.
+
+    A per-run :class:`_FireClaimGuard` is installed in a ContextVar around the
+    full body. The heartbeat thread, on False or exception, atomically marks
+    lease-lost state (it does not silently continue). Body checkpoints after
+    ``run_job``, before delivery, and before mark reconfirm exact ownership and
+    raise ``_FireClaimOwnershipLostError`` so a stale runner cannot deliver or
+    mutate replacement state. In-flight agent/tool work is not rolled back —
+    the enforceable gate is cooperative post-run abort + no delivery/mark.
+
+    Only after preflight succeeds may the heartbeat thread start. Thread start
+    failure raises ``_FireClaimHeartbeatStartError`` (still before ``fn``). The
+    heartbeat thread inherits the caller's ContextVar snapshot so
+    profile-scoped cron stores stay correct. Stop+join happens after ``fn``
+    returns (including ``mark_job_run``, which clears the claim when still owned).
+    """
+    claim = job.get("fire_claim")
+    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    if not owner:
+        return fn()
+
+    job_id = str(job.get("id") or "")
+    guard = _FireClaimGuard(job_id=job_id, expected_owner=owner)
+    guard_token = _fire_claim_guard.set(guard)
+
+    try:
+        # Synchronous ownership preflight: the async heartbeat loop waits up to
+        # _RUN_CLAIM_HEARTBEAT_SECONDS before its first tick, which is far too
+        # late to catch a replacement owner already present in durable storage.
+        try:
+            still_owns = heartbeat_fire_claim(job_id, expected_owner=owner)
+        except Exception as exc:
+            logger.debug(
+                "Job '%s': fire_claim ownership preflight raised",
+                job_id,
+                exc_info=True,
+            )
+            raise _FireClaimOwnershipError(
+                f"fire_claim ownership preflight failed: {exc}"
+            ) from exc
+        if not still_owns:
+            raise _FireClaimOwnershipError(
+                "fire_claim ownership preflight failed: durable claim is not "
+                f"held by expected owner {owner!r}"
+            )
+
+        stop = threading.Event()
+        # Copy after guard install so the heartbeat thread sees the same
+        # ContextVar profile store *and* the active FireClaimGuard.
+        heartbeat_context = contextvars.copy_context()
+
+        def _heartbeat_loop() -> None:
+            # Reuse the one-shot claim cadence (tests patch that single dial).
+            while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
+                try:
+                    still_owns = heartbeat_fire_claim(
+                        job_id, expected_owner=owner
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Job '%s': fire_claim heartbeat failed",
+                        job_id,
+                        exc_info=True,
+                    )
+                    guard.mark_lost(
+                        f"fire_claim heartbeat raised: {exc}",
+                        exc,
+                    )
+                    return
+                if not still_owns:
+                    guard.mark_lost(
+                        "fire_claim heartbeat lost ownership: durable claim "
+                        f"is not held by expected owner {owner!r}"
+                    )
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_context.run,
+            args=(_heartbeat_loop,),
+            name="cron-fire-claim-heartbeat",
+            daemon=True,
+        )
+        try:
+            heartbeat_thread.start()
+        except Exception as exc:
+            logger.debug(
+                "Job '%s': could not start fire_claim heartbeat",
+                job_id,
+                exc_info=True,
+            )
+            # Fail closed: never run unprotected when a claim requires heartbeat.
+            raise _FireClaimHeartbeatStartError(
+                f"fire_claim heartbeat could not start: {exc}"
+            ) from exc
+
+        try:
+            return fn()
+        finally:
+            stop.set()
+            # Event.wait() wakes immediately. Bound join if the heartbeat is
+            # blocked on another process's jobs-file lock.
+            heartbeat_thread.join(timeout=1.0)
+    finally:
+        _fire_claim_guard.reset(guard_token)
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2765,6 +3043,11 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    Manual/external ``fire_claim`` heartbeating is owned by ``run_one_job``
+    (the full execute→save→deliver→mark lifecycle), not here. Nested wrappers
+    would double-write the claim; direct ``run_job`` callers that need
+    singleflight must go through ``run_one_job``.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -2800,7 +3083,9 @@ def run_job(
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is passed as the subprocess cwd so the
         # Python process cwd is NEVER mutated — avoiding the global-side-effect
-        # bug where os.chdir() leaks into concurrent gateway sessions (#69396).
+        # bug where os.chdir() leaks into concurrent gateway sessions (#69396),
+        # and (per this commit) so concurrently-firing workdir jobs never race
+        # each other over a shared process-global cwd either.
         _job_workdir = (job.get("workdir") or "").strip() or None
         if _job_workdir and not Path(_job_workdir).is_dir():
             logger.warning(
@@ -2973,8 +3258,13 @@ def run_job(
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    _eff_dynamic_parts: list[str] = []
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=prerun_script,
+            dynamic_capture=_eff_dynamic_parts,
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3001,12 +3291,31 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # Unique per attempt (not just per second) so two fires of the same job
+    # within the same wall-clock second — e.g. a manual run racing the ticker,
+    # or rapid interval jobs — never collide on session id / task id (the
+    # latter drives per-job workdir isolation below).
+    _cron_session_id = (
+        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+        f"_{uuid.uuid4().hex[:8]}"
+    )
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _eff_gate = None
+    _eff_decision = None
+    _eff_config = None
+    _compression_override = None
+    _eff_started = time.monotonic()
+    # Agentic-efficiency ledger: resolve tipo before model dispatch; append
+    # exactly once for any attempt that reaches the model path (success,
+    # failure, or autonomous limit). no_agent short-circuits above never set
+    # this recorder.
+    _agentic_recorder: Optional[OnceOnlyAgenticRecorder] = None
+    _agentic_model_attempted = False
+    _agentic_result: Optional[dict] = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -3016,6 +3325,15 @@ def run_job(
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+
+    # Per-job workdir isolation reuses the same per-session/per-task
+    # infrastructure the gateway/ACP/TUI use, so concurrent workdir jobs never
+    # share process-global cwd state (see the workdir block below).
+    from agent.runtime_cwd import set_session_cwd
+    from tools.terminal_tool import (
+        register_task_env_overrides,
+        clear_task_env_overrides,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3078,46 +3396,47 @@ def run_job(
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
-    # Per-job working directory — _SESSION_CWD was already set via
-    # set_session_vars(cwd=...) above. Here we only handle the
-    # process-global TERMINAL_CWD env var, which is serialized by
-    # _terminal_cwd_lock to avoid leaking into concurrent jobs.
-    #
-    # os.environ["TERMINAL_CWD"] is process-global, so this override is
-    # serialized by _terminal_cwd_lock (acquired just below): a workdir job
-    # holds it as a writer for its whole run, excluding every other job, while
-    # workdir-less jobs hold it as readers and stay parallel with each other.
-    # The sequential pool only keeps workdir jobs from overlapping EACH OTHER;
-    # the lock is what additionally keeps a concurrently-firing workdir-less
-    # parallel-pool job from observing this override and running its shell /
-    # file / code-exec commands in the wrong directory.  For workdir-less jobs
-    # we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    #
-    # The critical path (resolve_context_cwd / build_context_files_prompt)
-    # checks _SESSION_CWD first, so gateway sessions with no override see
-    # their own cwd, not the cron's workdir (#69396).
+    # Per-job working directory (_job_workdir already resolved + validated
+    # above, before set_session_vars).  When set, the job runs isolated to its
+    # workdir WITHOUT any process-global mutation, so different-workdir jobs
+    # run concurrently and one long job can't block another. Isolation is
+    # applied inside the try below via set_session_cwd (the _SESSION_CWD
+    # ContextVar, already primed via set_session_vars(cwd=...) above, for
+    # context-file discovery + the Codex runtime) and
+    # register_task_env_overrides (per-task, for the terminal / file /
+    # execute_code tools).  Workdir-less jobs keep the original behaviour:
+    # skip_context_files=True and tools use the scheduler's own cwd.
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    # A per-job task id (== the cron session id) keys the terminal env override
+    # AND the agent's own sandbox teardown (AIAgent.close -> cleanup_vm(
+    # session_id)), so the job's isolated env is created and reclaimed under one
+    # key regardless of when the override is cleared.
+    _job_task_id = _cron_session_id
+    _cron_future = None
 
-    _holds_cwd_write = _job_workdir is not None
-    if _holds_cwd_write:
-        _terminal_cwd_lock.acquire_write()
-    else:
-        _terminal_cwd_lock.acquire_read()
-
-    # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
+    # Everything below runs inside this try so the finally always clears the
+    # per-task cwd override (the _SESSION_CWD ContextVar is cleared by
+    # clear_session_vars).  No process-global lock is taken: per-job isolation
+    # is what keeps concurrent jobs from seeing each other's workdir.
     try:
         if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
+            # ContextVar channel: system-prompt / context-file discovery and the
+            # Codex runtime resolve cwd via resolve_context_cwd/resolve_agent_cwd,
+            # which read _SESSION_CWD first.  Isolated per job because the agent
+            # runs inside a copied context (contextvars.copy_context) below.
+            set_session_cwd(_job_workdir)
+            # Task-override channel: the terminal / file / execute_code tools
+            # resolve THIS job's workdir keyed by the run_conversation task_id.
+            # ``isolate_env`` gives the job its OWN terminal env so concurrent
+            # jobs never clobber a shared env.cwd.
+            register_task_env_overrides(
+                _job_task_id,
+                {
+                    "cwd": _job_workdir,
+                    "host_cwd": _job_workdir,
+                    "isolate_env": True,
+                },
+            )
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -3209,6 +3528,71 @@ def run_job(
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+        # Context-efficiency is double-gated: the profile config enables the
+        # feature and each migrated job opts in explicitly. This keeps unrelated
+        # cron jobs bit-for-bit compatible and gives the weekly rollback a safe
+        # per-job kill switch.
+        _job_eff = job.get("context_efficiency")
+        _job_eff_enabled = isinstance(_job_eff, dict) and _job_eff.get("enabled") is True
+        _cfg_map = _cfg if isinstance(_cfg, dict) else {}
+        _cron_cfg = _cfg_map.get("cron") if isinstance(_cfg_map.get("cron"), dict) else {}
+        _raw_eff_cfg = _cron_cfg.get("context_efficiency") if isinstance(_cron_cfg, dict) else {}
+        if _job_eff_enabled:
+            from cron.context_efficiency import (
+                ContextEfficiencyGate,
+                EfficiencyConfig,
+                GEMINI_COMPRESSION_MODEL,
+                GEMINI_COMPRESSION_PROVIDER,
+            )
+            from agent.auxiliary_client import auxiliary_task_override
+
+            _eff_config = EfficiencyConfig.from_mapping(_raw_eff_cfg)
+            if not _eff_config.enabled:
+                raise RuntimeError(
+                    "cron context_efficiency is enabled on the job but disabled in profile config"
+                )
+            _eff_gate = ContextEfficiencyGate(_get_hermes_home(), _eff_config)
+            _eff_decision = _eff_gate.before_run(
+                job,
+                dynamic_input="\n\n".join(_eff_dynamic_parts),
+            )
+            if _eff_decision.dynamic_append:
+                prompt = _scan_assembled_cron_prompt(
+                    prompt
+                    + "\n\n## Fresh boundary redesign (runtime data; apply once)\n"
+                    + _eff_decision.dynamic_append,
+                    job,
+                    has_injected_data=True,
+                    user_prompt=str(job.get("prompt") or ""),
+                )
+            if not _eff_decision.allow:
+                _eff_gate.record_blocker(
+                    job,
+                    _eff_decision.reason or "context-efficiency gate blocked this frontier",
+                    _eff_decision.fingerprint,
+                )
+                _aged_alert = _eff_gate.blocker_alert(
+                    job, _eff_decision.fingerprint
+                )
+                _eff_gate.record_outcome(
+                    job,
+                    _eff_decision.fingerprint,
+                    "blocker",
+                    material=bool(_aged_alert),
+                )
+                _gate_doc = (
+                    f"# Cron Job: {job_name}\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Context-efficiency gate:** {_eff_decision.reason or 'blocked'}\n"
+                )
+                return True, _gate_doc, _aged_alert or SILENT_MARKER, None
+            _compression_override = auxiliary_task_override(
+                "compression",
+                provider=GEMINI_COMPRESSION_PROVIDER,
+                model=GEMINI_COMPRESSION_MODEL,
+            )
+            _compression_override.__enter__()
+
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):
@@ -3259,8 +3643,47 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Autonomous limits: resolve a fixed positive profile BEFORE constructing
+        # AIAgent so unknown/sentinel/nonpositive profiles fail closed without a
+        # model spawn. max_iterations is the profile's max_turns (not global
+        # agent.max_turns). no_agent script-only jobs never reach this path.
+        from cron.autonomous_limits import (
+            AutonomousLimitError,
+            AutonomousProfileError,
+            resolve_autonomous_profile,
+            run_with_autonomous_limits,
+        )
+
+        try:
+            _auto_profile = resolve_autonomous_profile(job, _cfg)
+        except AutonomousProfileError as _profile_exc:
+            raise RuntimeError(
+                f"Cron autonomous profile rejected before agent spawn: {_profile_exc}"
+            ) from _profile_exc
+        max_iterations = _auto_profile.max_turns
+        logger.info(
+            "Job '%s': autonomous profile=%s timeout=%ss max_turns=%s "
+            "token_budget=%s usd_budget=%s",
+            job_id,
+            _auto_profile.name,
+            _auto_profile.timeout_seconds,
+            _auto_profile.max_turns,
+            _auto_profile.token_budget,
+            _auto_profile.usd_budget,
+        )
+
+        # Agentic-efficiency tipo is resolved before AIAgent construction so
+        # invalid agentic_execution_type fails closed with no model call and
+        # no ledger row.
+        try:
+            _agentic_tipo = resolve_agentic_tipo(
+                job, profile_name=getattr(_auto_profile, "name", None)
+            )
+        except AgenticTipoError as _tipo_exc:
+            raise RuntimeError(
+                f"Cron agentic_execution_type rejected before agent spawn: {_tipo_exc}"
+            ) from _tipo_exc
+        _agentic_recorder = OnceOnlyAgenticRecorder(_agentic_tipo)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3506,6 +3929,30 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if _eff_config is not None:
+            from cron.context_efficiency import apply_cron_compaction_ceiling
+
+            _applied_ceiling = apply_cron_compaction_ceiling(agent, _eff_config)
+            logger.info(
+                "Job '%s': context compaction ceiling=%s provider=%s model=%s",
+                job_id,
+                _applied_ceiling,
+                "google-gemini-cli",
+                "Gemini 3.5 Flash (Medium)",
+            )
+        # Keep execution-owned resources attached to the agent so teardown can
+        # wait for a timed-out worker to finish before closing its sandbox or DB.
+        setattr(
+            agent,
+            "_cron_cleanup_task_id",
+            _job_task_id if _job_workdir else None,
+        )
+        if _session_db is not None:
+            setattr(
+                agent,
+                "_cron_session_cleanup",
+                (_session_db, _cron_session_id, job_name, job_id),
+            )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3561,58 +4008,44 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
+        # thread used by the autonomous-limits supervisor.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
+        # Supervised run: wall-clock hard timeout, max turns, token/USD budget,
+        # plus the existing inactivity watchdog. max_iterations_reached is
+        # treated as limit_reason=max-turns failure (never successful delivery).
+        # Pass task_id so the per-task cwd override registered above actually
+        # reaches the tool calls; it matches the agent's session_id so sandbox
+        # teardown (cleanup_vm) targets the same key.
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    _heartbeat_run_claim_if_due()
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
+            # Model path reached: any return or exception from here records
+            # exactly one agentic_efficiency row (including limits/failures).
+            _agentic_model_attempted = True
+            result = run_with_autonomous_limits(
+                agent,
+                _auto_profile,
+                prompt=prompt,
+                task_key=str(job_id),
+                task_id=_job_task_id,
+                poll_interval=_POLL_INTERVAL,
+                heartbeat_fn=_heartbeat_run_claim_if_due,
+                inactivity_limit=_cron_inactivity_limit,
+                context=_cron_context,
+            )
+            _agentic_result = result if isinstance(result, dict) else None
+        except AutonomousLimitError as _limit_exc:
+            # Re-raise so the outer except builds the failure delivery; the
+            # exception string already carries limit_reason=/limit_count=/action=
+            # for Discord/chat alerts.
+            logger.error(
+                "Job '%s' autonomous limit: %s",
+                job_name,
+                _limit_exc,
+            )
             raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-
-        if _inactivity_timeout:
-            # Build diagnostic summary from the agent's activity tracker.
+        except TimeoutError as _idle_exc:
+            # Inactivity path preserved from the pre-limits watchdog.
             _activity = {}
             if hasattr(agent, "get_activity_summary"):
                 try:
@@ -3624,7 +4057,6 @@ def run_job(
             _cur_tool = _activity.get("current_tool")
             _iter_n = _activity.get("api_call_count", 0)
             _iter_max = _activity.get("max_iterations", 0)
-
             logger.error(
                 "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
                 "| last_activity=%s | iteration=%s/%s | tool=%s",
@@ -3632,13 +4064,11 @@ def run_job(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
+                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit or 0)}s) "
                 f"— last activity: {_last_desc}"
-            )
+            ) from _idle_exc
 
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
@@ -3653,27 +4083,19 @@ def run_job(
         # would otherwise be delivered as if it were the agent's reply and the
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
+        #
+        # max_iterations_reached is already converted to AutonomousLimitError
+        # inside run_with_autonomous_limits (limit_reason=max-turns) — never
+        # treat it as a successful fallback delivery here.
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
-            result.get("failed") is not True
-            and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
-        )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if result.get("failed") is True or result.get("completed") is False:
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
-            logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
-            )
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
@@ -3720,12 +4142,63 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        if _eff_gate is not None and _eff_decision is not None:
+            _usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
+            _is_noop = not final_response.strip() or final_response.strip() == SILENT_MARKER
+            _eff_gate.record_outcome(
+                job,
+                _eff_decision.fingerprint,
+                "valid_noop" if _is_noop else "success",
+                material=not _is_noop,
+                usage=_usage,
+                duration_seconds=time.monotonic() - _eff_started,
+                model=str(model),
+                provider=str(runtime.get("provider") or ""),
+            )
         return True, output, final_response, None
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+        if _eff_gate is not None and _eff_decision is not None:
+            _attempted = ""
+            if agent is not None and hasattr(agent, "get_activity_summary"):
+                try:
+                    _activity = agent.get_activity_summary()
+                    _attempted = json.dumps(
+                        {
+                            key: _activity.get(key)
+                            for key in (
+                                "last_activity_desc",
+                                "current_tool",
+                                "api_call_count",
+                                "max_iterations",
+                            )
+                            if key in _activity
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                except Exception:
+                    _attempted = "activity summary unavailable"
+            _eff_gate.record_outcome(
+                job,
+                _eff_decision.fingerprint,
+                "failure",
+                error=error_msg,
+                attempted=_attempted,
+                duration_seconds=time.monotonic() - _eff_started,
+                model=str(locals().get("model") or job.get("model") or ""),
+                provider=str((locals().get("runtime") or {}).get("provider") or ""),
+            )
+            _lower_error = error_msg.lower()
+            if any(marker in _lower_error for marker in ("timeout", "timed out", "quota", "credit", "402", "rate limit")):
+                _eff_gate.record_blocker(
+                    job,
+                    error_msg,
+                    _eff_decision.fingerprint,
+                )
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -3745,96 +4218,50 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Release the cwd lock now that the env is restored, so a waiting
-        # workdir job (or queued reader) can proceed without seeing the override.
-        if _holds_cwd_write:
-            _terminal_cwd_lock.release_write()
-        else:
-            _terminal_cwd_lock.release_read()
-        # Clean up ContextVar session/delivery state for this job.
-        # clear_session_vars also clears _SESSION_CWD internally, so no
-        # separate clear_session_cwd() call is needed.
+        # Record exactly once from the worker's final snapshot.  Hard-limit and
+        # inactivity paths can return while the worker thread is still
+        # unwinding; in that case this attaches a callback before teardown so
+        # messages and token totals are read only after the worker is done.
+        if _agentic_model_attempted and _agentic_recorder is not None:
+            def _log_deferred_ledger_error(_ledger_exc: BaseException) -> None:
+                logger.exception(
+                    "Job '%s': deferred agentic_efficiency ledger write failed: %s",
+                    job_name,
+                    _ledger_exc,
+                )
+
+            record_agentic_efficiency_after_worker(
+                _agentic_recorder,
+                agent=agent,
+                fallback_result=_agentic_result,
+                workdir=_job_workdir,
+                on_error=_log_deferred_ledger_error,
+            )
+        if _compression_override is not None:
+            try:
+                _compression_override.__exit__(None, None, None)
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to restore compression auxiliary override",
+                    job_id,
+                    exc_info=True,
+                )
+        # If agent construction failed, no lifecycle owner exists to reclaim
+        # resources; clean those directly.  Otherwise _teardown_cron_agent owns
+        # both sandbox and session-store cleanup, and may defer them until the
+        # worker Future has actually finished.
+        if agent is None:
+            if _job_workdir:
+                clear_task_env_overrides(_job_task_id)
+            if _session_db:
+                _finalize_cron_session(
+                    _session_db, _cron_session_id, job_name, job_id
+                )
+        # Clean up ContextVar session/delivery state for this job.  This also
+        # clears the _SESSION_CWD ContextVar via clear_session_cwd().
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
-        if _session_db:
-            # Compression can rotate the live agent onto a continuation while
-            # this run is in flight. Finalize that continuation, not the stale
-            # cron id captured before AIAgent started. SessionDB is the source
-            # of truth for the lineage; agent.session_id is only a fail-safe
-            # when the lookup itself is unavailable.
-            _final_cron_session_id = _cron_session_id
-            try:
-                _compression_tip = _session_db.get_compression_tip(
-                    _cron_session_id
-                )
-                if _compression_tip:
-                    _final_cron_session_id = _compression_tip
-            except (Exception, KeyboardInterrupt) as e:
-                try:
-                    _agent_session_id = getattr(agent, "session_id", None)
-                    if _agent_session_id:
-                        _final_cron_session_id = _agent_session_id
-                except (Exception, KeyboardInterrupt):
-                    pass
-                logger.debug(
-                    "Job '%s': failed to resolve cron compression tip: %s",
-                    job_id,
-                    e,
-                )
-            # Title the cron session from the job (name -> id) and PERSIST it
-            # BEFORE end_session()/close() tear the connection down, so the
-            # close can never run over an in-flight title write (#50536). The
-            # run-time suffix keeps it unique against the sessions.title index
-            # across runs; _set_cron_session_title dedupes (#50537) and the
-            # except-fallback below guarantees a non-blank title (#50535).
-            try:
-                _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-                _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
-                if not _set_cron_session_title(
-                    _session_db, _final_cron_session_id, _cron_title
-                ):
-                    # Helper returned None (blank base) -> use the id fallback.
-                    _set_cron_session_title(
-                        _session_db, _final_cron_session_id, f"cron {job_id}"
-                    )
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug(
-                    "Job '%s': failed to set cron session title: %s", job_id, e
-                )
-                # Last-resort: never leave the session blank (#50535). Try the
-                # next free title in the lineage, then a bare id-stamped title.
-                for _fallback in (
-                    getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(
-                        f"cron {job_id}"
-                    ),
-                    f"cron {job_id} {_final_cron_session_id[-6:]}",
-                ):
-                    try:
-                        if _set_cron_session_title(
-                            _session_db, _final_cron_session_id, _fallback
-                        ):
-                            break
-                    except (Exception, KeyboardInterrupt):
-                        continue
-            try:
-                _session_db.end_session(
-                    _final_cron_session_id, "cron_complete"
-                )
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            try:
-                _session_db.close()
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -3850,24 +4277,116 @@ def run_job(
             _teardown_cron_agent(agent, job_id)
 
 
-def _teardown_cron_agent(agent, job_id: str) -> None:
-    """Release an ephemeral cron agent's async resources.
+def _finalize_cron_session(
+    session_db, session_id: str, job_name: str, job_id: str, agent=None
+) -> None:
+    """Title, end, and close a cron session store exactly once.
 
-    Split out of ``run_job``'s ``finally`` so a caller that defers teardown
-    (to deliver first — #58720) can invoke the identical cleanup AFTER delivery.
-    Closes the agent (subprocesses, sandboxes, browser daemons, OpenAI/httpx
-    client) and reaps stale async clients whose loop has since closed. Idempotent
-    and independently guarded, matching the original inline behavior.
+    Uses the upstream ``_set_cron_session_title`` helper so title dedupe /
+    blank-title fallbacks (#50535/#50537) survive the workdir-isolation
+    teardown split.
+
+    Compression can rotate the live agent onto a continuation while the run
+    is in flight. Finalize that continuation, not the stale cron id captured
+    before AIAgent started. SessionDB is the source of truth for the
+    lineage; ``agent.session_id`` (when an agent is passed) is only a
+    fail-safe when the lookup itself is unavailable.
     """
+    _final_session_id = session_id
+    try:
+        _compression_tip = session_db.get_compression_tip(session_id)
+        if _compression_tip:
+            _final_session_id = _compression_tip
+    except (Exception, KeyboardInterrupt) as e:
+        try:
+            _agent_session_id = getattr(agent, "session_id", None)
+            if _agent_session_id:
+                _final_session_id = _agent_session_id
+        except (Exception, KeyboardInterrupt):
+            pass
+        logger.debug(
+            "Job '%s': failed to resolve cron compression tip: %s", job_id, e,
+        )
+    try:
+        _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+        _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+        if not _set_cron_session_title(session_db, _final_session_id, _cron_title):
+            _set_cron_session_title(session_db, _final_session_id, f"cron {job_id}")
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
+        for _fallback in (
+            getattr(session_db, "get_next_title_in_lineage", lambda b: b)(
+                f"cron {job_id}"
+            ),
+            f"cron {job_id} {_final_session_id[-6:]}",
+        ):
+            try:
+                if _set_cron_session_title(session_db, _final_session_id, _fallback):
+                    break
+            except (Exception, KeyboardInterrupt):
+                continue
+    try:
+        session_db.end_session(_final_session_id, "cron_complete")
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to end session: %s", job_id, e)
+    try:
+        session_db.close()
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+
+
+def _teardown_cron_agent(agent, job_id: str) -> None:
+    """Release an ephemeral cron agent after its worker Future is idle.
+
+    A timeout only returns control to the scheduler; the worker thread may still
+    be unwinding and issuing tool calls.  Teardown is therefore scheduled on the
+    Future instead of racing ``agent.close()`` / ``cleanup_vm`` against it.
+    """
+    _worker_future = getattr(agent, "_cron_worker_future", None) if agent else None
+    _future_done = getattr(_worker_future, "done", None)
+    if (
+        _worker_future is not None
+        and callable(_future_done)
+        and not _future_done()
+    ):
+        if getattr(agent, "_cron_teardown_scheduled", False) is True:
+            return
+        setattr(agent, "_cron_teardown_scheduled", True)
+        _worker_future.add_done_callback(
+            lambda _f, _agent=agent, _job_id=job_id: _teardown_cron_agent_now(
+                _agent, _job_id
+            )
+        )
+        return
+    _teardown_cron_agent_now(agent, job_id)
+
+
+def _teardown_cron_agent_now(agent, job_id: str) -> None:
+    """Perform cron cleanup once no worker can use the owned resources."""
+    if (
+        agent is not None
+        and getattr(agent, "_cron_teardown_complete", False) is True
+    ):
+        return
+    if agent is not None:
+        setattr(agent, "_cron_teardown_complete", True)
     try:
         if agent is not None:
             agent.close()
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close agent resources: %s", job_id, e)
-    # Each cron run spins up a short-lived worker thread whose event loop
-    # dies as soon as the ``ThreadPoolExecutor`` shuts down. Any async
-    # httpx clients cached under that loop are now unusable — reap them
-    # so their transports don't accumulate in the process-global cache.
+    if agent is not None:
+        _cleanup_task_id = getattr(agent, "_cron_cleanup_task_id", None)
+        if isinstance(_cleanup_task_id, str) and _cleanup_task_id:
+            from tools.terminal_tool import clear_task_env_overrides
+
+            clear_task_env_overrides(_cleanup_task_id)
+        _session_cleanup = getattr(agent, "_cron_session_cleanup", None)
+        if isinstance(_session_cleanup, tuple) and len(_session_cleanup) == 4:
+            _finalize_cron_session(*_session_cleanup, agent=agent)
+            setattr(agent, "_cron_session_cleanup", None)
+    # Each cron run spins up a short-lived worker thread whose event loop dies
+    # when the Future exits. Reap cached clients only after that point.
     try:
         from agent.auxiliary_client import cleanup_stale_async_clients
         cleanup_stale_async_clients()
@@ -3887,8 +4406,79 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     under the file lock before dispatch; an external provider claims via the
     store CAS). This function only fires the given job once.
 
+    Manual/external fires and scheduled ticks that carry a ``fire_claim`` keep
+    that claim heartbeated for the entire lifecycle (not only ``run_job``), so a
+    slow delivery/cleanup path cannot let the claim expire and re-enter the due
+    set. Jobs without a claim take the heartbeat fast path.
+
+    The stable ``fire_claim.by`` from the *dispatched* job is captured once and
+    passed to every ``mark_job_run`` path as ``expected_fire_claim_owner`` so a
+    stale runner that finishes after a replacement claim cannot erase the
+    replacement's claim or job state. Ownership preflight / heartbeat-start
+    failure fails closed (no side effect). Mid-run lease loss (heartbeat False
+    / raise, post-run exact-owner checkpoint, or owner-conditional mark
+    returning explicit False after a successful ``before_mark`` checkpoint)
+    aborts remaining delivery/mark without rolling back in-flight agent work.
+    Owner-conditional mark records an owned failure only when this runner still
+    holds the durable claim, and the function returns False so callers cannot
+    treat a no-op abort as success via a stale prior ``last_status``.
+
     Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    failure is recorded via ``mark_job_run``). Returns False if processing
+    raised or if a fire-claim abort refused the run.
+    """
+    expected_fire_claim_owner = _fire_claim_owner_from_job(job)
+    try:
+        return _run_with_fire_claim_heartbeat(
+            job,
+            lambda: _run_one_job_body(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            ),
+        )
+    except _FireClaimLifecycleError as e:
+        # Fail closed for pre-execution *and* any lifecycle error that escaped
+        # the body. Record an owned failure only when this runner still owns
+        # the durable claim. Return False so _execute_job_now cannot report
+        # success from a prior last_status='ok'. Never re-raise.
+        logger.error("Error processing job %s: %s", job.get("id"), e)
+        if not _consume_interrupted_flag(job["id"]):
+            try:
+                _mark_job_run_owned(
+                    job["id"],
+                    False,
+                    str(e),
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+            except Exception:
+                # Durable state may be unavailable (same condition that aborted
+                # ownership); do not mutate replacement/unknown state.
+                logger.debug(
+                    "Job '%s': could not record fire_claim lifecycle abort",
+                    job.get("id"),
+                    exc_info=True,
+                )
+        return False
+
+
+def _run_one_job_body(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    expected_fire_claim_owner: Optional[str] = None,
+) -> bool:
+    """Inner ``run_one_job`` implementation (see :func:`run_one_job`).
+
+    When ``expected_fire_claim_owner`` is set, ownership checkpoints run after
+    ``run_job``, before delivery, and before mark. Lease loss fails closed for
+    remaining post-run side effects (no platform delivery; owner-conditional
+    mark is a no-op for a stale owner). In-flight agent/tool work is not rolled
+    back — that boundary is cooperative only.
     """
     execution_id = job.get("execution_id")
     if not execution_id:
@@ -3959,12 +4549,29 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
-        # between run_job returning and delivery — save_job_output, the [SILENT]
-        # / empty-response computation, or _deliver_result itself — raises, the
-        # deferred agent is still torn down. Otherwise the outer `except` would
-        # swallow the error and leak the agent's subprocesses/clients (#10200).
+        # between run_job returning and delivery — ownership checkpoints,
+        # save_job_output, the [SILENT] / empty-response computation, or
+        # _deliver_result itself — raises, the deferred agent is still torn
+        # down. Otherwise the outer `except` would swallow the error and leak
+        # the agent's subprocesses/clients (#10200).
         delivery_error = None
         try:
+            # Cooperative ownership gate immediately after run_job: if the
+            # async heartbeat already lost the lease (or durable ownership no
+            # longer matches), abort remaining post-run side effects. Local
+            # diagnostic save below is best-effort only when we still own;
+            # platform delivery and schedule/state mutation must not run for a
+            # stale owner.
+            _checkpoint_fire_claim_ownership(
+                job["id"],
+                expected_fire_claim_owner,
+                stage="after_run_job",
+            )
+
+            # Optional local diagnostic output. Ownership may still be
+            # re-checked before delivery; a save that races a concurrent
+            # replacement is acceptable local-only side effect, not
+            # user/platform delivery.
             output_file = save_job_output(job["id"], output)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
@@ -4007,43 +4614,102 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     _normalize_deliver_value(job.get("deliver", "local")) == "origin"
                     and not _resolve_delivery_targets(job)
                 )
+                # Exact-owner refresh immediately before platform delivery.
+                _checkpoint_fire_claim_ownership(
+                    job["id"],
+                    expected_fire_claim_owner,
+                    stage="before_deliver",
+                )
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+            # Treat empty final_response as a soft failure so last_status
+            # is not "ok" — the agent ran but produced nothing useful.
+            # (issue #8585)
+            if success and not final_response.strip():
+                success = False
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+            # Final ownership gate before schedule/state mutation. A stale owner
+            # raises here so mark is never attempted; the except path still uses
+            # owner-conditional mark which is a full no-op for replacements.
+            # Note: a replacement can still win *after* this checkpoint and
+            # *before* mark_job_run acquires the jobs lock (TOCTOU). The mark
+            # itself is then a full no-op returning False — captured below so
+            # callers cannot report success from a rejected stale mark.
+            _checkpoint_fire_claim_ownership(
+                job["id"],
+                expected_fire_claim_owner,
+                stage="before_mark",
+            )
+
+            if not _consume_interrupted_flag(job["id"]):
+                mark_applied = _mark_job_run_owned(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+                # Only an *explicit* False under an expected owner is lease loss.
+                # Legacy paths (no expected owner) ignore mark return values —
+                # including None from void-style mocks and False from not-found —
+                # so historical run_one_job → True semantics stay intact.
+                if (
+                    expected_fire_claim_owner is not None
+                    and mark_applied is False
+                ):
+                    raise _FireClaimOwnershipLostError(
+                        "fire_claim ownership lost at mark: durable claim is "
+                        "not held by expected owner "
+                        f"{expected_fire_claim_owner!r}"
+                    )
+            normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+            if delivery_error:
+                delivery_outcome = "failed"
+            elif should_deliver and unresolved_origin:
+                delivery_outcome = "not_configured"
+            elif should_deliver and normalized_deliver != "local":
+                delivery_outcome = "delivered"
+            else:
+                delivery_outcome = "suppressed"
+            finish_execution(
+                execution_id,
+                success=success,
+                error=error,
+                delivery_outcome=delivery_outcome,
+            )
+            return True
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
-            # (or raised). Must happen on every path so cron agents never leak
-            # their subprocesses/clients (#10200).
+            # (or raised / ownership-lost). Must happen on every path so cron
+            # agents never leak their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
+    except _FireClaimOwnershipLostError as e:
+        # Mid-run / post-run lease loss: no delivery after detection (checkpoints
+        # above), no exception leak, owner-conditional mark only if still owned.
+        logger.error("Error processing job %s: %s", job["id"], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
-        if delivery_error:
-            delivery_outcome = "failed"
-        elif should_deliver and unresolved_origin:
-            delivery_outcome = "not_configured"
-        elif should_deliver and normalized_deliver != "local":
-            delivery_outcome = "delivered"
-        else:
-            delivery_outcome = "suppressed"
-        finish_execution(
-            execution_id,
-            success=success,
-            error=error,
-            delivery_outcome=delivery_outcome,
-        )
-        return True
+            try:
+                _mark_job_run_owned(
+                    job["id"],
+                    False,
+                    str(e),
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+            except Exception:
+                logger.debug(
+                    "Job '%s': could not record fire_claim ownership-lost abort",
+                    job.get("id"),
+                    exc_info=True,
+                )
+        finish_execution(execution_id, success=False, error=str(e))
+        return False
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
         # BaseException, not Exception (#73973): the inner run_job handler
@@ -4059,7 +4725,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         logger.error("Error processing job %s: %s", job['id'], _err_text)
         try:
             if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+                _mark_job_run_owned(
+                    job["id"],
+                    False,
+                    _err_text,
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
@@ -4151,13 +4822,51 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
-        for job in due_jobs:
-            advance_next_run(job["id"])
+        # Per-fire CAS fencing (same path as manual/external fire_due):
+        # get_due_jobs() releases the jobs lock before submit, so a manual or
+        # external claim can win between the due scan and dispatch. Claim each
+        # due job with a unique token, re-read, and require exact-token match
+        # before any submit. claim_job_for_fire advances recurring next_run_at
+        # atomically — do NOT also call advance_next_run (would double-advance).
+        # Lost / missing / wrong-token claims fail closed: log + skip, never
+        # fall back to the pre-claim due snapshot, never clear a foreign claim.
+        claimed_due_jobs: list = []
+        for due_snapshot in due_jobs:
+            job_id = due_snapshot.get("id")
+            if not job_id:
+                logger.warning("Due job missing id — skipping dispatch")
+                continue
+            claim_owner = new_fire_claim_owner()
+            if not claim_job_for_fire(job_id, claim_owner=claim_owner):
+                logger.info(
+                    "Job '%s' not dispatched — fire_claim lost to another owner",
+                    due_snapshot.get("name", job_id),
+                )
+                continue
+            claimed = get_job(job_id)
+            if claimed is None:
+                logger.warning(
+                    "Job '%s' not dispatched — missing after fire_claim win "
+                    "(left durable claim for owner/TTL recovery)",
+                    due_snapshot.get("name", job_id),
+                )
+                continue
+            claim = claimed.get("fire_claim") if isinstance(claimed, dict) else None
+            stored_owner = (
+                str(claim.get("by") or "") if isinstance(claim, dict) else ""
+            ) or None
+            if stored_owner != claim_owner:
+                logger.warning(
+                    "Job '%s' not dispatched — post-claim fire_claim token "
+                    "mismatch (expected %r, got %r); leaving durable claim",
+                    due_snapshot.get("name", job_id),
+                    claim_owner,
+                    stored_owner,
+                )
+                continue
+            claimed_due_jobs.append(claimed)
+
+        due_jobs = claimed_due_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -4192,15 +4901,6 @@ def tick(
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
-
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 
         _results: list = []
         _all_futures: list = []
@@ -4267,30 +4967,18 @@ def tick(
                 )
                 return None
 
-        # Sequential pass for env-mutating (workdir) jobs.
-        # Queued to a persistent single-thread pool so they run one at a time
-        # WITHOUT blocking the ticker thread — a long workdir job no
-        # longer starves the rest of the schedule (same fix as the parallel
-        # pass, just serialized).  The in-flight guard prevents a still-running
-        # job from being re-queued on the next tick.
-        if sequential_jobs:
-            seq_pool = _get_sequential_pool()
-            for job in sequential_jobs:
-                fut = _submit_with_guard(job, seq_pool)
-                if fut is None:
-                    continue
-                _all_futures.append(fut)
-                if not sync:
-                    _results.append(True)  # optimistically counted
-
-        # Parallel pass — persistent pool, non-blocking dispatch.
-        # Jobs that are already running (from a previous tick) are skipped.
-        # mark_job_run() updates next_run_at on completion, so the next tick
-        # after completion finds the job due again naturally.  No catch-up
-        # queue needed.
-        if parallel_jobs:
+        # Dispatch every due job to the persistent parallel pool, non-blocking.
+        # Workdir jobs no longer need a separate serialized pool: each job now
+        # isolates its own cwd (the _SESSION_CWD ContextVar + a per-task terminal
+        # env override, applied in run_job) instead of mutating process-global
+        # state, so different-workdir jobs run concurrently and one long job can
+        # no longer starve the schedule.  Jobs already running from a previous
+        # tick are skipped by the in-flight guard; mark_job_run() updates
+        # next_run_at on completion, so the next tick finds the job due again
+        # naturally (no catch-up queue needed).
+        if due_jobs:
             pool = _get_parallel_pool(_max_workers)
-            for job in parallel_jobs:
+            for job in due_jobs:
                 fut = _submit_with_guard(job, pool)
                 if fut is None:
                     continue

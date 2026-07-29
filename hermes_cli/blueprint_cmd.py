@@ -195,6 +195,10 @@ def build_blueprint_seed(blueprint) -> str:
         f"choice using {dict(WEEKDAY_PRESETS)}, {{interval_min}} from any "
         "interval). Use this exact prompt for the job (substituting my "
         f"answers into any {{slot}} placeholders): \"{blueprint.prompt_template}\". "
+        "Pass these exact admission declarations unchanged to cronjob "
+        f"action=create — do not invent or rephrase them: "
+        f"category={blueprint.admission_category!r}, "
+        f"material_result_criterion={blueprint.material_result_criterion!r}. "
         "Confirm the schedule and what it will do before you create it."
     )
     return "\n".join(lines)

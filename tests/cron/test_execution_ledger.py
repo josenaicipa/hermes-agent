@@ -226,6 +226,15 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
     monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
+    # Per-fire CAS fencing (tick()) claims each due job and re-reads it before
+    # dispatch; without matching mocks the synthetic due job fails the
+    # post-claim owner check and is skipped before create_execution ever runs.
+    monkeypatch.setattr(scheduler, "new_fire_claim_owner", lambda: "test-owner")
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", lambda _job_id, claim_owner=None: True)
+    monkeypatch.setattr(
+        scheduler, "get_job",
+        lambda _job_id: {"id": "submit-fail", "fire_claim": {"by": "test-owner"}},
+    )
 
     assert scheduler.tick(verbose=False, sync=False) == 0
     assert finished == [

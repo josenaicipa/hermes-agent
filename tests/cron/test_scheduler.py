@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from tests.cron.tick_claim_helpers import successful_tick_fire_claims
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1835,13 +1836,12 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "all good"
 
-    def test_run_job_delivers_max_iteration_fallback_summary(self, tmp_path):
-        """Cron should deliver a usable max-iteration fallback summary.
+    def test_run_job_marks_max_iteration_fallback_as_limit_failure(self, tmp_path):
+        """Exhausting max turns is a bounded failure, never a success delivery.
 
-        A cron run can exhaust the iteration budget, get a final text summary
-        from the no-tools fallback call, and still have ``completed=False`` in
-        the generic agent result. That should not make cron raise the report
-        text as a RuntimeError.
+        A final no-tools fallback may still exist, but the scheduler must surface
+        ``limit_reason=max-turns`` and the one-rescope action instead of marking
+        the cron run healthy.
         """
         job = {
             "id": "summary-job",
@@ -1876,11 +1876,13 @@ class TestRunJobSessionPersistence:
 
             success, output, final_response, error = run_job(job)
 
-        assert success is True
-        assert error is None
-        assert final_response == "final fallback report"
-        assert "final fallback report" in output
-        assert "(FAILED)" not in output
+        assert success is False
+        assert error is not None
+        combined = "\n".join(str(value or "") for value in (output, final_response, error))
+        assert "limit_reason=max-turns" in combined
+        assert "limit_count=1" in combined
+        assert "action=rescope-permitted" in combined
+        assert "(FAILED)" in output
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
@@ -1921,7 +1923,8 @@ class TestRunJobSessionPersistence:
 
         fake_db = MagicMock()
 
-        with patch("cron.scheduler._hermes_home", tmp_path), \
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.mark_job_run") as mock_mark, \
@@ -2780,7 +2783,7 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, task_id=None):
             from tools.env_passthrough import get_all_passthrough
 
             assert "NOTION_API_KEY" in get_all_passthrough()
@@ -2838,7 +2841,7 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, task_id=None):
             from tools.credential_files import _get_registered
 
             registered = _get_registered()
@@ -2980,7 +2983,9 @@ class TestSilentDelivery:
         }
 
     def test_silent_response_suppresses_delivery(self, caplog):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -2992,7 +2997,9 @@ class TestSilentDelivery:
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
     def test_silent_with_note_suppresses_delivery(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3004,7 +3011,9 @@ class TestSilentDelivery:
     def test_silent_trailing_suppresses_delivery(self):
         """Agent appended [SILENT] after explanation text — must still suppress."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3014,7 +3023,9 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3028,7 +3039,9 @@ class TestSilentDelivery:
         must still suppress delivery (#51438, #46917)."""
         from cron.scheduler import tick
         for marker in ("SILENT", "NO_REPLY", "NO REPLY", "no_reply"):
-            with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+            job = self._make_job()
+            with successful_tick_fire_claims([job]), \
+                 patch("cron.scheduler.get_due_jobs", return_value=[job]), \
                  patch("cron.scheduler.run_job", return_value=(True, "# output", marker, None)), \
                  patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
                  patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3040,7 +3053,9 @@ class TestSilentDelivery:
         """A genuine report that merely mentions the token mid-sentence must
         be delivered — the old substring check wrongly swallowed it."""
         response = "I considered staying [SILENT] but here is the summary: 3 items merged."
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3071,7 +3086,9 @@ class TestSilentDelivery:
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3081,7 +3098,9 @@ class TestSilentDelivery:
         deliver_mock.assert_called_once()
 
     def test_output_saved_even_when_delivery_suppressed(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output") as save_mock, \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3094,7 +3113,9 @@ class TestSilentDelivery:
 
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        job = self._make_job()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -3103,12 +3124,14 @@ class TestSilentDelivery:
             tick(verbose=False)
 
         deliver_mock.assert_not_called()
-        mark_mock.assert_called_once_with(
-            "monitor-job",
-            False,
-            "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
-            delivery_error=None,
-        )
+        # Owner-conditional mark passes expected_fire_claim_owner when tick claimed.
+        assert mark_mock.call_count == 1
+        args, kwargs = mark_mock.call_args
+        assert args[0] == "monitor-job"
+        assert args[1] is False
+        assert "empty" in args[2].lower()
+        assert kwargs.get("delivery_error") is None
+        assert kwargs.get("expected_fire_claim_owner")
 
 
 class TestOneShotDispatchClaim:
@@ -3127,7 +3150,9 @@ class TestOneShotDispatchClaim:
 
     def test_claim_runs_before_run_job(self):
         order = []
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
+        job = self._oneshot()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
              patch("cron.scheduler.run_job", side_effect=lambda _j, **_kw: order.append("run") or (True, "# out", "ok", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -3138,7 +3163,9 @@ class TestOneShotDispatchClaim:
         assert order == ["claim", "run"]  # claim strictly before side effect
 
     def test_refused_claim_skips_run_job(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
+        job = self._oneshot()
+        with successful_tick_fire_claims([job]), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.claim_dispatch", return_value=False), \
              patch("cron.scheduler.run_job") as run_mock, \
              patch("cron.scheduler.save_job_output"), \
@@ -3587,7 +3614,8 @@ class TestParallelTick:
             {"id": "job-b", "name": "b", "deliver": "local"},
         ]
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+        with successful_tick_fire_claims(jobs), \
+             patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -3632,7 +3660,8 @@ class TestParallelTick:
              "origin": {"platform": "discord", "chat_id": "222"}},
         ]
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+        with successful_tick_fire_claims(jobs), \
+             patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -3661,7 +3690,8 @@ class TestParallelTick:
             {"id": "s2", "name": "s2", "deliver": "local"},
         ]
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+        with successful_tick_fire_claims(jobs), \
+             patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \

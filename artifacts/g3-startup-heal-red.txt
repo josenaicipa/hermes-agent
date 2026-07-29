@@ -1,0 +1,174 @@
+=== RED evidence — G3 startup-heal barrier ===
+Command: python -m pytest tests/gateway/test_session_store_stale_prune.py -v
+Base SHA: d7c62193b5f4144100b787e1548461394ad2d013
+Date: 2026-07-12T14:35:11Z
+
+============================= test session starts ==============================
+platform linux -- Python 3.13.13, pytest-9.0.2, pluggy-1.6.0 -- /home/jose-naicipa/.hermes/hermes-agent-vpsclone-0cb6a295/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/jose-naicipa/.hermes/worktrees/hermes-vpsclone-g3-startup-heal-sonnet
+configfile: pyproject.toml
+plugins: asyncio-1.3.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 22 items
+
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_prunes_ended_session PASSED [  4%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_keeps_live_session PASSED [  9%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_keeps_session_absent_from_db PASSED [ 13%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_prunes_multiple_stale_entries PASSED [ 18%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_repoints_stale_compression_parent_to_latest_live_child PASSED [ 22%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_repoints_compression_parent_via_lineage_when_child_lacks_peer_metadata PASSED [ 27%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_repoints_compression_parent_via_real_sqlite_lineage PASSED [ 31%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_prunes_compression_parent_when_lineage_tip_is_ended PASSED [ 36%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_prunes_compression_parent_when_no_lineage_child_exists PASSED [ 40%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_prunes_stale_entry_when_recovery_only_finds_same_ended_session PASSED [ 45%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_noop_when_db_is_none PASSED [ 50%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_noop_when_no_entries PASSED [ 54%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_db_error_is_non_fatal PASSED [ 59%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_sessions_json_rewritten_after_pruning PASSED [ 63%]
+tests/gateway/test_session_store_stale_prune.py::TestPruneStaleSessionsLocked::test_sessions_json_not_rewritten_when_nothing_pruned PASSED [ 68%]
+tests/gateway/test_session_store_stale_prune.py::TestEnsureLoadedCallsPrune::test_stale_entry_pruned_during_load PASSED [ 72%]
+tests/gateway/test_session_store_stale_prune.py::TestEnsureLoadedCallsPrune::test_live_entry_survives_load PASSED [ 77%]
+tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_startup_heal_db_phase_runs_without_routing_lock FAILED [ 81%]
+tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_inbound_waits_for_terminal_startup_heal FAILED [ 86%]
+tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_startup_heal_failure_releases_inbound_waiter FAILED [ 90%]
+tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_ensure_loaded_does_not_wait_for_in_progress_heal FAILED [ 95%]
+tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_has_any_sessions_db_error_fallback_does_not_wait_for_in_progress_heal FAILED [100%]
+
+=================================== FAILURES ===================================
+_ TestStartupHealBarrier.test_startup_heal_db_phase_runs_without_routing_lock __
+
+self = <tests.gateway.test_session_store_stale_prune.TestStartupHealBarrier object at 0x7ca12da491d0>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-775/test_startup_heal_db_phase_run0')
+
+    def test_startup_heal_db_phase_runs_without_routing_lock(self, tmp_path):
+        """The first startup-heal DB lookup must run with SessionStore._lock
+        free — proving the heal's DB-resolution phase is not nested inside
+        the routing lock (d7c62193b holds it there via
+        _ensure_loaded_locked -> _prune_stale_sessions_locked)."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        real_get_session = db.get_session
+        lock_was_free: list = []
+
+        def instrumented_get_session(session_id):
+            acquired = store._lock.acquire(blocking=False)
+            lock_was_free.append(acquired)
+            if acquired:
+                store._lock.release()
+            return real_get_session(session_id)
+
+        db.get_session = instrumented_get_session
+
+        store._ensure_loaded()
+
+        assert lock_was_free, "startup-heal DB lookup was never invoked"
+>       assert all(lock_was_free), (
+            "SessionStore._lock must be free during every startup-heal DB "
+            "lookup, not just serialized behind it"
+        )
+E       AssertionError: SessionStore._lock must be free during every startup-heal DB lookup, not just serialized behind it
+E       assert False
+E        +  where False = all([False, False])
+
+tests/gateway/test_session_store_stale_prune.py:397: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  gateway.session:session.py:1139 gateway.session: repointing stale sessions.json entry 'agent:main:telegram:dm:919191' from compression parent sid_parent to lineage tip sid_child
+_____ TestStartupHealBarrier.test_inbound_waits_for_terminal_startup_heal ______
+
+self = <tests.gateway.test_session_store_stale_prune.TestStartupHealBarrier object at 0x7ca12da49090>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-775/test_inbound_waits_for_termina0')
+
+    def test_inbound_waits_for_terminal_startup_heal(self, tmp_path):
+        """Thread B (the real get_or_create_session inbound path) must block
+        until Thread A's startup heal reaches a terminal state, then resolve
+        the compression continuation child rather than the stale parent."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        reached_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+>       original_resolve = store._resolve_stale_sessions
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'SessionStore' object has no attribute '_resolve_stale_sessions'
+
+tests/gateway/test_session_store_stale_prune.py:412: AttributeError
+___ TestStartupHealBarrier.test_startup_heal_failure_releases_inbound_waiter ___
+
+self = <tests.gateway.test_session_store_stale_prune.TestStartupHealBarrier object at 0x7ca12dc57490>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-775/test_startup_heal_failure_rele0')
+
+    def test_startup_heal_failure_releases_inbound_waiter(self, tmp_path):
+        """A DB-resolution exception during startup heal must still release
+        Thread B (conservatively — no pruning applied) rather than hanging."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_ended_route_without_recovery(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        resolve_started = threading.Event()
+        release_failure = threading.Event()
+
+        def failing_get_session(session_id):
+            resolve_started.set()
+            assert release_failure.wait(timeout=5), "test never released the DB failure"
+            raise RuntimeError("simulated DB-resolution failure")
+
+        db.get_session = failing_get_session
+
+        b_entered_wait = threading.Event()
+>       original_wait = store._wait_for_startup_heal_locked
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'SessionStore' object has no attribute '_wait_for_startup_heal_locked'
+
+tests/gateway/test_session_store_stale_prune.py:480: AttributeError
+_ TestStartupHealBarrier.test_ensure_loaded_does_not_wait_for_in_progress_heal _
+
+self = <tests.gateway.test_session_store_stale_prune.TestStartupHealBarrier object at 0x7ca12dc576f0>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-775/test_ensure_loaded_does_not_wa0')
+
+    def test_ensure_loaded_does_not_wait_for_in_progress_heal(self, tmp_path):
+        """A direct, non-inbound _ensure_loaded() call must not be stranded
+        behind an in-flight heal, and must never observe a half-applied
+        (partially pruned/repointed) routing index."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        reached_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+>       original_resolve = store._resolve_stale_sessions
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'SessionStore' object has no attribute '_resolve_stale_sessions'
+
+tests/gateway/test_session_store_stale_prune.py:532: AttributeError
+_ TestStartupHealBarrier.test_has_any_sessions_db_error_fallback_does_not_wait_for_in_progress_heal _
+
+self = <tests.gateway.test_session_store_stale_prune.TestStartupHealBarrier object at 0x7ca12da73890>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-775/test_has_any_sessions_db_error0')
+
+    def test_has_any_sessions_db_error_fallback_does_not_wait_for_in_progress_heal(
+        self, tmp_path
+    ):
+        """has_any_sessions()'s DB-error fallback must not be stranded behind
+        an in-flight heal either."""
+        db = SessionDB(tmp_path / "state.db")
+        self._seed_compression_route(tmp_path, db)
+        store = self._make_unloaded_store(tmp_path, db)
+
+        reached_snapshot = threading.Event()
+        release_snapshot = threading.Event()
+>       original_resolve = store._resolve_stale_sessions
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'SessionStore' object has no attribute '_resolve_stale_sessions'
+
+tests/gateway/test_session_store_stale_prune.py:575: AttributeError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_startup_heal_db_phase_runs_without_routing_lock
+FAILED tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_inbound_waits_for_terminal_startup_heal
+FAILED tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_startup_heal_failure_releases_inbound_waiter
+FAILED tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_ensure_loaded_does_not_wait_for_in_progress_heal
+FAILED tests/gateway/test_session_store_stale_prune.py::TestStartupHealBarrier::test_has_any_sessions_db_error_fallback_does_not_wait_for_in_progress_heal
+========================= 5 failed, 17 passed in 0.21s =========================

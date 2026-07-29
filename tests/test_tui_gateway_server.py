@@ -37,6 +37,32 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+def test_cron_manage_add_forwards_required_llm_admission_fields(monkeypatch):
+    captured = {}
+
+    def fake_cronjob(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True, "job_id": "job-tui"})
+
+    monkeypatch.setattr("tools.cronjob_tools.cronjob", fake_cronjob)
+
+    response = server._methods["cron.manage"](
+        "r-cron",
+        {
+            "action": "add",
+            "name": "TUI cron",
+            "schedule": "every 1h",
+            "prompt": "Produce a verified report",
+            "category": "necessary_as_is",
+            "material_result_criterion": "verified report file exists",
+        },
+    )
+
+    assert response["result"]["success"] is True
+    assert captured["category"] == "necessary_as_is"
+    assert captured["material_result_criterion"] == "verified report file exists"
+
+
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

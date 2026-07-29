@@ -851,6 +851,32 @@ def _startup_restore_drain_timeout_secs() -> float:
         return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
 
 
+def _restart_resume_guidance(*, has_new_message: bool) -> str:
+    """Return safe, intent-aware guidance for an interrupted gateway turn.
+
+    A real inbound message always wins. The synthetic empty startup turn,
+    however, exists specifically to continue work marked ``resume_pending``;
+    asking the user what to do next defeats that recovery mechanism.
+    """
+    if has_new_message:
+        return (
+            "Address the user's NEW message first; it takes priority. "
+            "Do not automatically resume unrelated old work. If the new "
+            "message asks to continue the interrupted goal, reconstruct the "
+            "goal from the transcript, inspect current durable state, and "
+            "continue only the remaining work without blindly repeating "
+            "already-confirmed external side effects."
+        )
+    return (
+        "You must automatically continue the unfinished user goal from the "
+        "transcript. Reconstruct the pending goal, inspect current durable state "
+        "before any external side effect, and continue only the remaining work. "
+        "Do not ask what to do next unless required context cannot be recovered. "
+        "Do not blindly repeat old tool calls or already-confirmed external "
+        "side effects."
+    )
+
+
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
 
@@ -934,13 +960,13 @@ def build_resume_recovery_note(
             "unfinished work from the conversation history."
         )
     elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
+        # Local resume continuity: the synthetic empty auto-resume turn
+        # exists specifically to continue work marked resume_pending.
+        # Asking "what next?" defeats that recovery mechanism.
+        resume_guidance = _restart_resume_guidance(has_new_message=False)
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do not blindly re-execute already-confirmed external "
+            "side effects from the conversation history."
         )
     else:
         resume_guidance = (
@@ -8220,10 +8246,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             service_arg = shlex.quote(service_name)
+            # Use ``start`` rather than ``restart`` after the old PID exits.
+            # The unit's own Restart= policy may already have started a fresh
+            # MainPID by the time this helper runs. ``restart`` would then stop
+            # that healthy replacement and can race it into an orphan/lock
+            # collision loop; ``start`` is idempotent and only acts when the
+            # unit is still down.
             shell_cmd = (
                 f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
                 f"{systemctl_scope} reset-failed {service_arg}; "
-                f"{systemctl_scope} restart {service_arg}"
+                f"{systemctl_scope} start {service_arg}"
             )
             unit_name = f"{service_name}-planned-restart-{current_pid}".replace(".", "-")
             subprocess.Popen(
@@ -8542,6 +8574,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
         return redelivered
 
+    async def _restore_startup_sessions(self) -> tuple[int, int]:
+        """Prioritize already-queued human input, then auto-resume leftovers.
+
+        Platform adapters can receive real messages while startup wiring is
+        still settling. Replaying those messages first lets cancellation or
+        replacement intent claim its session before any synthetic recovery
+        turn is scheduled. The adapter-level active-session guard closes the
+        small gap before the runner's background agent registers itself.
+        """
+        drained_first = await self._drain_startup_restore_queue()
+        scheduled = self._schedule_resume_pending_sessions()
+        await self._finish_startup_restore()
+        return scheduled, drained_first
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -8620,6 +8666,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Skipping auto-resume for %s: adapter not ready for %s",
                     entry.session_key,
                     getattr(source.platform, "value", source.platform),
+                )
+                continue
+
+            # A real inbound message replayed from the startup queue installs
+            # this adapter guard synchronously before its background agent has
+            # time to claim ``self._running_agents``. Respect both registries so
+            # the synthetic recovery turn cannot race ahead of human intent.
+            if entry.session_key in getattr(adapter, "_active_sessions", {}):
+                logger.info(
+                    "Skipping auto-resume for %s: real inbound turn already active",
+                    entry.session_key,
                 )
                 continue
 
@@ -9520,18 +9577,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _clear_planned_restart_notification()
 
         # Automatically continue fresh sessions that were interrupted by the
-        # previous gateway restart/shutdown.  The resume_pending flag is cleared
-        # by the normal successful-turn path, so a failed auto-resume remains
-        # visible for manual recovery on the next user message.
-        #
-        # Delivery-obligation redelivery runs FIRST: a session whose final
-        # response was generated but never confirmed-delivered has its answer
-        # in the ledger — redelivering it (and clearing resume_pending for
-        # that session) is strictly cheaper and more correct than re-running
-        # the whole turn.
+        # previous gateway restart/shutdown. Delivery-obligation redelivery
+        # runs FIRST: a session whose final response was generated but never
+        # confirmed-delivered has its answer in the ledger — redelivering it
+        # (and clearing resume_pending for that session) is strictly cheaper
+        # and more correct than re-running the whole turn. Real inbound
+        # messages collected during startup are then replayed before any
+        # synthetic auto-resume so current human intent wins. The
+        # resume_pending flag is cleared by the normal successful-turn path,
+        # so a failed auto-resume remains visible for manual recovery.
         await self._redeliver_pending_obligations()
-        self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
+        await self._restore_startup_sessions()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -18749,6 +18805,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 str(context.source.chat_type) if context.source.chat_type else ""
             ),
             chat_name=context.source.chat_name or "",
+            guild_id=str(context.source.guild_id) if context.source.guild_id else "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
@@ -23070,12 +23127,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _persist_user_message_override = message
                 # The empty-message case is the auto-resume startup turn
                 # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address.  Guidance is adapter-aware:
-                # interactive platforms report the restore and ask what next;
-                # non-interactive event platforms (webhook, API server)
-                # continue the interrupted work instead, because nobody is
-                # present to answer and an acknowledgement would silently
-                # abandon the task (#57056).
+                # no NEW user message to address. Guidance is adapter-aware via
+                # build_resume_recovery_note (upstream #57056 interactive split)
+                # and continues interrupted work on empty auto-resume turns
+                # (local resume-continuity intent).
                 _resume_adapter = self._adapter_for_source(source)
                 _interactive_resume = bool(
                     getattr(_resume_adapter, "interactive_resume", True)

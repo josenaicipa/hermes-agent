@@ -444,6 +444,13 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _resolve_subdirectory_hint_working_dir() -> str:
+    """Resolve tracker root from the per-session cwd before global fallbacks."""
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    return str(resolve_agent_cwd())
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -1942,10 +1949,14 @@ def init_agent(
         }
     else:
         compression_model_thresholds = {}
-    # Absolute token cap: when set, compression triggers at the lower of
-    # the ratio-based threshold and this absolute count. Clamped to the
-    # model's context length at apply-time so a cap above the window is
-    # a no-op (ratio-based threshold wins).
+    # Absolute token cap (the "hard pre-API compression cap"): when set,
+    # compression triggers at the lower of the ratio-based threshold and
+    # this absolute count. Clamped to the model's context length at
+    # apply-time so a cap above the window is a no-op (ratio-based
+    # threshold wins). Config.yaml only — no env var. Wired into
+    # ContextCompressor as threshold_tokens_cap so pre-API preflight +
+    # should_compress share it and model fallback via update_model keeps
+    # the ceiling (see ContextCompressor._apply_threshold_tokens_cap).
     compression_threshold_tokens = _compression_cfg.get("threshold_tokens")
     if compression_threshold_tokens is not None:
         try:
@@ -2540,7 +2551,7 @@ def init_agent(
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=_resolve_subdirectory_hint_working_dir(),
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

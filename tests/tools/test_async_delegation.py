@@ -911,6 +911,277 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# Delivery attempt cap → failed-terminal (Entrega 3)
+# ---------------------------------------------------------------------------
+
+def _seed_pending_completion(delegation_id, *, attempts=0, claim=None, claimed_at=None):
+    """Insert a completed-but-pending durable row with controlled attempt count."""
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "status": "completed",
+            "completed_at": 2.0,
+            "session_key": "owner",
+            "summary": "seeded",
+        },
+        {"status": "completed", "summary": "seeded"},
+    )
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET delivery_attempts=?, delivery_claim=?, delivery_claimed_at=?
+               WHERE delegation_id=?""",
+            (attempts, claim, claimed_at, delegation_id),
+        )
+
+
+def _row_fields(delegation_id):
+    with ad._DB_LOCK, ad._connect() as conn:
+        return conn.execute(
+            """SELECT state, delivery_state, delivery_attempts,
+                      delivery_claim, delivery_claimed_at
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+
+
+def test_max_delivery_attempts_constant_is_25():
+    assert ad._MAX_DELIVERY_ATTEMPTS == 25
+
+
+def test_pending_at_max_attempts_fails_terminal_on_restore_without_requeue(
+    tmp_path, monkeypatch,
+):
+    """Rows already at the cap must become failed-terminal before restore."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    did = "deleg_restore_cap"
+    _seed_pending_completion(did, attempts=ad._MAX_DELIVERY_ATTEMPTS)
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(did)
+    assert state == "completed"
+    assert delivery_state == "failed-terminal"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim is None
+    assert claimed_at is None
+
+
+def test_pending_at_max_attempts_fails_terminal_on_claim_never_reenqueues(
+    tmp_path, monkeypatch,
+):
+    """Claim must terminal-fail exhausted pending rows and leave them unclaimed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    did = "deleg_claim_cap"
+    _seed_pending_completion(
+        did, attempts=ad._MAX_DELIVERY_ATTEMPTS, claim="stale", claimed_at=1.0,
+    )
+
+    assert not ad.claim_completion_delivery(did, "consumer-new")
+
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(did)
+    assert state == "completed"
+    assert delivery_state == "failed-terminal"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim is None
+    assert claimed_at is None
+
+    # Still never re-enqueued after a subsequent restore.
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    assert ad.get_durable_delegation(did)["delivery_state"] == "failed-terminal"
+
+
+def test_claim_at_24_can_still_complete_as_delivered(tmp_path, monkeypatch):
+    """The claim that bumps attempts 24→25 may still succeed as delivered."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    did = "deleg_claim_last"
+    _seed_pending_completion(did, attempts=ad._MAX_DELIVERY_ATTEMPTS - 1)
+
+    assert ad.claim_completion_delivery(did, "consumer-last")
+    row = ad.get_durable_delegation(did)
+    assert row["delivery_state"] == "pending"
+    assert row["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert row["state"] == "completed"
+
+    assert ad.complete_completion_delivery(did, "consumer-last")
+    row = ad.get_durable_delegation(did)
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert row["state"] == "completed"
+
+
+def test_release_of_25th_claim_atomically_fails_terminal_and_clears_claim(
+    tmp_path, monkeypatch,
+):
+    """Releasing the claim that reached N must atomically fail-terminal."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    did = "deleg_release_cap"
+    _seed_pending_completion(did, attempts=ad._MAX_DELIVERY_ATTEMPTS - 1)
+
+    assert ad.claim_completion_delivery(did, "consumer-25")
+    assert ad.get_durable_delegation(did)["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+
+    assert ad.release_completion_delivery(did, "consumer-25")
+
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(did)
+    assert state == "completed"
+    assert delivery_state == "failed-terminal"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim is None
+    assert claimed_at is None
+
+    # Release was terminal: no further claim/release/mark.
+    assert not ad.claim_completion_delivery(did, "consumer-retry")
+    assert not ad.release_completion_delivery(did, "consumer-25")
+    assert not ad.mark_completion_delivered(did)
+    assert ad.get_durable_delegation(did)["delivery_state"] == "failed-terminal"
+
+
+def test_delivered_and_failed_terminal_are_immutable_for_mark_claim_release(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    delivered_id = "deleg_immut_delivered"
+    _seed_pending_completion(delivered_id, attempts=1)
+    assert ad.claim_completion_delivery(delivered_id, "c1")
+    assert ad.complete_completion_delivery(delivered_id, "c1")
+    assert ad.get_durable_delegation(delivered_id)["delivery_state"] == "delivered"
+    assert not ad.mark_completion_delivered(delivered_id)
+    assert not ad.claim_completion_delivery(delivered_id, "c2")
+    assert not ad.release_completion_delivery(delivered_id, "c1")
+    assert ad.get_durable_delegation(delivered_id)["delivery_state"] == "delivered"
+    assert ad.get_durable_delegation(delivered_id)["state"] == "completed"
+
+    failed_id = "deleg_immut_failed"
+    _seed_pending_completion(failed_id, attempts=ad._MAX_DELIVERY_ATTEMPTS)
+    assert not ad.claim_completion_delivery(failed_id, "c3")
+    assert ad.get_durable_delegation(failed_id)["delivery_state"] == "failed-terminal"
+    assert not ad.mark_completion_delivered(failed_id)
+    assert not ad.claim_completion_delivery(failed_id, "c4")
+    assert not ad.release_completion_delivery(failed_id, "c3")
+    assert ad.get_durable_delegation(failed_id)["delivery_state"] == "failed-terminal"
+    assert ad.get_durable_delegation(failed_id)["state"] == "completed"
+
+
+def test_fresh_claim_at_max_attempts_survives_restore_and_can_complete(
+    tmp_path, monkeypatch,
+):
+    """Active 25th claim must not be requeued or terminal-failed by restore."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    did = "deleg_fresh_restore_25"
+    owner = "consumer-owner-25"
+    now = time.time()
+    _seed_pending_completion(
+        did,
+        attempts=ad._MAX_DELIVERY_ATTEMPTS,
+        claim=owner,
+        claimed_at=now,
+    )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(did)
+    assert state == "completed"
+    assert delivery_state == "pending"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim == owner
+    assert claimed_at == now
+
+    assert ad.complete_completion_delivery(did, owner)
+    row = ad.get_durable_delegation(did)
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert row["state"] == "completed"
+
+
+def test_fresh_claim_at_max_attempts_blocks_competitor_and_owner_can_complete(
+    tmp_path, monkeypatch,
+):
+    """Competing claim at attempts=25 must lose; original owner may still deliver."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    did = "deleg_fresh_claim_race_25"
+    owner = "consumer-owner-25"
+    now = time.time()
+    _seed_pending_completion(
+        did,
+        attempts=ad._MAX_DELIVERY_ATTEMPTS,
+        claim=owner,
+        claimed_at=now,
+    )
+
+    assert not ad.claim_completion_delivery(did, "consumer-competitor")
+
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(did)
+    assert state == "completed"
+    assert delivery_state == "pending"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim == owner
+    assert claimed_at == now
+
+    assert ad.complete_completion_delivery(did, owner)
+    row = ad.get_durable_delegation(did)
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert row["state"] == "completed"
+
+
+def test_stale_claim_at_max_attempts_fails_terminal_on_restore_and_claim(
+    tmp_path, monkeypatch,
+):
+    """Stale claim (outside the 300s window) at attempts=25 is terminal-failed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    stale_at = time.time() - 301
+
+    restore_id = "deleg_stale_restore_25"
+    _seed_pending_completion(
+        restore_id,
+        attempts=ad._MAX_DELIVERY_ATTEMPTS,
+        claim="stale-owner",
+        claimed_at=stale_at,
+    )
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(restore_id)
+    assert state == "completed"
+    assert delivery_state == "failed-terminal"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim is None
+    assert claimed_at is None
+
+    claim_id = "deleg_stale_claim_25"
+    _seed_pending_completion(
+        claim_id,
+        attempts=ad._MAX_DELIVERY_ATTEMPTS,
+        claim="stale-owner",
+        claimed_at=stale_at,
+    )
+    assert not ad.claim_completion_delivery(claim_id, "consumer-new")
+    state, delivery_state, attempts, claim, claimed_at = _row_fields(claim_id)
+    assert state == "completed"
+    assert delivery_state == "failed-terminal"
+    assert attempts == ad._MAX_DELIVERY_ATTEMPTS
+    assert claim is None
+    assert claimed_at is None
+
+
+# ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
 

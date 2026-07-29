@@ -687,6 +687,17 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            # Final safety net: drop any hallucinated fields the model
+            # invented outside the tool's declared schema right before the
+            # handler actually runs, so a stray extra key doesn't crash a
+            # handler that unpacks **args into a strict signature (reported
+            # for Opus 4.8 / Sonnet 5 circa 2026-07 — see
+            # model_tools.strip_unrecognized_tool_args docstring). Applied
+            # at this actual dispatch boundary so every caller of dispatch()
+            # is protected, while callers/hooks/middleware upstream keep
+            # seeing the model's real, unmodified args.
+            from model_tools import strip_unrecognized_tool_args
+            args = strip_unrecognized_tool_args(name, args)
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))

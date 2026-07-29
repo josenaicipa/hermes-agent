@@ -35,6 +35,13 @@ except ImportError:  # noqa: F401 - sentinel consumed in register_credential_fil
 
 logger = logging.getLogger(__name__)
 
+_DISABLE_AUTO_MOUNTS_ENV = "HERMES_DISABLE_SANDBOX_AUTO_MOUNTS"
+
+
+def _auto_mounts_disabled() -> bool:
+    """Return whether implicit credential/skill/cache sandbox mounts are disabled."""
+    return os.environ.get(_DISABLE_AUTO_MOUNTS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
 # Session-scoped list of credential files to mount.
 # Backed by ContextVar to prevent cross-session data bleed in the gateway pipeline.
 _registered_files_var: ContextVar[Dict[str, str]] = ContextVar("_registered_files")
@@ -224,6 +231,8 @@ def get_credential_file_mounts() -> List[Dict[str, str]]:
     Each item has ``host_path`` and ``container_path`` keys.
     Combines skill-registered files and user config.
     """
+    if _auto_mounts_disabled():
+        return []
     mounts: Dict[str, str] = {}
 
     # Skill-registered files
@@ -263,6 +272,8 @@ def get_skills_directory_mount(
     The local skills dir mounts at ``<container_base>/skills``, external dirs
     at ``<container_base>/external_skills/<index>``.
     """
+    if _auto_mounts_disabled():
+        return []
     mounts = []
     hermes_home = _resolve_hermes_home()
     skills_dir = hermes_home / "skills"
@@ -407,6 +418,8 @@ def get_cache_directory_mounts(
     ``container_path`` keys.  The host path is resolved via
     ``get_hermes_dir()`` for backward compatibility with old directory layouts.
     """
+    if _auto_mounts_disabled():
+        return []
     from hermes_constants import get_hermes_dir
 
     mounts: List[Dict[str, str]] = []

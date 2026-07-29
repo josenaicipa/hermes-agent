@@ -25,6 +25,24 @@ from gateway.session import (
 normalize_whatsapp_identifier = canonical_whatsapp_identifier
 
 
+@pytest.fixture(autouse=True)
+def _close_test_session_dbs(monkeypatch):
+    """Close every temporary SessionDB created by this test module."""
+    import hermes_state
+
+    databases = []
+    original_init = hermes_state.SessionDB.__init__
+
+    def tracked_init(db, *args, **kwargs):
+        original_init(db, *args, **kwargs)
+        databases.append(db)
+
+    monkeypatch.setattr(hermes_state.SessionDB, "__init__", tracked_init)
+    yield
+    for db in reversed(databases):
+        db.close()
+
+
 class TestSessionSourceRoundtrip:
     def test_full_roundtrip(self):
         source = SessionSource(
@@ -2611,6 +2629,94 @@ class TestGatewaySessionDbRecovery:
         assert reset.session_id != entry.session_id
         assert reset.was_auto_reset is True
         assert reset.auto_reset_reason == "idle"
+
+    def test_aware_persisted_timestamp_is_compatible_with_idle_reset_policy(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+        from gateway.config import SessionResetPolicy
+        from gateway.session import SessionEntry
+
+        config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=1))
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1524886442411823185",
+            chat_type="group",
+            user_id="906161572706136165",
+        )
+        old_aware = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        entry = SessionEntry.from_dict({
+            "session_key": build_session_key(source),
+            "session_id": "aware-timestamp-session",
+            "created_at": old_aware,
+            "updated_at": old_aware,
+            "platform": "discord",
+            "chat_type": "group",
+            "origin": source.to_dict(),
+        })
+
+        assert store._should_reset(entry, source) == "idle"
+
+    def test_aware_timestamp_normalization_preserves_the_instant(self):
+        from datetime import datetime
+        from gateway.session import _as_local_naive
+
+        aware = datetime.fromisoformat("2026-07-16T09:30:00-04:00")
+        local_aware = aware.astimezone()
+        normalized = _as_local_naive(aware)
+
+        assert normalized == local_aware.replace(tzinfo=None)
+        assert normalized.replace(tzinfo=local_aware.tzinfo).timestamp() == aware.timestamp()
+
+    def test_legacy_naive_timestamp_remains_unchanged(self):
+        from datetime import datetime
+        from gateway.session import _as_local_naive
+
+        legacy = datetime(2026, 7, 16, 9, 51, 32)
+
+        assert _as_local_naive(legacy) is legacy
+
+    def test_aware_persisted_timestamp_is_compatible_with_daily_reset_policy(self, tmp_path):
+        from datetime import datetime
+        from gateway.config import SessionResetPolicy
+        from gateway.session import SessionEntry
+
+        config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="daily", at_hour=12))
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1524886442411823185",
+            chat_type="group",
+            user_id="906161572706136165",
+        )
+        local_tz = datetime.now().astimezone().tzinfo
+        entry = SessionEntry.from_dict({
+            "session_key": build_session_key(source),
+            "session_id": "aware-daily-session",
+            "created_at": datetime(2026, 7, 16, 9, 0, 0, tzinfo=local_tz).isoformat(),
+            "updated_at": datetime(2026, 7, 16, 10, 0, 0, tzinfo=local_tz).isoformat(),
+            "platform": "discord",
+            "chat_type": "group",
+            "origin": source.to_dict(),
+        })
+
+        with patch("gateway.session._now", return_value=datetime(2026, 7, 16, 13, 0, 0)):
+            assert store._should_reset(entry, source) == "daily"
+
+    @pytest.mark.parametrize("last_resume_value", [None, "not-a-datetime"])
+    def test_optional_resume_timestamp_null_or_malformed_is_safe(self, last_resume_value):
+        from gateway.session import SessionEntry
+
+        entry = SessionEntry.from_dict({
+            "session_key": "agent:main:discord:group:room:user",
+            "session_id": "optional-resume-timestamp",
+            "created_at": "2026-07-16T09:00:00-04:00",
+            "updated_at": "2026-07-16T10:00:00-04:00",
+            "platform": "discord",
+            "chat_type": "group",
+            "last_resume_marked_at": last_resume_value,
+        })
+
+        assert entry.last_resume_marked_at is None
 
 
 class TestGatewayRoutingTable:

@@ -83,6 +83,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--category",
+        choices=("event", "justified_cadence", "necessary_as_is"),
+        help="Required for LLM jobs: event, justified_cadence, or necessary_as_is.",
+    )
+    cron_create.add_argument(
+        "--material-result-criterion",
+        dest="material_result_criterion",
+        help="Required for LLM jobs: verifiable outcome that counts as a material result.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -160,6 +170,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--category",
+        choices=("event", "justified_cadence", "necessary_as_is"),
+        help="Set the LLM admission category before resume/reactivation.",
+    )
+    cron_edit.add_argument(
+        "--material-result-criterion",
+        dest="material_result_criterion",
+        help="Set the verifiable outcome required before resume/reactivation.",
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
@@ -191,5 +211,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+
+    # cron repair — explicit canonicalize of legacy/hand-edited jobs.json
+    cron_subparsers.add_parser(
+        "repair",
+        help=(
+            "Canonicalize a legacy/hand-edited jobs.json (bare list or "
+            "control-character JSON). Fails closed on enabled incomplete LLM jobs."
+        ),
+    )
+
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

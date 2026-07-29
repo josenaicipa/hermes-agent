@@ -49,6 +49,23 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
+def _probe_is_dir(path: Path) -> bool:
+    """``Path.is_dir()`` that fails open to ``False`` on any filesystem error.
+
+    ``Path.is_dir()`` only swallows ENOENT/ENOTDIR/EBADF/ELOOP and RE-RAISES
+    everything else — notably EACCES (``PermissionError``). In a sandboxed
+    cron/gateway environment ``stat('/etc/hermes')`` can raise ``PermissionError``,
+    which must resolve to 'no managed scope' rather than crash startup. Managed
+    scope is a fail-open policy layer, so an unprobeable directory is treated as
+    absent. This does NOT weaken real managed-scope behavior: a present, readable
+    directory still probes ``True`` and is honored exactly as before.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def get_managed_dir() -> Optional[Path]:
     """Resolve the managed-scope directory, or None when no scope is present.
 
@@ -60,15 +77,18 @@ def get_managed_dir() -> Optional[Path]:
          a real system managed scope can't leak into the test suite.
 
     A non-existent directory at either tier resolves to None (no managed scope),
-    which is the common case and must be cheap + side-effect-free.
+    which is the common case and must be cheap + side-effect-free. A directory
+    that cannot be probed at all (e.g. ``stat`` raising ``PermissionError`` in a
+    sandboxed cron/gateway environment) also resolves to None — see
+    ``_probe_is_dir`` — so managed scope stays fail-open and never crashes startup.
     """
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
         p = Path(override)
-        return p if p.is_dir() else None
+        return p if _probe_is_dir(p) else None
     if _under_pytest():
         return None
-    return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
+    return _DEFAULT_MANAGED_DIR if _probe_is_dir(_DEFAULT_MANAGED_DIR) else None
 
 
 def invalidate_managed_cache() -> None:

@@ -2,7 +2,7 @@
 Cron subcommand for hermes CLI.
 
 Handles standalone cron management commands like list, create, edit,
-pause/resume/run/remove, status, and tick.
+pause/resume/run/remove, status, tick, and repair.
 """
 
 import json
@@ -352,6 +352,8 @@ def cron_create(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        category=getattr(args, "category", None),
+        material_result_criterion=getattr(args, "material_result_criterion", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -417,6 +419,8 @@ def cron_edit(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
+        category=getattr(args, "category", None),
+        material_result_criterion=getattr(args, "material_result_criterion", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -450,13 +454,51 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         job = result.get("job", {})
-        if job.get("executed"):
+        if job.get("execution_pending"):
+            print("  Run dispatched; completion pending.")
+        elif job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):
             print(f"  {job['execution_skipped']}")
         else:
             print("  It will run on the next scheduler tick.")
+    return 0
+
+
+def cron_repair():
+    """Canonicalize a legacy/hand-edited jobs.json via the central write gate.
+
+    Load paths are pure-read; this is the only explicit rewrite for bare-list
+    and control-character stores. Admission-invalid enabled LLM records fail
+    closed with a clear error and leave the file byte-identical.
+    """
+    from cron.jobs import LlmCronAdmissionError, repair_legacy_jobs_store
+
+    try:
+        result = repair_legacy_jobs_store()
+    except LlmCronAdmissionError as exc:
+        print(color(str(exc), Colors.RED))
+        return 1
+    except Exception as exc:
+        print(color(f"Failed to repair cron jobs store: {exc}", Colors.RED))
+        return 1
+
+    if result.get("changed"):
+        n = result.get("jobs", 0)
+        print(color(
+            f"Repaired cron jobs store ({n} job{'s' if n != 1 else ''} "
+            f"canonicalized).",
+            Colors.GREEN,
+        ))
+    else:
+        reason = result.get("reason") or "unchanged"
+        if reason == "missing":
+            print("No cron jobs store found — nothing to repair.")
+        elif reason == "canonical":
+            print("Cron jobs store is already canonical — no changes.")
+        else:
+            print("Cron jobs store unchanged.")
     return 0
 
 
@@ -499,6 +541,9 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
+    if subcmd == "repair":
+        return cron_repair()
+
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|repair]")
     sys.exit(1)

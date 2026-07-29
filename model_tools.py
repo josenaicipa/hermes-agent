@@ -908,6 +908,65 @@ def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
     return value
 
 
+def strip_unrecognized_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop tool-call arguments the model invented that aren't in its schema.
+
+    Some frontier models (reported for Opus 4.8 and Sonnet 5 circa mid-2026 by
+    Armin Ronacher / Simon Willison, "Better Models, Worse Tools") add extra
+    fields to tool-call arguments for custom (non-native) tool schemas --
+    fields that were never declared in the tool's JSON Schema
+    ``parameters.properties``. Handlers that unpack ``**args`` into a strict
+    function signature then raise ``TypeError: unexpected keyword argument``,
+    silently breaking the tool call. RL training on Claude Code's own
+    native edit-tools is the suspected cause; third-party schemas pay the
+    price. See: https://simonwillison.net/2026/Jul/4/better-models-worse-tools/
+
+    This strips any top-level key not present in the schema's declared
+    ``properties``, unless the schema explicitly opts into freeform args via
+    ``"additionalProperties": true`` (e.g. the raw CDP bridge or the generic
+    MCP tool_call bridge, which intentionally accept arbitrary shapes).
+    Stripped calls are logged as a warning -- grep ``malformed_tool_args`` in
+    agent.log for a running count of how often models hallucinate fields --
+    so this is observable without changing the tool's success/failure shape.
+
+    Only checks top-level keys (not nested object schemas): that's the
+    reported failure mode (invented sibling fields breaking ``**kwargs``
+    unpacking), and a full recursive JSON Schema validator across ~90
+    built-in tools plus arbitrary MCP schemas is a larger, riskier change
+    that deserves its own dedicated pass.
+
+    Mutates and returns *args* (same contract as coerce_tool_args above).
+    """
+    if not args or not isinstance(args, dict):
+        return args
+
+    schema = registry.get_schema(tool_name)
+    if not schema:
+        return args
+
+    parameters = schema.get("parameters") or {}
+    if parameters.get("additionalProperties") is True:
+        return args
+
+    properties = parameters.get("properties")
+    if properties is None:
+        return args
+
+    unknown_keys = [key for key in args if key not in properties]
+    if not unknown_keys:
+        return args
+
+    logger.warning(
+        "malformed_tool_args: %s called with %d field(s) not declared in its "
+        "schema -- stripping before dispatch (model likely hallucinated "
+        "these): %s",
+        tool_name, len(unknown_keys), sorted(unknown_keys),
+    )
+    for key in unknown_keys:
+        del args[key]
+    return args
+
+
 def _coerce_value(value: str, expected_type, schema: dict | None = None):
     """Attempt to coerce a string *value* to *expected_type*.
 

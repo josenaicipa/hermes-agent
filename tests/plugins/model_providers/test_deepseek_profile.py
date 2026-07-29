@@ -191,6 +191,13 @@ class TestDeepSeekAuxModel:
     expected to set `default_aux_model` on `ProviderProfile`, and the
     fallback dict only exists for providers that predate the profiles
     system.
+
+    2026-07-05: bumped from ``deepseek-chat`` (V3) to ``deepseek-v4-flash``
+    per the actualidad-ai daily report's DeepSeek migration recommendation —
+    DeepSeek retires the ``deepseek-chat``/``deepseek-reasoner`` IDs on
+    2026-07-24, and Hermes' own ``config.yaml`` auxiliary blocks already use
+    ``deepseek-v4-flash`` everywhere else, so the profile default was the
+    one place still pointing at the legacy V3 alias.
     """
 
     def test_profile_advertises_deepseek_v4_flash(self, deepseek_profile):

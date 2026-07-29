@@ -9,7 +9,6 @@ cron job store.
 import importlib
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -24,6 +23,29 @@ from cron.blueprint_catalog import (
     blueprint_form_schema,
     blueprint_slash_command,
 )
+from cron.jobs import LLM_ADMISSION_CATEGORIES, LLM_BLUEPRINT_MATERIAL_CRITERIA
+
+
+# Reminders / alerts / nudges / check-ins use alerta_accionable.
+_ALERT_KEYS = frozenset({
+    "important-mail",
+    "workday-start",
+    "custom-reminder",
+    "evening-winddown",
+    "bill-renewal-watch",
+    "habit-checkin",
+    "hydration-move",
+    "gratitude-journal",
+})
+# Concrete content/report deliverables use archivo_entregado.
+_DELIVERABLE_KEYS = frozenset({
+    "morning-brief",
+    "weekly-review",
+    "news-digest",
+    "meal-plan",
+    "learn-daily",
+    "on-this-day",
+})
 
 
 class TestCatalog:
@@ -40,6 +62,33 @@ class TestCatalog:
     def test_bad_slot_type_rejected(self):
         with pytest.raises(ValueError):
             BlueprintSlot(name="x", type="bogus", label="X")
+
+    def test_every_entry_declares_explicit_admission(self):
+        for r in CATALOG:
+            assert r.admission_category in LLM_ADMISSION_CATEGORIES, r.key
+            assert r.material_result_criterion in LLM_BLUEPRINT_MATERIAL_CRITERIA, r.key
+            # Display category stays free-form; admission is separate.
+            assert r.category  # display taxonomy still present
+
+    def test_important_mail_is_event_alert(self):
+        r = get_blueprint("important-mail")
+        assert r.admission_category == "event"
+        assert r.material_result_criterion == "alerta_accionable"
+
+    def test_other_entries_use_justified_cadence(self):
+        for r in CATALOG:
+            if r.key == "important-mail":
+                continue
+            assert r.admission_category == "justified_cadence", r.key
+
+    def test_criterion_assignment_by_intent(self):
+        for r in CATALOG:
+            if r.key in _ALERT_KEYS:
+                assert r.material_result_criterion == "alerta_accionable", r.key
+            elif r.key in _DELIVERABLE_KEYS:
+                assert r.material_result_criterion == "archivo_entregado", r.key
+            else:
+                pytest.fail(f"catalog entry {r.key!r} not mapped in criterion groups")
 
 
 class TestScheduleResolution:
@@ -71,6 +120,24 @@ class TestScheduleResolution:
     def test_defaults_fill_when_omitted(self):
         spec = fill_blueprint(get_blueprint("morning-brief"), {})
         assert spec["schedule"] == "0 8 * * *"
+
+    def test_fill_propagates_admission_declarations_unchanged(self):
+        bp = get_blueprint("morning-brief")
+        spec = fill_blueprint(bp, {"time": "08:30"})
+        assert spec["category"] == bp.admission_category == "justified_cadence"
+        assert (
+            spec["material_result_criterion"]
+            == bp.material_result_criterion
+            == "archivo_entregado"
+        )
+
+    def test_fill_important_mail_event_alert(self):
+        bp = get_blueprint("important-mail")
+        spec = fill_blueprint(
+            bp, {"interval_min": "30", "criteria": "from CEO", "deliver": "origin"}
+        )
+        assert spec["category"] == "event"
+        assert spec["material_result_criterion"] == "alerta_accionable"
 
 
 class TestValidation:
@@ -129,6 +196,9 @@ class TestRenderers:
         names = [f["name"] for f in schema["fields"]]
         assert names == ["time", "deliver"]
         assert schema["key"] == "morning-brief"
+        assert schema["category"] == "daily"  # display taxonomy
+        assert schema["admissionCategory"] == "justified_cadence"
+        assert schema["materialResultCriterion"] == "archivo_entregado"
 
     def test_slash_command_defaults(self):
         cmd = blueprint_slash_command(get_blueprint("morning-brief"))
@@ -152,17 +222,21 @@ class TestRenderers:
         assert entry["appUrl"].startswith("hermes://")
         assert entry["scheduleHuman"]
         assert "fields" in entry
+        assert entry["admissionCategory"] == "justified_cadence"
+        assert entry["materialResultCriterion"] == "archivo_entregado"
 
 
 @pytest.fixture
 def isolated_home(tmp_path, monkeypatch):
+    """Isolate HERMES_HOME for create_job paths.
+
+    ``cron.jobs`` resolves storage from the live HERMES_HOME env dynamically —
+    do not reload the module (reload desyncs the suite-wide create_job wrapper).
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    import hermes_constants
-    importlib.reload(hermes_constants)
     import cron.jobs as jobs
-    importlib.reload(jobs)
     return jobs
 
 
@@ -185,6 +259,11 @@ class TestCommandHandler:
         assert "cronjob tool" in res.agent_seed
         # the schedule template is handed to the agent to build the cron expr
         assert "* * *" in res.agent_seed
+        # Admission declarations must be passed unchanged to cronjob create.
+        assert "justified_cadence" in res.agent_seed
+        assert "archivo_entregado" in res.agent_seed
+        assert "material_result_criterion" in res.agent_seed
+        assert "category" in res.agent_seed
 
     def test_name_match_is_forgiving(self, isolated_home):
         from hermes_cli.blueprint_cmd import handle_blueprint_command, match_blueprint
@@ -209,6 +288,8 @@ class TestCommandHandler:
         assert len(jobs) == 1
         assert (jobs[0].get("schedule_display") or jobs[0].get("schedule")) == "30 7 * * *"
         assert jobs[0].get("deliver") == "telegram"
+        assert jobs[0].get("category") == "justified_cadence"
+        assert jobs[0].get("material_result_criterion") == "archivo_entregado"
 
     def test_unknown_blueprint(self, isolated_home):
         from hermes_cli.blueprint_cmd import handle_blueprint_command
@@ -243,3 +324,6 @@ class TestDocsGenerator:
         # Each entry must round-trip through json and carry the surfaces.
         json.dumps(index)
         assert all("command" in e and "appUrl" in e for e in index)
+        assert all(
+            "admissionCategory" in e and "materialResultCriterion" in e for e in index
+        )

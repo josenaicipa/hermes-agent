@@ -1,0 +1,84 @@
+=== G3 STARTUP-HEAL PARTIAL-SUCCESS — RED (pre-fix) ===
+Date: 2026-07-12T15:31:55Z
+HEAD: 74ca258ee45c5aaf0c6058ff4787c76d92f7c2f4
+Command: python -m pytest tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotPartialSuccess::test_older_snapshot_cannot_clobber_after_mirror_failure -v
+Regression: a newer snapshot's authoritative SQLite write succeeds, its
+sessions.json mirror then fails, then an OLDER snapshot arrives. Pre-fix
+_persisted_version was never advanced (only bumped after the mirror), so
+the stale guard let the older snapshot clobber the routes SQLite committed.
+===========================================================================
+
+============================= test session starts ==============================
+platform linux -- Python 3.13.13, pytest-9.0.2, pluggy-1.6.0 -- /home/jose-naicipa/.hermes/hermes-agent-vpsclone-0cb6a295/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/jose-naicipa/.hermes/worktrees/hermes-vpsclone-g3-startup-heal-sonnet
+configfile: pyproject.toml
+plugins: asyncio-1.3.0, anyio-4.12.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 1 item
+
+tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotPartialSuccess::test_older_snapshot_cannot_clobber_after_mirror_failure FAILED [100%]
+
+=================================== FAILURES ===================================
+_ TestPersistSnapshotPartialSuccess.test_older_snapshot_cannot_clobber_after_mirror_failure _
+
+self = <tests.gateway.test_session_store_g3_lock_free.TestPersistSnapshotPartialSuccess object at 0x7cc7bb1b8e10>
+tmp_path = PosixPath('/tmp/pytest-of-jose-naicipa/pytest-818/test_older_snapshot_cannot_clo0')
+
+    def test_older_snapshot_cannot_clobber_after_mirror_failure(self, tmp_path):
+        """SQLite is the authoritative routing store; sessions.json is a
+        best-effort mirror. When a newer snapshot's SQLite write succeeds but
+        its JSON mirror then fails, the persist must still advance the version
+        guard — otherwise a lower-version snapshot (e.g. an older startup-heal
+        persist still queued on ``_persist_lock``) would pass the guard and
+        clobber the routes SQLite already committed."""
+        db = SessionDB(tmp_path / "state.db")
+        store = _make_unloaded_store(tmp_path, db)
+        store._ensure_loaded()
+        scope = store._routing_scope()
+        # Baseline guard value after load — versions are chosen relative to it so
+        # the scenario is deterministic regardless of what the load/heal set.
+        base = store._persisted_version
+
+        newer = {"k_new": _make_entry("k_new", "sid_new").to_dict()}
+        older = {"k_old": _make_entry("k_old", "sid_old").to_dict()}
+
+        real_save_json = store._save_sessions_json
+
+        def failing_mirror(data):
+            raise OSError("sessions.json mirror unavailable")
+
+        store._save_sessions_json = failing_mirror
+
+        # Newer snapshot: the authoritative SQLite write commits, then the JSON
+        # mirror fails. A successfully persisted SQLite snapshot must not look
+        # uncommitted, so this must NOT raise — pre-fix it does, so tolerate the
+        # raise here to expose the downstream clobber either way.
+        try:
+            store._persist_snapshot(base + 1000, newer)
+        except Exception:
+            pass
+
+        assert "k_new" in db.load_gateway_routing_entries(scope=scope), (
+            "newer snapshot's authoritative SQLite write never committed"
+        )
+
+        # An older snapshot now arrives (as an out-of-lock startup-heal persist
+        # still waiting on _persist_lock would carry), this time with a working
+        # mirror. The version guard must drop it.
+        store._save_sessions_json = real_save_json
+        store._persist_snapshot(base + 1, older)
+
+        loaded = db.load_gateway_routing_entries(scope=scope)
+>       assert "k_new" in loaded, (
+            "an older snapshot clobbered SQLite routes already committed by a "
+            "newer, partially-successful persist — the JSON mirror failure left "
+            "the version guard stale"
+        )
+E       AssertionError: an older snapshot clobbered SQLite routes already committed by a newer, partially-successful persist — the JSON mirror failure left the version guard stale
+E       assert 'k_new' in {'k_old': '{"session_key": "k_old", "session_id": "sid_old", "created_at": "2026-07-12T09:31:56.028558", "updated_at": "2026-07-12T10:31:56.028558", "display_name": null, "platform": "telegram", "chat_type": "dm", "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 0, "last_prompt_tokens": 0, "estimated_cost_usd": 0.0, "cost_status": "unknown", "expiry_finalized": false, "suspended": false, "resume_pending": false, "resume_reason": null, "last_resume_marked_at": null, "is_fresh_reset": false, "was_auto_reset": false, "auto_reset_reason": null, "reset_had_activity": false}'}
+
+tests/gateway/test_session_store_g3_lock_free.py:359: AssertionError
+=========================== short test summary info ============================
+FAILED tests/gateway/test_session_store_g3_lock_free.py::TestPersistSnapshotPartialSuccess::test_older_snapshot_cannot_clobber_after_mirror_failure
+============================== 1 failed in 0.08s ===============================

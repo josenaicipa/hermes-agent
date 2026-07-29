@@ -436,6 +436,21 @@ class TestCacheDirectoryMounts:
         assert get_cache_directory_mounts() == []
 
 
+def test_disable_sandbox_auto_mounts_flag(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "skills").mkdir(parents=True)
+    (hermes_home / "cache" / "documents").mkdir(parents=True)
+    credential = hermes_home / "token.json"
+    credential.write_text("{}")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    clear_credential_files()
+    assert register_credential_files([{"path": "token.json"}]) == []
+    monkeypatch.setenv("HERMES_DISABLE_SANDBOX_AUTO_MOUNTS", "1")
+    assert get_credential_file_mounts() == []
+    assert get_skills_directory_mount() == []
+    assert get_cache_directory_mounts() == []
+
+
 class TestMapCachePathToContainer:
     """Tests for map_cache_path_to_container() — the backend-agnostic mapper."""
 

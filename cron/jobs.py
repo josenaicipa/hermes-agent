@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any, Set, Tuple, Union
+from typing import Optional, Dict, List, Any, Collection, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +114,177 @@ _jobs_lock_state = threading.local()
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+
+# Permanent LLM-cron admission policy: every new or reactivated agentic
+# (non-no_agent) cron must declare a category + material-result criterion
+# before it may be enabled. Existing enabled jobs without these fields are
+# grandfathered on load and through unrelated bookkeeping writes; resume /
+# reactivate fails closed until both are set. The store write path also
+# rejects stripping declarations from an enabled compliant LLM cron.
+LLM_ADMISSION_CATEGORIES = frozenset(
+    {"event", "justified_cadence", "necessary_as_is"}
+)
+
+# Standard material-result criteria for skill blueprints, parameterized
+# automation blueprints, and curated/suggestion job specs. Direct cronjob /
+# create_job callers that do not pass an allowlist still accept any non-empty
+# free-text criterion (existing contract).
+LLM_BLUEPRINT_MATERIAL_CRITERIA = frozenset(
+    {
+        "integracion_produccion",
+        "archivo_entregado",
+        "metrica_registrada",
+        "alerta_accionable",
+    }
+)
+
+
+class LlmCronAdmissionError(ValueError):
+    """Raised when an LLM cron lacks required admission declarations."""
+
+
+def normalize_llm_admission_category(value: Any) -> Optional[str]:
+    """Return a stripped category string, or None when absent/blank."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def normalize_material_result_criterion(value: Any) -> Optional[str]:
+    """Return a stripped non-empty criterion string, or None when absent/blank."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def check_llm_admission_for_enable(
+    *,
+    no_agent: Any = False,
+    category: Any = None,
+    material_result_criterion: Any = None,
+    allowed_material_criteria: Optional[Collection[str]] = None,
+) -> None:
+    """Fail closed if an LLM cron is missing admission fields required to enable.
+
+    Deterministic ``no_agent=True`` script-only jobs are exempt. Invalid
+    categories always fail closed for LLM jobs.
+
+    When ``allowed_material_criteria`` is omitted, any non-empty criterion is
+    accepted (legacy create_job / cronjob tool surface). When an allowlist is
+    supplied (blueprints / suggestions), the criterion must be one of those
+    exact values; invalid-criterion errors name ``material_result_criterion``
+    and the allowed set. Missing category and criterion are both listed.
+    """
+    if bool(no_agent):
+        return
+
+    cat = normalize_llm_admission_category(category)
+    crit = normalize_material_result_criterion(material_result_criterion)
+    allowed_set: Optional[frozenset] = None
+    if allowed_material_criteria is not None:
+        allowed_set = frozenset(allowed_material_criteria)
+
+    problems: List[str] = []
+    if cat is None:
+        problems.append("category is required")
+    elif cat not in LLM_ADMISSION_CATEGORIES:
+        problems.append(
+            "category must be one of "
+            f"{sorted(LLM_ADMISSION_CATEGORIES)}, got {cat!r}"
+        )
+    if crit is None:
+        problems.append("material_result_criterion is required (non-empty)")
+    elif allowed_set is not None and crit not in allowed_set:
+        problems.append(
+            "material_result_criterion must be one of "
+            f"{sorted(allowed_set)}, got {crit!r}"
+        )
+    if not problems:
+        return
+
+    allowed_cats = ", ".join(sorted(LLM_ADMISSION_CATEGORIES))
+    if allowed_set is not None:
+        allowed_crits = ", ".join(sorted(allowed_set))
+        criterion_clause = (
+            f"and material_result_criterion (one of: {allowed_crits})"
+        )
+    else:
+        criterion_clause = (
+            "and a non-empty material_result_criterion describing the "
+            "verifiable material result"
+        )
+    raise LlmCronAdmissionError(
+        "LLM cron admission failed: "
+        + "; ".join(problems)
+        + ". Every new or reactivated LLM cron must declare category "
+        f"(one of: {allowed_cats}) {criterion_clause}. Script-only jobs with "
+        "no_agent=true are exempt."
+    )
+
+
+def _job_will_be_enabled(job: Dict[str, Any]) -> bool:
+    """True when a job record is in a schedulable (enabled, non-paused) state."""
+    if not job.get("enabled", True):
+        return False
+    state = _coerce_job_text(job.get("state")).strip()
+    if state == "paused":
+        return False
+    return True
+
+
+def _llm_admission_complete(job: Dict[str, Any]) -> bool:
+    """True when an LLM job has both valid mandatory admission declarations."""
+    if bool(job.get("no_agent")):
+        return True
+    cat = normalize_llm_admission_category(job.get("category"))
+    crit = normalize_material_result_criterion(job.get("material_result_criterion"))
+    return (
+        cat is not None
+        and cat in LLM_ADMISSION_CATEGORIES
+        and crit is not None
+    )
+
+
+def validate_llm_admission_on_persist(jobs: List[Dict[str, Any]]) -> None:
+    """Enforce the LLM admission invariant on every jobs-store write.
+
+    Every enabled LLM cron in the outgoing store must carry a valid ``category``
+    and a non-empty ``material_result_criterion``. This applies to create,
+    update, enable/reactivate, scheduler bookkeeping, direct/internal API,
+    import, and restore writes. Existing incomplete records remain readable,
+    but no mutation may persist them while enabled.
+
+    Disabled or paused incomplete records may remain on disk. ``no_agent=True``
+    jobs are exempt. This validator never auto-disables jobs or silently fills,
+    rewrites, or removes admission fields.
+    """
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        if bool(job.get("no_agent")) or not _job_will_be_enabled(job):
+            continue
+        if _llm_admission_complete(job):
+            continue
+
+        missing = []
+        category = normalize_llm_admission_category(job.get("category"))
+        if category not in LLM_ADMISSION_CATEGORIES:
+            missing.append("category")
+        if normalize_material_result_criterion(
+            job.get("material_result_criterion")
+        ) is None:
+            missing.append("material_result_criterion")
+        job_label = job.get("id") or job.get("name") or "<unknown>"
+        raise LlmCronAdmissionError(
+            "LLM cron admission failed: enabled job "
+            f"{job_label!r} is missing or has invalid mandatory field(s): "
+            f"{', '.join(missing)}. Every persisted enabled LLM cron must "
+            "declare a valid category and a non-empty material_result_criterion. "
+            "Pause/disable it before removing either declaration. The job was "
+            "not auto-disabled or rewritten."
+        )
 
 
 @dataclass(frozen=True)
@@ -195,6 +366,12 @@ def get_cron_output_dir() -> Path:
 # floor for the derived value so a very short configured timeout can't make the
 # claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
+
+# Stale-recovery TTL for a multi-machine / manual ``fire_claim`` (#Phase 4C).
+# The claim is a dead-owner detector, not a wall-clock run limit: a live run
+# heartbeats ``fire_claim.at`` so the job stays non-due for the full duration.
+# After this TTL with no refresh, another fire may reclaim (crashed owner).
+FIRE_CLAIM_TTL_SECONDS = 300
 
 # The derived TTL is the cron inactivity timeout times this headroom multiplier.
 # A healthy run clears its claim via mark_job_run() long before the TTL; the
@@ -1010,60 +1187,186 @@ def get_ticker_last_error() -> Optional[str]:
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
-    jobs_file = _current_cron_store().jobs_file
-    ensure_dirs()
-    if not jobs_file.exists():
-        return []
+# Legacy on-disk shapes that load tolerates but never rewrites. Explicit
+# ``repair_legacy_jobs_store`` / ``hermes cron repair`` owns canonicalize.
+_LEGACY_FORMAT_BARE_LIST = "bare_list"
+_LEGACY_FORMAT_CONTROL_CHARS = "control_chars"
 
-    _strict_retry = False  # track whether we used the strict=False fallback
+# Process-global: one warning per (canonical jobs.json path, legacy format).
+# Never includes job content — path + format only.
+_legacy_store_warnings_emitted: Set[Tuple[str, str]] = set()
+_legacy_store_warnings_lock = threading.Lock()
 
+
+def _canonical_jobs_path(jobs_file: Path) -> str:
+    """Stable path key for warn-once (resolve when possible)."""
+    try:
+        return str(jobs_file.resolve())
+    except OSError:
+        return str(jobs_file)
+
+
+def _warn_legacy_jobs_store_once(jobs_file: Path, legacy_format: str) -> None:
+    """Emit at most one legacy-format warning per process + path + format."""
+    key = (_canonical_jobs_path(jobs_file), legacy_format)
+    with _legacy_store_warnings_lock:
+        if key in _legacy_store_warnings_emitted:
+            return
+        _legacy_store_warnings_emitted.add(key)
+    path = _canonical_jobs_path(jobs_file)
+    if legacy_format == _LEGACY_FORMAT_BARE_LIST:
+        logger.warning(
+            "Legacy cron jobs store at %s uses a bare JSON list "
+            '(expected {"jobs": [...]}). Load is read-only; '
+            "run 'hermes cron repair' to canonicalize the store.",
+            path,
+        )
+    elif legacy_format == _LEGACY_FORMAT_CONTROL_CHARS:
+        logger.warning(
+            "Legacy cron jobs store at %s contains unescaped control "
+            "characters. Load is read-only; run 'hermes cron repair' "
+            "to canonicalize the store.",
+            path,
+        )
+    else:
+        logger.warning(
+            "Legacy cron jobs store at %s uses a non-canonical format "
+            "(%s). Load is read-only; run 'hermes cron repair' to "
+            "canonicalize the store.",
+            path,
+            legacy_format,
+        )
+
+
+def _read_jobs_payload(jobs_file: Path) -> Tuple[Any, Optional[str]]:
+    """Parse jobs.json without mutating disk.
+
+    Returns ``(data, legacy_format)`` where ``legacy_format`` is one of
+    ``bare_list`` / ``control_chars`` / ``None`` (canonical dict envelope
+    that parsed under strict JSON).
+    """
+    strict_retry = False
     try:
         # utf-8-sig: Windows Notepad / PowerShell 5.1 Set-Content -Encoding UTF8
         # write a leading BOM; json.load under plain utf-8 raises
         # JSONDecodeError("Unexpected UTF-8 BOM") and takes down cron.
-        with open(jobs_file, 'r', encoding='utf-8-sig') as f:
+        with open(jobs_file, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
-        _strict_retry = True
+        strict_retry = True
         try:
-            with open(jobs_file, 'r', encoding='utf-8-sig') as f:
+            with open(jobs_file, "r", encoding="utf-8-sig") as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
-            logger.error("Failed to auto-repair jobs.json: %s", e)
-            raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+            logger.error("Failed to parse jobs.json: %s", e)
+            raise RuntimeError(
+                f"Cron database corrupted and unrepairable: {e}"
+            ) from e
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
 
-    # Validate the top-level JSON shape: accept a dict (expected) or a bare
-    # list (auto-repair). Anything else (str/number/null) is corruption that
-    # would otherwise raise an uncaught AttributeError on ``.get()`` and take
-    # down the whole cron subsystem.
     if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
-            # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
-            logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-        return jobs
+        if strict_retry:
+            return data, _LEGACY_FORMAT_CONTROL_CHARS
+        return data, None
     if isinstance(data, list):
-        # Bare array — likely saved/edited outside save_jobs(). Wrap it back
-        # into the expected {"jobs": [...]} structure.
-        if data:
-            save_jobs(data)
-            logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return data
-
+        return data, _LEGACY_FORMAT_BARE_LIST
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
     )
 
 
+def _jobs_list_from_payload(data: Any) -> List[Dict[str, Any]]:
+    """Extract the jobs list from a parsed payload (dict envelope or bare list)."""
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        if jobs is None:
+            return []
+        if not isinstance(jobs, list):
+            raise RuntimeError(
+                "Cron database corrupted: expected 'jobs' to be a list, "
+                f"got {type(jobs).__name__}"
+            )
+        return jobs
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(
+        f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
+    )
+
+
+def load_jobs() -> List[Dict[str, Any]]:
+    """Load all jobs from storage.
+
+    Pure read on every path: never creates directories, never rewrites
+    ``jobs.json``, and never mutates parent paths. Missing store → ``[]``.
+    Legacy bare-list and control-character stores are parsed in-memory and
+    returned as-is; a one-shot warning points operators at
+    ``hermes cron repair``.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+
+    data, legacy_format = _read_jobs_payload(jobs_file)
+    if legacy_format is not None:
+        _warn_legacy_jobs_store_once(jobs_file, legacy_format)
+    return _jobs_list_from_payload(data)
+
+
+def repair_legacy_jobs_store() -> Dict[str, Any]:
+    """Canonicalize a legacy/hand-edited jobs.json via the central write gate.
+
+    - Missing store → no-op (no directory creation).
+    - Canonical strict dict envelope → no-op (bytes untouched).
+    - Legacy bare list or control-character JSON → parse, then call
+      ``_save_jobs_unlocked`` under the existing jobs lock so the admission
+      lifecycle gate applies. Policy-valid / no_agent / disabled incomplete
+      records are rewritten to the canonical ``{"jobs": [...], "updated_at": ...}``
+      envelope. Any enabled incomplete LLM record raises
+      ``LlmCronAdmissionError`` and leaves disk byte-identical — never
+      auto-disables or invents admission fields.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    # Check before taking the lock so a never-used profile does not get a
+    # cron directory created solely by a no-op repair.
+    if not jobs_file.exists():
+        return {"changed": False, "jobs": 0, "reason": "missing"}
+
+    with _jobs_lock():
+        if not jobs_file.exists():
+            return {"changed": False, "jobs": 0, "reason": "missing"}
+
+        data, legacy_format = _read_jobs_payload(jobs_file)
+        jobs = _jobs_list_from_payload(data)
+        if legacy_format is None:
+            return {
+                "changed": False,
+                "jobs": len(jobs),
+                "reason": "canonical",
+            }
+
+        before = jobs_file.read_bytes()
+        # Central gate: validates admission first; raises before any write.
+        _save_jobs_unlocked(jobs)
+        after = jobs_file.read_bytes()
+        return {
+            "changed": after != before,
+            "jobs": len(jobs),
+            "reason": "repaired",
+            "format": legacy_format,
+        }
+
+
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
+    # Central admission lifecycle gate — every store write (public save_jobs,
+    # update/create, scheduler bookkeeping, import/restore) funnels here.
+    # Any enabled incomplete LLM cron is rejected. Never auto-disables.
+    validate_llm_admission_on_persist(jobs)
+
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1097,7 +1400,13 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+    """Save all jobs to storage.
+
+    Enforces the LLM-cron admission lifecycle invariant centrally: every enabled
+    LLM cron must declare category + material_result_criterion. Any write that
+    would persist an enabled incomplete LLM record is rejected; disabled or
+    paused incomplete records remain readable and storable.
+    """
     with _jobs_lock():
         _save_jobs_unlocked(jobs)
 
@@ -1261,6 +1570,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    category: Optional[str] = None,
+    material_result_criterion: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,6 +1616,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        category: Required for new LLM crons (not ``no_agent``). One of
+                ``event``, ``justified_cadence``, ``necessary_as_is``.
+        material_result_criterion: Required for new LLM crons. Non-empty
+                description of the verifiable material result that counts as
+                success for this job.
 
     Returns:
         The created job dict
@@ -1337,6 +1653,8 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_category = normalize_llm_admission_category(category)
+    normalized_criterion = normalize_material_result_criterion(material_result_criterion)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1346,6 +1664,14 @@ def create_job(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
         )
+
+    # LLM admission policy: new enabled agentic crons must declare category +
+    # material-result criterion. Script-only no_agent jobs are exempt.
+    check_llm_admission_for_enable(
+        no_agent=normalized_no_agent,
+        category=normalized_category,
+        material_result_criterion=normalized_criterion,
+    )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1427,6 +1753,13 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    # Persist admission declarations for LLM jobs (and optional values on
+    # no_agent jobs if a caller sets them). Absent keys remain valid for
+    # grandfathered records loaded from older JSON.
+    if normalized_category is not None:
+        job["category"] = normalized_category
+    if normalized_criterion is not None:
+        job["material_result_criterion"] = normalized_criterion
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1530,7 +1863,35 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            # Normalize admission fields when present so empty strings clear
+            # and invalid categories fail closed before persistence.
+            if "category" in updates:
+                raw_cat = updates["category"]
+                if raw_cat in {None, ""}:
+                    updates["category"] = None
+                else:
+                    cat = normalize_llm_admission_category(raw_cat)
+                    if cat is None or cat not in LLM_ADMISSION_CATEGORIES:
+                        raise LlmCronAdmissionError(
+                            "LLM cron admission failed: category must be one of "
+                            f"{sorted(LLM_ADMISSION_CATEGORIES)}, got {raw_cat!r}."
+                        )
+                    updates["category"] = cat
+            if "material_result_criterion" in updates:
+                raw_crit = updates["material_result_criterion"]
+                if raw_crit in {None, ""}:
+                    updates["material_result_criterion"] = None
+                else:
+                    crit = normalize_material_result_criterion(raw_crit)
+                    if crit is None:
+                        raise LlmCronAdmissionError(
+                            "LLM cron admission failed: material_result_criterion "
+                            "must be a non-empty string."
+                        )
+                    updates["material_result_criterion"] = crit
+
             previous_inference_axes = _normalized_inference_axes(job)
+            was_enabled = _job_will_be_enabled(job)
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
@@ -1599,6 +1960,47 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            # Fail closed when reactivating/enabling an LLM cron that still
+            # lacks admission declarations. Grandfathered jobs that are already
+            # enabled may keep running and may receive non-enable updates.
+            will_be_enabled = _job_will_be_enabled(updated)
+            if will_be_enabled and not was_enabled:
+                check_llm_admission_for_enable(
+                    no_agent=updated.get("no_agent"),
+                    category=updated.get("category"),
+                    material_result_criterion=updated.get("material_result_criterion"),
+                )
+            # Flipping no_agent off on an already-enabled job turns it into an
+            # LLM cron — require admission on that transition too.
+            elif (
+                will_be_enabled
+                and was_enabled
+                and not bool(updated.get("no_agent"))
+                and bool(job.get("no_agent"))
+            ):
+                check_llm_admission_for_enable(
+                    no_agent=False,
+                    category=updated.get("category"),
+                    material_result_criterion=updated.get("material_result_criterion"),
+                )
+            # Refuse edits that clear admission on an already-enabled compliant
+            # LLM cron. Explicit here so update_job fails before the store write
+            # with a clear message; save_jobs enforces the same invariant for
+            # every other write path.
+            elif (
+                will_be_enabled
+                and was_enabled
+                and not bool(updated.get("no_agent"))
+                and _llm_admission_complete(job)
+                and not _llm_admission_complete(updated)
+            ):
+                raise LlmCronAdmissionError(
+                    "LLM cron admission failed: cannot clear category and/or "
+                    "material_result_criterion on an enabled LLM cron. Keep both "
+                    "declarations, or pause/disable the job before removing them. "
+                    "Never auto-disable or silently rewrite admission fields."
+                )
+
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
@@ -1627,6 +2029,9 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
+    # Past one-shot check first — preserve the established "in the past"
+    # ValueError semantics. Admission runs after so a never-fireable one-shot
+    # is rejected for schedule reasons rather than missing admission fields.
     next_run_at = compute_next_run(job["schedule"])
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
@@ -1634,6 +2039,18 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
         )
+
+    # Admission is also enforced inside update_job on the enable transition;
+    # check here so the error message is immediate and clear for the
+    # resume/reactivate path (including paused CRM↔Calendar #44-style jobs).
+    # Already-enabled grandfathered jobs are not re-gated.
+    if not _job_will_be_enabled(job):
+        check_llm_admission_for_enable(
+            no_agent=job.get("no_agent"),
+            category=job.get("category"),
+            material_result_criterion=job.get("material_result_criterion"),
+        )
+
     return update_job(
         job["id"],
         {
@@ -1651,6 +2068,15 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    # Reactivate path — same admission gate as resume for LLM jobs that are
+    # currently disabled/paused. Already-enabled grandfathered jobs pass
+    # because they are not transitioning into enabled.
+    if not _job_will_be_enabled(job):
+        check_llm_admission_for_enable(
+            no_agent=job.get("no_agent"),
+            category=job.get("category"),
+            material_result_criterion=job.get("material_result_criterion"),
+        )
     return update_job(
         job["id"],
         {
@@ -1687,7 +2113,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None, *,
+                 expected_fire_claim_owner: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1696,11 +2123,31 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``expected_fire_claim_owner``: when supplied, the mark is owner-conditional
+    on the durable ``fire_claim``. If the stored claim's ``by`` differs from
+    this owner or the claim is missing, return ``False`` before ANY mutation
+    so a stale runner cannot erase a replacement owner's claim/state. When
+    omitted, legacy scheduled callers keep the prior unconditional finalize
+    + clear behavior.
+
+    Returns:
+        ``True`` if the mark was applied, ``False`` if skipped (owner
+        mismatch / missing claim under an expected owner, or job not found).
     """
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                # Owner-conditional gate MUST run before any field mutation.
+                if expected_fire_claim_owner is not None:
+                    claim = job.get("fire_claim")
+                    claim_by = (
+                        claim.get("by") if isinstance(claim, dict) else None
+                    )
+                    if claim_by != expected_fire_claim_owner:
+                        return False
+
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -1741,7 +2188,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1776,9 +2223,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
@@ -1923,6 +2371,39 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Refresh a manual/external ``fire_claim`` timestamp while its run is alive.
+
+    Manual ``cronjob(action="run")`` and external ``fire_due`` stamp a
+    ``fire_claim`` then execute outside ``scheduler._running_job_ids``. The
+    claim's TTL is only a dead-owner detector: without a heartbeat a healthy
+    run that outlives ``FIRE_CLAIM_TTL_SECONDS`` looks dead, so the scheduled
+    ticker re-dispatches the same job and two runs mutate one status file.
+
+    ``expected_owner`` is the stable owner copied from the dispatched job at
+    claim time — never re-read from storage before compare. A stale runner
+    that resumes after a replacement owner has claimed must not extend the
+    new claim. ``mark_job_run`` clears the claim on completion.
+
+    Returns True if this owner's fire claim was refreshed; False when the
+    job, claim, or ownership no longer matches.
+    """
+    if not expected_owner:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                return False
+            claim["at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
@@ -1953,10 +2434,13 @@ def advance_next_run(job_id: str) -> bool:
 
 
 def _machine_id() -> str:
-    """Stable-ish identifier for claim attribution/debugging (NOT correctness).
+    """Stable-ish host attribution for fire-claim fencing tokens.
 
-    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
-    comes from the file lock + the fresh-claim check, not from this value.
+    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. This prefix is for
+    attribution/debugging only — fencing correctness requires the full
+    per-fire token from :func:`new_fire_claim_owner` (machine id + unique
+    generation), not the machine id alone. A stable host:pid would collide
+    across reclaim generations in the same gateway process.
     """
     explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
     if explicit:
@@ -1969,13 +2453,40 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def new_fire_claim_owner() -> str:
+    """Return a per-fire unique opaque fencing token for ``fire_claim.by``.
+
+    Format: ``<machine-id>:<uuid4-hex>``. The full string is the correctness-
+    critical owner identity used by heartbeat / owner-conditional mark /
+    post-claim verification. Machine attribution is preserved in the prefix
+    while the UUID makes same-process reclaim generations distinguishable.
+    """
+    return f"{_machine_id()}:{uuid.uuid4().hex}"
+
+
+def claim_job_for_fire(
+    job_id: str,
+    *,
+    claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
+    claim_owner: Optional[str] = None,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
     Used by the external-provider fire path (``CronScheduler.fire_due``) when an
     external scheduler (Chronos) signals a job is due across N gateway replicas:
-    exactly one wins. Single-machine deployments always win.
+    exactly one wins. Single-machine deployments always win. Manual
+    ``cronjob(action="run")`` uses the same claim so a concurrent ticker tick
+    cannot also fire the job.
+
+    ``claim_owner``: optional pre-generated fencing token from
+    :func:`new_fire_claim_owner`. When supplied, it must be a non-empty
+    (after strip) opaque token and that exact stripped token is stamped under
+    the jobs lock (callers that verify the post-claim record must pass the
+    token they generated). Blank/whitespace-only supplied owners fail closed
+    with ``ValueError`` before any mutation. When omitted (``None``), a unique
+    token is generated internally so legacy bool-only callers keep working.
+    The token is never generated outside the lock and then replaced inside.
 
     Under the file lock: reject if the job is missing/disabled/paused. If a
     fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
@@ -1988,8 +2499,17 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
 
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
-    reclaim it.
+    reclaim it. Live runs must heartbeat the claim (see
+    ``heartbeat_fire_claim``) so a healthy long run is never treated as dead.
     """
+    # Validate supplied claim_owner before any lock/mutation. Only None mints
+    # internally; a non-None blank is an API error, not a mint request.
+    if claim_owner is not None and not str(claim_owner).strip():
+        raise ValueError(
+            "claim_owner must be a non-empty fencing token when supplied; "
+            "pass claim_owner=None to mint one internally"
+        )
+
     with _jobs_lock():
         jobs = load_jobs()
         for job in jobs:
@@ -2013,7 +2533,13 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            # Stamp the caller-supplied fencing token, or mint one under the
+            # lock for legacy bool-only callers. Never replace a supplied token.
+            if claim_owner is not None:
+                owner = str(claim_owner).strip()
+            else:
+                owner = new_fire_claim_owner()
+            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -2175,6 +2701,37 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         continue  # a fresh claim is held by an in-flight run
                 except (KeyError, ValueError, TypeError):
                     pass  # malformed claim → fall through and (re)claim
+
+            # Manual/external fire singleflight: a fresh fire_claim means a
+            # manual cronjob(action="run") or Chronos fire_due owns this fire.
+            # Those paths are NOT members of scheduler._running_job_ids, so the
+            # ticker's in-process dedup cannot see them. Skip while the claim
+            # is fresh (heartbeated for long runs). An expired, future-dated, or
+            # malformed claim is a dead/invalid owner signal — clear it from
+            # BOTH the working job and durable raw_jobs *before* due evaluation
+            # so the built-in ticker cannot capture and heartbeat the stale
+            # generation token (which would defeat the ownership fence if a
+            # previously stalled old runner still holds the same token).
+            existing_fire = job.get("fire_claim")
+            if existing_fire:
+                _fire_is_fresh = False
+                try:
+                    fire_claimed_at = _ensure_aware(
+                        datetime.fromisoformat(existing_fire["at"])
+                    )
+                    _fire_age = (now - fire_claimed_at).total_seconds()
+                    if 0 <= _fire_age < FIRE_CLAIM_TTL_SECONDS:
+                        _fire_is_fresh = True
+                except (KeyError, ValueError, TypeError):
+                    pass  # malformed claim → recover by clearing
+                if _fire_is_fresh:
+                    continue
+                job["fire_claim"] = None
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["fire_claim"] = None
+                        needs_save = True
+                        break
 
             next_run = job.get("next_run_at")
             if not next_run:

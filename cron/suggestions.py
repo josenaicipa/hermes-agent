@@ -227,16 +227,34 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     not pending. The job_spec is passed straight to ``cron.jobs.create_job``;
     an ``origin`` (platform/chat) is merged so "origin" delivery routes back to
     the chat where the user accepted.
+
+    LLM specs are validated against the standard four-criterion blueprint
+    allowlist before create. Stale/missing admission declarations raise
+    ``LlmCronAdmissionError`` and the suggestion remains pending.
+    ``no_agent=True`` specs are exempt.
     """
     s = get_suggestion(ref)
     if not s or s.get("status") != _STATUS_PENDING:
         return None
 
-    from cron.jobs import create_job
+    from cron.jobs import (
+        LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        check_llm_admission_for_enable,
+        create_job,
+    )
 
     spec = dict(s.get("job_spec") or {})
     if origin is not None and "origin" not in spec:
         spec["origin"] = origin
+
+    # Fail closed on stale catalog/blueprint specs that predate (or omit)
+    # the standard declarations. Raise before create_job so status stays pending.
+    check_llm_admission_for_enable(
+        no_agent=spec.get("no_agent", False),
+        category=spec.get("category"),
+        material_result_criterion=spec.get("material_result_criterion"),
+        allowed_material_criteria=LLM_BLUEPRINT_MATERIAL_CRITERIA,
+    )
 
     job = create_job(**spec)
     _set_status(s["id"], _STATUS_ACCEPTED)

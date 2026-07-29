@@ -72,9 +72,32 @@ def test_real_binaries_execute_leading_dash_program_payload(
     if needs_tty:
         argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    completed = subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
 
-    assert marker.read_text() == "executed"
+    if not marker.exists():
+        combined_output = completed.stdout + completed.stderr
+        # Some hosts have a `man` binary present but no man-db configuration
+        # at all (no /etc/manpath.config), so `man` exits before it ever
+        # tries to invoke a pager -- this is a host packaging gap, not a
+        # pager-invocation behavior this test can observe.
+        if tool == "man" and "manpath configuration file" in combined_output:
+            pytest.skip("man-db is not configured on this host (no manpath.config)")
+        # Some hosts ship a non-GNU `sort` (e.g. a Rust/clap-based coreutils
+        # replacement) whose argument parser rejects a dash-leading value for
+        # `--compress-program <value>` outright (it wants `--opt=value`
+        # instead), so the payload is never invoked -- a CLI-grammar
+        # difference in the installed binary, not GNU sort's documented
+        # execution-bearing-option behavior this test pins.
+        if tool == "sort" and "unexpected argument" in combined_output:
+            pytest.skip(
+                "this host's sort does not accept a dash-leading "
+                "--compress-program value in GNU getopt style"
+            )
+
+    assert marker.exists() and marker.read_text() == "executed", (
+        f"argv={argv!r} returncode={completed.returncode!r} "
+        f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+    )
 
 
 @pytest.mark.parametrize(

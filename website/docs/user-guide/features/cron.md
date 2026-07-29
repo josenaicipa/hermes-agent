@@ -35,26 +35,42 @@ All of this is available to Hermes itself through the `cronjob` tool, so you can
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
 
+:::warning LLM admission policy
+Every **new enabled LLM cron** (anything that is not `no_agent=true`) must declare at creation:
+
+1. **`category`** — one of `event`, `justified_cadence`, or `necessary_as_is`
+2. **`material_result_criterion`** — a non-empty description of the verifiable outcome that counts as success
+
+Without both, create fails closed (the job is not enabled). The same rule applies when **resuming/reactivating** a paused LLM cron that lacks either field — set them via `update` first. Deterministic `no_agent=true` script-only jobs are exempt. Existing enabled jobs written before this policy remain enabled (grandfathered) until paused and reactivated.
+:::
+
 ## Creating scheduled tasks
 
 ### In chat with `/cron`
 
 ```bash
-/cron add 30m "Remind me to check the build"
-/cron add "every 2h" "Check server status"
-/cron add "every 1h" "Summarize new feed items" --skill blogwatcher
-/cron add "every 1h" "Use both skills and combine the result" --skill blogwatcher --skill maps
+/cron add 30m "Remind me to check the build" --category event --material-result-criterion "reminder delivered"
+/cron add "every 2h" "Check server status" --category justified_cadence --material-result-criterion "verified status report delivered"
+/cron add "every 1h" "Summarize new feed items" --skill blogwatcher --category event --material-result-criterion "summary delivered when new items exist"
+/cron add "every 1h" "Use both skills and combine the result" --skill blogwatcher --skill maps --category event --material-result-criterion "combined brief delivered when new items exist"
 ```
 
 ### From the standalone CLI
 
 ```bash
-hermes cron create "every 2h" "Check server status"
-hermes cron create "every 1h" "Summarize new feed items" --skill blogwatcher
+hermes cron create "every 2h" "Check server status" \
+  --category justified_cadence \
+  --material-result-criterion "verified status report delivered"
+hermes cron create "every 1h" "Summarize new feed items" \
+  --skill blogwatcher \
+  --category event \
+  --material-result-criterion "summary delivered when new items exist"
 hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
   --skill maps \
-  --name "Skill combo"
+  --name "Skill combo" \
+  --category event \
+  --material-result-criterion "combined brief delivered when new items exist"
 ```
 
 ### Through natural conversation
@@ -107,6 +123,8 @@ cronjob(
     prompt="Check the configured feeds and summarize anything new.",
     schedule="0 9 * * *",
     name="Morning feeds",
+    category="justified_cadence",
+    material_result_criterion="verified morning feed summary delivered",
 )
 ```
 
@@ -121,6 +139,8 @@ cronjob(
     prompt="Look for new local events and interesting nearby places, then combine them into one short brief.",
     schedule="every 6h",
     name="Local brief",
+    category="event",
+    material_result_criterion="local brief delivered when new events exist",
 )
 ```
 
@@ -134,7 +154,9 @@ Cron jobs default to running detached from any repo — no `AGENTS.md`, `CLAUDE.
 # Standalone CLI (schedule and prompt are positional)
 hermes cron create "every 1d at 09:00" \
   "Audit open PRs, summarize CI health, and post to #eng" \
-  --workdir /home/me/projects/acme
+  --workdir /home/me/projects/acme \
+  --category justified_cadence \
+  --material-result-criterion "verified CI audit posted to #eng"
 ```
 
 ```python
@@ -144,6 +166,8 @@ cronjob(
     schedule="every 1d at 09:00",
     workdir="/home/me/projects/acme",
     prompt="Audit open PRs, summarize CI health, and post to #eng",
+    category="justified_cadence",
+    material_result_criterion="verified CI audit posted to #eng",
 )
 ```
 
@@ -219,6 +243,7 @@ hermes cron remove <job_id_or_name>
 hermes cron edit <job_id_or_name> [...flags]
 hermes cron status
 hermes cron tick
+hermes cron repair
 ```
 
 What they do:
@@ -228,6 +253,24 @@ What they do:
 - `run` — trigger the job on the next scheduler tick
 - `remove` — delete it entirely
 - `edit` — modify schedule, prompt, delivery, etc.
+- `repair` — canonicalize a legacy/hand-edited `jobs.json` (see below)
+
+### Repairing a legacy jobs store
+
+Reading cron jobs is always **read-only**. If `~/.hermes/cron/jobs.json` is a bare JSON list (hand-edited outside Hermes) or contains unescaped control characters, Hermes still loads the jobs for listing and scheduling, preserves the exact on-disk bytes, and emits a one-time warning pointing at repair. It never auto-rewrites the file on load.
+
+To rewrite the store into the canonical `{"jobs": [...], "updated_at": ...}` envelope:
+
+```bash
+hermes cron repair
+```
+
+Repair goes through the same central write gate as every other jobs-store mutation:
+
+- policy-valid LLM jobs, `no_agent` script jobs, and disabled/paused incomplete records are canonicalized
+- an **enabled incomplete LLM** record (missing `category` / `material_result_criterion`) is rejected with a clear admission error and the file is left **byte-identical** — repair never auto-disables jobs or invents admission fields
+
+If repair fails closed, set the missing admission fields with `hermes cron edit` (or pause/disable the job), then run `hermes cron repair` again.
 
 **Name-based lookup.** All four mutating verbs (`pause`, `resume`, `run`, `remove`, `edit`) plus the agent's `cronjob` tool now accept a job **name** (case-insensitive) in place of the hex ID. The agent and CLI both prefer an exact ID match if one exists; ambiguous name matches (multiple jobs sharing the same name) are refused with the full list of candidate IDs so you can pick one explicitly. Names are not unique, so this guard is load-bearing — it prevents silently mutating the wrong job when two share a name.
 
@@ -513,6 +556,8 @@ cronjob(
     prompt="Fetch the top 10 AI/ML stories from Hacker News. Save them to ~/.hermes/data/briefs/raw.md in markdown format with title, URL, and score.",
     schedule="0 7 * * *",
     name="AI News Collector",
+    category="justified_cadence",
+    material_result_criterion="raw brief file contains 10 verified stories",
 )
 
 # Job 2: Triage — receives Job 1's output as context
@@ -523,6 +568,8 @@ cronjob(
     schedule="30 7 * * *",
     context_from="<job1_id>",
     name="AI News Triage",
+    category="justified_cadence",
+    material_result_criterion="ranked brief file contains the top 5 stories",
 )
 
 # Job 3: Ship — receives Job 2's output as context
@@ -532,6 +579,8 @@ cronjob(
     schedule="0 8 * * *",
     context_from="<job2_id>",
     name="AI News Brief",
+    category="justified_cadence",
+    material_result_criterion="three tweet drafts delivered",
 )
 ```
 
@@ -618,6 +667,8 @@ cronjob(
     prompt="...",
     schedule="every 2h",
     repeat=5,
+    category="justified_cadence",
+    material_result_criterion="verifiable task output delivered on each run",
 )
 ```
 
@@ -626,7 +677,7 @@ cronjob(
 The agent-facing API is one tool:
 
 ```python
-cronjob(action="create", ...)
+cronjob(action="create", category="event", material_result_criterion="verified outcome", ...)
 cronjob(action="list")
 cronjob(action="update", job_id="...")
 cronjob(action="pause", job_id="...")
@@ -653,6 +704,8 @@ Tighter per-job control is available via the `enabled_toolsets` field on `cronjo
 cronjob(action="create", name="weekly-news-summary",
         schedule="every sunday 9am",
         enabled_toolsets=["web", "file"],      # just web + file, no terminal/browser/etc.
+        category="justified_cadence",
+        material_result_criterion="verified weekly news summary delivered",
         prompt="Summarize this week's AI news: ...")
 ```
 
@@ -708,6 +761,8 @@ fi
 cronjob(action="create", name="process-feed",
         schedule="every 30m",
         script="feed-changed.sh",
+        category="event",
+        material_result_criterion="feed change summary delivered",
         prompt="A new ~/data/feed.json has landed. Summarize what changed.")
 ```
 
@@ -728,6 +783,8 @@ fi
 cronjob(action="create", name="nightly-analysis",
         schedule="0 9 * * *",
         script="flag-ready.sh",
+        category="event",
+        material_result_criterion="nightly analysis artifact produced",
         prompt="Run the nightly analysis over today's batch.")
 ```
 
@@ -751,6 +808,8 @@ else:
 cronjob(action="create", name="summarize-new-msgs",
         schedule="every 2h",
         script="new-rows.py",
+        category="event",
+        material_result_criterion="new-message summary delivered",
         prompt="Summarize the new messages from the last 2 hours.")
 ```
 
@@ -770,6 +829,8 @@ A cron job can consume the most recent successful output of one or more other jo
 cronjob(action="create", name="daily-digest",
         schedule="every day 7am",
         context_from=["ai-news-fetch", "github-prs-fetch"],
+        category="justified_cadence",
+        material_result_criterion="daily digest delivered from both upstream outputs",
         prompt="Write the daily digest using the outputs above.")
 ```
 

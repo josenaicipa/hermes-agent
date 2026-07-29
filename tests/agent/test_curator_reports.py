@@ -315,6 +315,8 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
         schedule="every 1h",
         skills=["foo"],
         name="foo-watcher",
+        category="necessary_as_is",
+        material_result_criterion="verify curator cron skill rewrite",
     )
 
     # Simulate a curator pass that consolidated `foo` → `foo-umbrella`
@@ -381,6 +383,8 @@ def test_curator_drops_pruned_skill_from_cron_job(curator_env_with_cron):
         prompt="",
         schedule="every 1h",
         skills=["keep", "stale-one"],
+        category="necessary_as_is",
+        material_result_criterion="verify curator prunes stale cron skill",
     )
 
     before = [{"name": "stale-one", "state": "active", "pinned": False}]
@@ -412,7 +416,13 @@ def test_curator_report_has_no_cron_section_when_nothing_changes(curator_env_wit
     curator = curator_env_with_cron["curator"]
     jobs = curator_env_with_cron["jobs"]
 
-    jobs.create_job(prompt="", schedule="every 1h", skills=["foo"])
+    jobs.create_job(
+        prompt="",
+        schedule="every 1h",
+        skills=["foo"],
+        category="necessary_as_is",
+        material_result_criterion="verify curator leaves unrelated cron untouched",
+    )
 
     run_dir = curator._write_run_report(
         started_at=datetime.now(timezone.utc),

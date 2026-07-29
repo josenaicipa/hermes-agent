@@ -352,7 +352,15 @@ metadata:
       deliver: telegram          # optional (default: origin)
       prompt: "Summarize my unread email and today's calendar."  # optional
       no_agent: false            # optional
+      # Required for LLM blueprints (no_agent=false). No defaults/inference.
+      category: justified_cadence
+      material_result_criterion: archivo_entregado
 ```
+
+LLM blueprints must declare `category` (`event` / `justified_cadence` /
+`necessary_as_is`) and `material_result_criterion` as one of the four standard
+criteria: `integracion_produccion`, `archivo_entregado`, `metrica_registrada`,
+`alerta_accionable`. Script-only blueprints with `no_agent: true` are exempt.
 
 Because a blueprint **is** a skill, it flows through the entire skills pipeline unchanged — search, inspect, install, security scan, provenance, taps, the centralized index, and `hermes skills publish` for sharing. Nothing new to learn.
 

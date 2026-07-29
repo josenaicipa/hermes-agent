@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.cron.tick_claim_helpers import install_successful_tick_fire_claims
+
 
 class TestPersistentPool:
     """_get_parallel_pool returns a persistent ThreadPoolExecutor."""
@@ -84,6 +86,7 @@ class TestRunningJobGuard:
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -117,6 +120,7 @@ class TestSyncMode:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, jobs, sched=sched)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -153,6 +157,7 @@ class TestSyncMode:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -171,21 +176,21 @@ class TestSyncMode:
         sched._shutdown_parallel_pool()
 
 
-class TestSequentialPool:
-    """Sequential (workdir) jobs use the persistent cron-seq pool.
+class TestWorkdirJobsOnParallelPool:
+    """Workdir jobs are no longer special-cased onto a single-thread pool.
 
-    Verifies the follow-up fix: env-mutating jobs no longer run inline
-    in the ticker thread, so a long workdir job can't starve the
-    schedule the same way the parallel path used to.
+    After the workdir-concurrency fix they run on the SAME non-blocking
+    parallel pool as everyone else (each job isolates its own cwd instead of
+    mutating process-global TERMINAL_CWD), so a long workdir job can't starve
+    the schedule and the in-flight dedup guard still applies to them.
     """
 
-    def test_sequential_job_does_not_block_ticker(self, tmp_path, monkeypatch):
+    def test_workdir_job_does_not_block_ticker(self, tmp_path, monkeypatch):
         """sync=False returns immediately even when a workdir job is slow."""
         import cron.scheduler as sched
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
@@ -196,7 +201,7 @@ class TestSequentialPool:
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
-            "workdir": str(tmp_path),  # makes it sequential
+            "workdir": str(tmp_path),
         }
 
         barrier = threading.Barrier(2, timeout=5)
@@ -207,6 +212,7 @@ class TestSequentialPool:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -223,18 +229,17 @@ class TestSequentialPool:
         time.sleep(0.1)
         sched._shutdown_parallel_pool()
 
-    def test_sequential_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
+    def test_workdir_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
         """A workdir job already in _running_job_ids is skipped on next tick."""
         import cron.scheduler as sched
 
         sched._parallel_pool = None
         sched._parallel_pool_max_workers = None
-        sched._sequential_pool = None
         sched._running_job_ids.clear()
 
         job = {
-            "id": "guard-seq",
-            "name": "guard-seq",
+            "id": "guard-wd",
+            "name": "guard-wd",
             "prompt": "test",
             "schedule": "every 5m",
             "enabled": True,
@@ -244,11 +249,12 @@ class TestSequentialPool:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-seq")
+        sched._running_job_ids.add("guard-wd")
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        install_successful_tick_fire_claims(monkeypatch, [job], sched=sched)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -258,17 +264,5 @@ class TestSequentialPool:
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
 
-        sched._running_job_ids.discard("guard-seq")
+        sched._running_job_ids.discard("guard-wd")
         sched._shutdown_parallel_pool()
-
-    def test_get_sequential_pool_is_persistent(self):
-        """_get_sequential_pool returns the same single-thread pool."""
-        import cron.scheduler as sched
-
-        sched._sequential_pool = None
-        pool1 = sched._get_sequential_pool()
-        pool2 = sched._get_sequential_pool()
-        assert pool1 is pool2
-
-        sched._shutdown_parallel_pool()
-        assert sched._sequential_pool is None

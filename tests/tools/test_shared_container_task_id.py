@@ -124,6 +124,103 @@ def test_cwd_only_override_collapses_to_default():
         terminal_tool.clear_task_env_overrides("acp-session-abc")
 
 
+def test_cwd_plus_isolate_env_keeps_own_id():
+    """A CWD-only override with the explicit ``isolate_env`` opt-in must get
+    its OWN environment (not collapse to 'default').  The cron scheduler uses
+    this so concurrent per-workdir jobs don't share one live shell and clobber
+    each other's env.cwd."""
+    terminal_tool.register_task_env_overrides(
+        "cron_job_0600", {"cwd": "/home/user/project-a", "isolate_env": True}
+    )
+    try:
+        assert (
+            terminal_tool._resolve_container_task_id("cron_job_0600")
+            == "cron_job_0600"
+        )
+    finally:
+        terminal_tool.clear_task_env_overrides("cron_job_0600")
+
+
+def test_isolate_env_falsy_still_collapses_to_default():
+    """A falsy ``isolate_env`` is not an isolation signal — a plain CWD-only
+    override still collapses to the shared 'default' env."""
+    terminal_tool.register_task_env_overrides(
+        "sess-x", {"cwd": "/p", "isolate_env": False}
+    )
+    try:
+        assert terminal_tool._resolve_container_task_id("sess-x") == "default"
+    finally:
+        terminal_tool.clear_task_env_overrides("sess-x")
+
+
+def test_child_inherits_parent_isolated_environment_and_cwd():
+    """A delegated child must resolve to its cron parent's isolated environment
+    and inherit the parent's cwd instead of falling back to ``default``."""
+    terminal_tool.register_task_env_overrides(
+        "cron-parent", {"cwd": "/home/user/project-a", "isolate_env": True}
+    )
+    try:
+        inherited = terminal_tool.inherit_task_env_overrides(
+            "cron-parent", "cron-child"
+        )
+        assert inherited is True
+        assert terminal_tool._resolve_container_task_id("cron-child") == "cron-child"
+        child_overrides = terminal_tool.resolve_task_overrides("cron-child")
+        assert child_overrides["cwd"] == "/home/user/project-a"
+        assert child_overrides["isolate_env"] is True
+        assert "inherit_env_from" not in child_overrides
+    finally:
+        terminal_tool.clear_task_env_overrides("cron-child")
+        terminal_tool.clear_task_env_overrides("cron-parent")
+
+
+def test_child_preserves_shared_default_for_cwd_only_parent():
+    """Ordinary ACP/TUI cwd tracking must not become sandbox isolation."""
+    terminal_tool.register_task_env_overrides(
+        "acp-parent", {"cwd": "/workspace/project"}
+    )
+    try:
+        assert terminal_tool.inherit_task_env_overrides(
+            "acp-parent", "acp-child"
+        )
+        child_overrides = terminal_tool.resolve_task_overrides("acp-child")
+        assert child_overrides["cwd"] == "/workspace/project"
+        assert not child_overrides.get("isolate_env")
+        assert terminal_tool._resolve_container_task_id("acp-child") == "default"
+    finally:
+        terminal_tool.clear_task_env_overrides("acp-child")
+        terminal_tool.clear_task_env_overrides("acp-parent")
+
+
+def test_concurrent_children_stay_bound_to_their_own_parent_workdirs():
+    """Children of two concurrent cron parents must never share cwd/container."""
+    terminal_tool.register_task_env_overrides(
+        "parent-a", {"cwd": "/projects/a", "isolate_env": True}
+    )
+    terminal_tool.register_task_env_overrides(
+        "parent-b", {"cwd": "/projects/b", "isolate_env": True}
+    )
+    try:
+        assert terminal_tool.inherit_task_env_overrides("parent-a", "child-a")
+        assert terminal_tool.inherit_task_env_overrides("parent-b", "child-b")
+        assert terminal_tool._resolve_container_task_id("child-a") == "child-a"
+        assert terminal_tool._resolve_container_task_id("child-b") == "child-b"
+        assert terminal_tool.resolve_task_overrides("child-a")["cwd"] == "/projects/a"
+        assert terminal_tool.resolve_task_overrides("child-b")["cwd"] == "/projects/b"
+    finally:
+        for task_id in ("child-a", "child-b", "parent-a", "parent-b"):
+            terminal_tool.clear_task_env_overrides(task_id)
+
+
+def test_child_does_not_register_when_parent_has_no_override():
+    """Ordinary delegation without a parent override keeps legacy behavior."""
+    terminal_tool.clear_task_env_overrides("plain-parent")
+    terminal_tool.clear_task_env_overrides("plain-child")
+    assert terminal_tool.inherit_task_env_overrides("plain-parent", "plain-child") is False
+    assert terminal_tool.resolve_task_overrides("plain-child") == {}
+    assert terminal_tool._resolve_container_task_id("plain-child") == "default"
+
+
 def test_cwd_plus_docker_image_keeps_own_id():
     """When overrides include both cwd AND docker_image, isolation must
     still be honoured (RL/benchmark pattern with explicit cwd)."""

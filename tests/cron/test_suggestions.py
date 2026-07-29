@@ -27,12 +27,37 @@ def store(tmp_path, monkeypatch):
     return s
 
 
-def _add(store, key="k1", title="Test", source="catalog", schedule="0 9 * * *"):
+def _add(
+    store,
+    key="k1",
+    title="Test",
+    source="catalog",
+    schedule="0 9 * * *",
+    *,
+    category="justified_cadence",
+    material_result_criterion="archivo_entregado",
+    no_agent=False,
+    job_spec=None,
+):
+    if job_spec is None:
+        job_spec = {
+            "prompt": "do it",
+            "schedule": schedule,
+            "name": title,
+            "deliver": "origin",
+        }
+        if no_agent:
+            job_spec["no_agent"] = True
+            job_spec["script"] = "watch.sh"
+            job_spec.pop("prompt", None)
+        else:
+            job_spec["category"] = category
+            job_spec["material_result_criterion"] = material_result_criterion
     return store.add_suggestion(
         title=title,
         description="desc",
         source=source,
-        job_spec={"prompt": "do it", "schedule": schedule, "name": title, "deliver": "origin"},
+        job_spec=job_spec,
         dedup_key=key,
     )
 
@@ -99,10 +124,75 @@ class TestStore:
         assert job is not None
         assert created["schedule"] == "0 9 * * *"
         assert created["origin"] == {"platform": "telegram", "chat_id": "5"}
+        assert created["category"] == "justified_cadence"
+        assert created["material_result_criterion"] == "archivo_entregado"
         # No longer pending.
         assert store.list_pending() == []
         # And accepting again is a no-op (not pending anymore).
         assert store.accept_suggestion("acc") is None
+
+    def test_accept_stale_missing_admission_fails_and_remains_pending(self, store):
+        from cron.jobs import LlmCronAdmissionError
+
+        _add(
+            store,
+            key="stale-missing",
+            title="Stale Missing",
+            job_spec={
+                "prompt": "do it",
+                "schedule": "0 9 * * *",
+                "name": "Stale Missing",
+                "deliver": "origin",
+            },
+        )
+        with pytest.raises(LlmCronAdmissionError) as excinfo:
+            store.accept_suggestion("1")
+        err = str(excinfo.value)
+        assert "category" in err
+        assert "material_result_criterion" in err
+        # Stays pending — not silently accepted or dropped.
+        pending = store.list_pending()
+        assert len(pending) == 1
+        assert pending[0]["title"] == "Stale Missing"
+
+    def test_accept_stale_invalid_criterion_fails_and_remains_pending(self, store):
+        from cron.jobs import LlmCronAdmissionError
+
+        _add(
+            store,
+            key="stale-crit",
+            title="Stale Criterion",
+            job_spec={
+                "prompt": "do it",
+                "schedule": "0 9 * * *",
+                "name": "Stale Criterion",
+                "deliver": "origin",
+                "category": "event",
+                "material_result_criterion": "free-text not in allowlist",
+            },
+        )
+        with pytest.raises(LlmCronAdmissionError, match="material_result_criterion"):
+            store.accept_suggestion("1")
+        assert len(store.list_pending()) == 1
+
+    def test_accept_no_agent_suggestion_exempt_from_allowlist(self, store):
+        created = {}
+
+        def fake_create_job(**kwargs):
+            created.update(kwargs)
+            return {"id": "na1", **kwargs}
+
+        _add(
+            store,
+            key="no-agent",
+            title="Watchdog",
+            no_agent=True,
+        )
+        with patch("cron.jobs.create_job", fake_create_job):
+            job = store.accept_suggestion("1")
+        assert job is not None
+        assert created.get("no_agent") is True
+        assert store.list_pending() == []
 
     def test_get_by_id_and_index_and_title(self, store):
         rec = _add(store, key="byref", title="Findable")
@@ -151,27 +241,61 @@ class TestCatalog:
         assert classify_items_script_path() not in monitor.job_spec["prompt"]
         assert Path(classify_items_script_path()).name == "classify_items.py"
 
+    def test_llm_entries_declare_standard_admission(self):
+        from cron.jobs import LLM_ADMISSION_CATEGORIES, LLM_BLUEPRINT_MATERIAL_CRITERIA
+        from cron.suggestion_catalog import CATALOG
+
+        expected = {
+            "catalog:daily-briefing": ("justified_cadence", "archivo_entregado"),
+            "catalog:important-mail-monitor": ("event", "alerta_accionable"),
+            "catalog:weekly-review": ("justified_cadence", "archivo_entregado"),
+            "catalog:standup-reminder": ("justified_cadence", "alerta_accionable"),
+        }
+        for entry in CATALOG:
+            cat = entry.job_spec.get("category")
+            crit = entry.job_spec.get("material_result_criterion")
+            assert cat in LLM_ADMISSION_CATEGORIES, entry.key
+            assert crit in LLM_BLUEPRINT_MATERIAL_CRITERIA, entry.key
+            assert (cat, crit) == expected[entry.key], entry.key
+
 
 class TestBlueprintBridge:
     def test_blueprint_registers_suggestion(self, store):
         from tools.blueprints import BlueprintSpec, register_blueprint_suggestion
 
-        spec = BlueprintSpec(skill_name="morning-brief", schedule="0 8 * * *", deliver="telegram")
+        spec = BlueprintSpec(
+            skill_name="morning-brief",
+            schedule="0 8 * * *",
+            deliver="telegram",
+            category="justified_cadence",
+            material_result_criterion="archivo_entregado",
+        )
         with patch("cron.suggestions.add_suggestion", store.add_suggestion):
             rec = register_blueprint_suggestion(spec)
         assert rec is not None
         assert rec["source"] == "blueprint"
         assert rec["job_spec"]["skills"] == ["morning-brief"]
         assert rec["job_spec"]["schedule"] == "0 8 * * *"
+        assert rec["job_spec"]["category"] == "justified_cadence"
+        assert rec["job_spec"]["material_result_criterion"] == "archivo_entregado"
 
     def test_blueprint_to_job_spec_matches_create_blueprint_job(self):
         from tools.blueprints import BlueprintSpec, blueprint_to_job_spec
 
-        spec = BlueprintSpec(skill_name="x", schedule="every 2h", deliver="origin", prompt="p")
+        spec = BlueprintSpec(
+            skill_name="x",
+            schedule="every 2h",
+            deliver="origin",
+            prompt="p",
+            category="event",
+            material_result_criterion="alerta_accionable",
+        )
         js = blueprint_to_job_spec(spec)
         assert js["skills"] == ["x"]
         assert js["schedule"] == "every 2h"
         assert js["prompt"] == "p"
+        assert js["category"] == "event"
+        assert js["material_result_criterion"] == "alerta_accionable"
 
 
 class TestCommandHandler:

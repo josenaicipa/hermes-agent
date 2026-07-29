@@ -111,9 +111,14 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
+# Never expose the operator's real HOME to tests. Credential-pool discovery can
+# otherwise ingest live Claude/OAuth files and make an isolated one-entry fixture
+# appear to have additional credentials. That is both non-hermetic and unsafe.
+TEST_HOME="$(mktemp -d)"
+trap 'rm -rf "$TEST_HOME"' EXIT
+env -i \
   PATH="$PATH" \
-  HOME="$HOME" \
+  HOME="$TEST_HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

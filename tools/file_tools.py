@@ -212,6 +212,23 @@ def _uses_container_paths(task_id: str = "default") -> bool:
     return _terminal_env_type_for_task(task_id) in container_backends
 
 
+def _container_workspace_root(task_id: str, fallback_cwd: str | None) -> str:
+    """Translate a task's host workdir into its effective sandbox cwd.
+
+    Docker auto-mount mode keeps the host checkout in ``host_cwd`` and mounts
+    it at ``/workspace``. File-tool guards and absolute targets must therefore
+    resolve relative paths against the sandbox cwd, not the host bind source.
+    """
+    from tools.terminal_tool import _get_env_config, resolve_task_environment_paths
+
+    cwd, _host_cwd = resolve_task_environment_paths(
+        task_id,
+        _get_env_config(),
+        fallback_cwd=fallback_cwd,
+    )
+    return cwd
+
+
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
     """Normalize path syntax without following host symlinks.
 
@@ -333,14 +350,15 @@ def _resolve_base_dir(
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
+    if container_paths:
+        base_text = _container_workspace_root(task_id, root or os.getcwd())
+        if not posixpath.isabs(base_text):
+            base_text = posixpath.join(os.getcwd(), base_text)
+        return _normalize_without_host_deref(base_text)
     if root:
         base_text = _expand_tilde(root)
     else:
         base_text = os.getcwd()
-    if container_paths:
-        if not posixpath.isabs(base_text):
-            base_text = posixpath.join(os.getcwd(), base_text)
-        return _normalize_without_host_deref(base_text)
     # Git Bash ``pwd -P`` reports ``/c/Users/...``; translate before Path so
     # relative file-tool paths don't anchor under a nonexistent ``\\c\\Users``.
     from tools.environments.local import _msys_to_windows_path
@@ -420,7 +438,9 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         if not workspace_root:
             return None  # No authoritative workspace root to compare against.
         if _uses_container_paths(task_id):
-            root = _normalize_without_host_deref(Path(_expand_tilde(workspace_root)))
+            root = _normalize_without_host_deref(
+                _container_workspace_root(task_id, workspace_root)
+            )
         else:
             root = Path(_expand_tilde(workspace_root)).resolve()
         # Is `resolved` inside `root`?
@@ -996,7 +1016,11 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 terminal_env = None
 
         if terminal_env is None:
-            from tools.terminal_tool import resolve_task_overrides
+            from tools.terminal_tool import (
+                get_session_cwd,
+                resolve_task_environment_paths,
+                resolve_task_overrides,
+            )
 
             config = _get_env_config()
             env_type = config["env_type"]
@@ -1013,32 +1037,11 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             else:
                 image = ""
 
-            try:
-                from tools.terminal_tool import get_session_cwd
-                recorded_cwd = get_session_cwd(raw_task_id)
-            except Exception:
-                recorded_cwd = None
-            cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
-            # Re-apply the container cwd guard that _get_env_config() already
-            # ran on config["cwd"] (see #50636).  A per-task cwd override
-            # registered by the gateway/TUI/ACP for workspace tracking is a
-            # raw host path (e.g. a Desktop session's /Users/<me>/workspace or
-            # C:\\Users\\<me>). On a container backend that reaches
-            # ``docker run -w <host-path>`` and the container starts in a
-            # directory that doesn't exist inside the sandbox, so search_files
-            # and friends silently return empty results (#54447).  Sanitize it
-            # back to the already-validated config["cwd"] so the override can't
-            # bypass the guard.  Valid in-container override paths (RL/benchmark
-            # sandboxes that set cwd to /workspace, /root, etc.) are absolute
-            # non-host paths and pass through untouched.
-            if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-                if cwd != config["cwd"]:
-                    logger.info(
-                        "Ignoring host/relative cwd override %r for %s backend "
-                        "(won't exist in sandbox). Using %r instead.",
-                        cwd, env_type, config["cwd"],
-                    )
-                cwd = config["cwd"]
+            cwd, host_cwd = resolve_task_environment_paths(
+                raw_task_id,
+                config,
+                fallback_cwd=get_session_cwd(raw_task_id),
+            )
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
@@ -1080,7 +1083,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 container_config=container_config,
                 local_config=local_config,
                 task_id=task_id,
-                host_cwd=config.get("host_cwd"),
+                host_cwd=host_cwd,
             )
 
             with _env_lock:

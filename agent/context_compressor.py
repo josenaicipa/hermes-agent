@@ -1934,8 +1934,17 @@ class ContextCompressor(ContextEngine):
         None means "no absolute cap — use the ratio-based threshold only".
         Non-numeric or non-positive values are treated as None so a bad
         config value never silently caps the threshold at zero.
+
+        Bools are rejected before any int() coercion (``int(True) == 1``
+        would otherwise silently cap at 1 token from a YAML
+        ``threshold_tokens: true``). Non-integer floats are also rejected
+        rather than truncated, so a fractional config value reads as unset
+        instead of silently losing precision.
         """
-        if value is None:
+        # bool is a subclass of int — must reject before any int() path.
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, float) and not value.is_integer():
             return None
         try:
             ivalue = int(value)
@@ -2015,6 +2024,7 @@ class ContextCompressor(ContextEngine):
             return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
                               effective_window - 1))
         return floored
+
     def __init__(
         self,
         model: str,

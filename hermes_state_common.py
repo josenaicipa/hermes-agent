@@ -121,15 +121,22 @@ FTS_STORAGE_VERSION = 1
 # sanitizer/runtime behavior predictable under adversarial input.
 MAX_FTS5_QUERY_CHARS = 2_048
 
+# Profile-local operational fuse for recurrent trigram-index corruption.  The
+# base FTS index remains available while this marker exists beside state.db.
+_TRIGRAM_FTS_DISABLE_MARKER = ".disable-trigram-fts"
 
-_FTS_TRIGGERS = (
+
+_BASE_FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
     "messages_fts_update",
+)
+_TRIGRAM_FTS_TRIGGERS = (
     "messages_fts_trigram_insert",
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+_FTS_TRIGGERS = _BASE_FTS_TRIGGERS + _TRIGRAM_FTS_TRIGGERS
 
 
 SCHEMA_SQL = """

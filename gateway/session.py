@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,20 @@ logger = logging.getLogger(__name__)
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
+
+
+def _as_local_naive(value: datetime) -> datetime:
+    """Normalize persisted datetimes to SessionStore's local-naive contract.
+
+    Legacy entries were serialized from ``datetime.now()`` without an offset,
+    while newer repair/import paths may persist ISO-8601 values with one.  The
+    reset policy compares against :func:`_now`, so aware values must first be
+    converted to the host's local wall time before dropping ``tzinfo``.  This
+    preserves the instant instead of merely stripping the offset.
+    """
+    if value.tzinfo is None:
+        return value
+    return value.astimezone().replace(tzinfo=None)
 
 
 # Default auto-continue freshness window in seconds (1 hour).  A session
@@ -890,7 +904,7 @@ class SessionEntry:
         _lrma = data.get("last_resume_marked_at")
         if _lrma:
             try:
-                last_resume_marked_at = datetime.fromisoformat(_lrma)
+                last_resume_marked_at = _as_local_naive(datetime.fromisoformat(_lrma))
             except (TypeError, ValueError):
                 last_resume_marked_at = None
 
@@ -916,8 +930,8 @@ class SessionEntry:
         return cls(
             session_key=session_key,
             session_id=session_id,
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            created_at=_as_local_naive(datetime.fromisoformat(data["created_at"])),
+            updated_at=_as_local_naive(datetime.fromisoformat(data["updated_at"])),
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -1157,14 +1171,38 @@ class AsyncSessionStore:
         return _offloaded
 
 
+@dataclass
+class _StaleSessionAction:
+    """One resolved startup-heal outcome, applied later under ``_lock``.
+
+    Produced by ``SessionStore._resolve_stale_sessions`` (DB I/O, no lock)
+    and consumed by ``SessionStore._apply_stale_session_actions`` (lock
+    held, no DB I/O) — the split that keeps the DB-resolution phase of the
+    startup heal outside ``SessionStore._lock``.
+    """
+    key: str
+    original_session_id: str
+    kind: str  # "prune" | "repoint_id" | "repoint_entry"
+    new_session_id: Optional[str] = None
+    new_entry: Optional["SessionEntry"] = None
+    end_reason: Optional[str] = None
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
-    
+
     Uses SQLite (via SessionDB) for session metadata and message transcripts.
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
-    
+
+    # Startup-heal barrier states (see _run_startup_heal_locked /
+    # _wait_for_startup_heal_locked). Monotonic per store instance:
+    # pending -> running -> terminal, once.
+    _HEAL_PENDING = "pending"
+    _HEAL_RUNNING = "running"
+    _HEAL_TERMINAL = "terminal"
+
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
                  has_active_processes_fn=None):
         self.sessions_dir = sessions_dir
@@ -1194,6 +1232,20 @@ class SessionStore:
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
+        # Startup-heal barrier (G3): the routing-index prune/compression-repoint
+        # pass that used to run inline inside _ensure_loaded_locked while
+        # holding _lock. _heal_cond shares _lock's underlying lock, so
+        # waiting on it (_wait_for_startup_heal_locked) releases _lock for
+        # the duration of the wait — see _run_startup_heal_locked.
+        self._heal_state = self._HEAL_PENDING
+        self._heal_cond = threading.Condition(self._lock)
+        # Startup-load barrier (G3): the initial state.db routing read used to
+        # run inline under _lock. It now runs with _lock released while a single
+        # owner thread loads; concurrent callers wait on _load_cond (which
+        # shares _lock's underlying lock, so waiting releases _lock) until the
+        # owner finishes — see _ensure_loaded_locked.
+        self._loading = False
+        self._load_cond = threading.Condition(self._lock)
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -1251,10 +1303,78 @@ class SessionStore:
         path for pre-migration installs (its entries are folded in for keys
         the DB doesn't have, then persisted to the DB on the next _save).
         """
+        # Some tests build a partially-initialized store via
+        # SessionStore.__new__ (bypassing __init__, same pattern noted for
+        # self._db elsewhere in this file) and never set the startup-heal
+        # barrier attributes. Lazily create them here — always called with
+        # self._lock held, so this is race-free — before either
+        # _run_startup_heal_locked or _wait_for_startup_heal_locked (called
+        # right after this method, in get_or_create_session) can need them.
+        if getattr(self, "_heal_cond", None) is None:
+            self._heal_state = self._HEAL_PENDING
+            self._heal_cond = threading.Condition(self._lock)
+        if getattr(self, "_load_cond", None) is None:
+            self._loading = False
+            self._load_cond = threading.Condition(self._lock)
         if self._loaded:
             return
 
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # Startup-load barrier (G3): the state.db routing read below is SQLite
+        # I/O and must not run under _lock. A single owner thread performs it
+        # with _lock released; any other caller that arrives mid-load waits on
+        # _load_cond (which releases _lock while waiting) until _loaded is set,
+        # then returns — never holding _lock across the read, and never
+        # double-loading (one-owner, mirroring the startup-heal owner below).
+        if self._loading:
+            while self._loading and not self._loaded:
+                self._load_cond.wait()
+            return
+
+        self._loading = True
+        try:
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            # Read state.db + sessions.json with _lock RELEASED — pure I/O into
+            # a local dict, no shared-state mutation. Concurrent callers are
+            # parked on _load_cond above, so _entries cannot be mutated here.
+            self._lock.release()
+            try:
+                loaded_entries = self._load_routing_entries_from_disk()
+            finally:
+                self._lock.acquire()
+            # Populate under _lock. setdefault preserves any entry a direct
+            # caller may have created (defensive: the load barrier already keeps
+            # other _ensure_loaded_locked callers parked), and keeps the DB-wins
+            # ordering resolved inside the helper.
+            for key, entry in loaded_entries.items():
+                self._entries.setdefault(key, entry)
+            self._loaded = True
+        finally:
+            self._loading = False
+            self._load_cond.notify_all()
+
+        # Heal any sessions.json entries that point to sessions already ended
+        # in state.db. A hard gateway crash (exit code 1) skips the graceful
+        # shutdown path, so sessions.json is never cleared and is left pointing
+        # at ended sessions. On the next startup those stale entries act as live
+        # routing keys. get_or_create_session() only consulted end_reason at
+        # startup (here) until #54878 added a routing-time guard for the
+        # live-gateway case; this startup heal still self-heals crash-left
+        # entries before the first message arrives. The DB lookups this
+        # requires run without _lock held — see _run_startup_heal_locked.
+        self._run_startup_heal_locked()
+
+    def _load_routing_entries_from_disk(self) -> Dict[str, "SessionEntry"]:
+        """Read the routing index from state.db + sessions.json (no _lock).
+
+        Pure I/O: returns a fresh ``{session_key: SessionEntry}`` dict and never
+        touches ``self._entries`` or any shared mutable state, so it is safe to
+        call with ``self._lock`` released (see ``_ensure_loaded_locked``'s
+        startup-load barrier). Read order (#9006 follow-up): the
+        ``gateway_routing`` table in state.db is primary; sessions.json is the
+        legacy import path whose entries only fill keys the DB didn't provide.
+        Every failure is non-fatal — startup must never fail here.
+        """
+        entries: Dict[str, "SessionEntry"] = {}
 
         # Primary: state.db gateway_routing table. getattr: some tests build
         # partially-initialized stores without __init__ (same pattern as
@@ -1269,12 +1389,12 @@ class SessionStore:
                         try:
                             entry_data = json.loads(entry_json)
                             if isinstance(entry_data, dict):
-                                self._entries[key] = SessionEntry.from_dict(entry_data)
+                                entries[key] = SessionEntry.from_dict(entry_data)
                         except (ValueError, KeyError, TypeError) as e:
                             logger.warning(
                                 "Skipping invalid routing entry %r: %s", key, e
                             )
-                    db_had_entries = bool(self._entries)
+                    db_had_entries = bool(entries)
                 except Exception as e:
                     logger.warning(
                         "gateway.session: state.db routing load failed: %s", e
@@ -1295,7 +1415,7 @@ class SessionStore:
                     # entries. Skip them so they never reach SessionEntry.from_dict.
                     if key.startswith("_"):
                         continue
-                    if key in self._entries:
+                    if key in entries:
                         continue
                     # Skip non-dict entries (corrupted sessions.json, e.g. a
                     # bare bool or string where a dict is expected). Without
@@ -1310,7 +1430,7 @@ class SessionStore:
                         )
                         continue
                     try:
-                        self._entries[key] = SessionEntry.from_dict(entry_data)
+                        entries[key] = SessionEntry.from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -1323,23 +1443,17 @@ class SessionStore:
             except Exception as e:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
-        self._loaded = True
-
-        # Prune any sessions.json entries that point to sessions already ended
-        # in state.db. A hard gateway crash (exit code 1) skips the graceful
-        # shutdown path, so sessions.json is never cleared and is left pointing
-        # at ended sessions. On the next startup those stale entries act as live
-        # routing keys. get_or_create_session() only consulted end_reason at
-        # startup (here) until #54878 added a routing-time guard for the
-        # live-gateway case; this startup prune still self-heals crash-left
-        # entries before the first message arrives. Pruning here (lock already
-        # held) is cheap: one lookup per routing key, once at startup.
-        self._prune_stale_sessions_locked()
+        return entries
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove sessions.json entries whose session has ended in state.db.
 
-        Called once during startup (from ``_ensure_loaded_locked``, lock held).
+        Synchronous, direct-call entry point used by callers that already
+        hold (or don't need) ``self._lock`` around the whole operation — kept
+        for backward compatibility with existing direct callers/tests. The
+        startup path instead goes through ``_run_startup_heal_locked``, which
+        runs the same resolution DB work without holding ``self._lock``.
+
         A ``session_id`` is stale when state.db reports ``end_reason IS NOT
         NULL`` for it. Sessions absent from the DB (never persisted / pre-SQLite
         legacy) are left alone, and a ``None`` DB handle (SQLite unavailable) is
@@ -1348,77 +1462,259 @@ class SessionStore:
         db = getattr(self, "_db", None)
         if not db or not self._entries:
             return
+        actions = self._resolve_stale_sessions(list(self._entries.items()))
+        self._apply_stale_session_actions(actions)
 
-        stale_keys: list = []
-        recovered_keys = 0
+    def _resolve_stale_sessions(
+        self, items: List[Tuple[str, "SessionEntry"]]
+    ) -> List[_StaleSessionAction]:
+        """Resolve which routing entries are stale via DB lookups.
+
+        Pure resolution: performs the ``db.get_session`` / compression-lineage
+        / peer-recovery DB calls but never mutates ``self._entries`` — callers
+        apply the returned actions separately (``_apply_stale_session_actions``).
+        Safe to call without ``self._lock`` held (see ``_run_startup_heal_locked``).
+        A DB error on any entry is non-fatal but aborts the whole batch
+        conservatively — returns ``[]`` (no changes) — so startup never fails
+        here and a transient failure never prunes/repoints based on a
+        partial scan.
+        """
+        db = getattr(self, "_db", None)
+        if not db:
+            return []
+
+        actions: List[_StaleSessionAction] = []
         try:
-            for key, entry in self._entries.items():
-                row = db.get_session(entry.session_id)
-                # row is None        -> not in DB (legacy / pre-SQLite) — keep
-                # end_reason is None  -> session alive — keep
-                # end_reason not None -> session ended — prune
-                if row is not None and row.get("end_reason") is not None:
-                    recovered_entry = None
-                    recovery_lookup_failed = False
-                    if entry.origin is not None:
-                        try:
-                            recovered_entry = self._recover_session_from_db(
-                                session_key=key,
-                                source=entry.origin,
-                                now=_now(),
-                                raise_on_lookup_error=True,
-                            )
-                        except Exception as exc:
-                            logger.debug(
-                                "gateway.session: recovery lookup failed for stale "
-                                "sessions.json entry %r -> %s: %s",
-                                key,
-                                entry.session_id,
-                                exc,
-                            )
-                            recovery_lookup_failed = True
-
-                    if recovery_lookup_failed:
-                        continue
-
-                    # If the stale entry points at a compression-ended parent but
-                    # a newer live child session exists for the exact same gateway
-                    # peer, repoint the routing index instead of dropping it. A
-                    # hard restart between compression rotation and the next clean
-                    # save otherwise leaves Telegram with no resumable mapping, so
-                    # queued/resume-pending work disappears until the user sends a
-                    # fresh message.
-                    if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
-                        logger.warning(
-                            "gateway.session: repointing stale sessions.json entry "
-                            "%r from ended %s (end_reason=%r) to recovered %s",
-                            key,
-                            entry.session_id,
-                            row["end_reason"],
-                            recovered_entry.session_id,
-                        )
-                        self._entries[key] = recovered_entry
-                        recovered_keys += 1
-                        continue
-
-                    logger.warning(
-                        "gateway.session: pruning stale sessions.json entry "
-                        "%r -> %s (end_reason=%r); left by a crashed gateway",
-                        key, entry.session_id, row["end_reason"],
-                    )
-                    stale_keys.append(key)
+            for key, entry in items:
+                action = self._resolve_stale_session_action(db, key, entry)
+                if action is not None:
+                    actions.append(action)
         except Exception as exc:
             logger.warning(
                 "gateway.session: stale-entry pruning skipped due to DB error: %s",
                 exc,
             )
-            return
+            return []
+        return actions
 
-        for key in stale_keys:
-            del self._entries[key]
+    def _resolve_stale_session_action(
+        self, db: Any, key: str, entry: "SessionEntry"
+    ) -> Optional[_StaleSessionAction]:
+        """Resolve a single routing entry against state.db.
 
-        if stale_keys or recovered_keys:
+        Returns ``None`` when the entry is absent from the DB (legacy /
+        pre-SQLite) or still alive — both cases mean "keep". Also returns
+        ``None`` when peer-recovery lookup raises: indeterminate recovery
+        must not delete the only routing handle (upstream contract from
+        ``test_keeps_stale_entry_when_recovery_lookup_raises``). May raise
+        for other DB errors; the caller (``_resolve_stale_sessions``) aborts
+        the whole batch conservatively on any such error.
+        """
+        row = db.get_session(entry.session_id)
+        if row is None or row.get("end_reason") is None:
+            return None
+
+        # Compression lineage is authoritative even when the child was
+        # created just before a crash and therefore never received gateway
+        # peer metadata. Recover by parent->child lineage before the
+        # peer-metadata fallback below.
+        if row.get("end_reason") == "compression":
+            canonical_id = self._compression_tip_for_session_id(entry.session_id)
+            if canonical_id and canonical_id != entry.session_id:
+                canonical_row = db.get_session(canonical_id)
+                if canonical_row is not None and canonical_row.get("end_reason") is None:
+                    return _StaleSessionAction(
+                        key=key,
+                        original_session_id=entry.session_id,
+                        kind="repoint_id",
+                        new_session_id=canonical_id,
+                    )
+
+        recovered_entry = None
+        if entry.origin is not None:
+            try:
+                recovered_entry = self._recover_session_from_db(
+                    session_key=key,
+                    source=entry.origin,
+                    now=_now(),
+                    raise_on_lookup_error=True,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "gateway.session: recovery lookup failed for stale "
+                    "sessions.json entry %r -> %s: %s",
+                    key, entry.session_id, exc,
+                )
+                # Keep the routing handle so the runtime stale guard can
+                # retry recovery on the next inbound message.
+                return None
+
+        # If the stale entry points at a compression-ended parent but a
+        # newer live child session exists for the exact same gateway peer,
+        # repoint the routing index instead of dropping it. A hard restart
+        # between compression rotation and the next clean save otherwise
+        # leaves Telegram with no resumable mapping, so queued/resume-pending
+        # work disappears until the user sends a fresh message.
+        if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
+            return _StaleSessionAction(
+                key=key,
+                original_session_id=entry.session_id,
+                kind="repoint_entry",
+                new_entry=recovered_entry,
+            )
+
+        return _StaleSessionAction(
+            key=key,
+            original_session_id=entry.session_id,
+            kind="prune",
+            end_reason=row.get("end_reason"),
+        )
+
+    def _apply_stale_session_actions(self, actions: List[_StaleSessionAction]) -> None:
+        """Apply a resolved stale-session plan and persist it synchronously.
+
+        Direct-call entry point (``_prune_stale_sessions_locked``): must be
+        called with ``self._lock`` held, applies the mutations and — like
+        before — persists them before returning, so existing callers keep their
+        synchronous semantics (and its ``_save`` contract). The startup-heal
+        owner instead calls ``_apply_stale_session_actions_locked`` directly and
+        persists a snapshot with ``self._lock`` released (see
+        ``_run_startup_heal_locked``).
+        """
+        if self._apply_stale_session_actions_locked(actions):
             self._save()
+
+    def _apply_stale_session_actions_locked(
+        self, actions: List[_StaleSessionAction]
+    ) -> bool:
+        """Apply a resolved stale-session plan to ``self._entries``.
+
+        Must be called with ``self._lock`` held. Each action is
+        compare-and-swap guarded against ``original_session_id``: if the
+        entry was mutated or removed since the plan was resolved (e.g. by a
+        concurrent non-inbound caller such as ``update_session``), it is
+        skipped rather than clobbered — the same protection
+        ``_heal_compression_tip_locked`` uses for per-request compression-tip
+        healing.
+
+        Does NOT perform I/O. Returns ``True`` iff at least one action changed
+        the index; the caller persists (``_save`` under the lock for the direct
+        path, or a ``_snapshot_routing_locked`` + out-of-lock
+        ``_persist_routing_data`` for
+        the startup-heal owner).
+        """
+        changed = False
+        for action in actions:
+            entry = self._entries.get(action.key)
+            if entry is None or entry.session_id != action.original_session_id:
+                continue
+
+            if action.kind == "prune":
+                logger.warning(
+                    "gateway.session: pruning stale sessions.json entry "
+                    "%r -> %s (end_reason=%r); left by a crashed gateway",
+                    action.key, action.original_session_id, action.end_reason,
+                )
+                del self._entries[action.key]
+                changed = True
+            elif action.kind == "repoint_id":
+                logger.warning(
+                    "gateway.session: repointing stale sessions.json entry "
+                    "%r from compression parent %s to lineage tip %s",
+                    action.key, action.original_session_id, action.new_session_id,
+                )
+                entry.session_id = action.new_session_id
+                changed = True
+            elif action.kind == "repoint_entry":
+                logger.warning(
+                    "gateway.session: repointing stale sessions.json entry "
+                    "%r from ended %s to recovered %s",
+                    action.key, action.original_session_id, action.new_entry.session_id,
+                )
+                self._entries[action.key] = action.new_entry
+                changed = True
+
+        return changed
+
+    def _run_startup_heal_locked(self) -> None:
+        """Owner-only startup heal: resolve stale/compression routes without
+        holding ``self._lock``, then apply the results.
+
+        Called exactly once per store instance, from ``_ensure_loaded_locked``
+        by whichever thread performs the initial load (``self._lock`` held at
+        entry). Transitions ``self._heal_state`` pending -> running -> terminal
+        and always returns with ``self._lock`` held, preserving
+        ``_ensure_loaded_locked``'s existing contract. The outer ``finally``
+        guarantees the terminal state is reached and waiters are notified no
+        matter what happens in between — including a failure inside the apply
+        or the out-of-lock persist — so a waiter blocked in
+        ``_wait_for_startup_heal_locked`` can never hang forever. Only the
+        real inbound path (``get_or_create_session``) calls that wait; other
+        direct ``_ensure_loaded_locked`` callers never wait on this and so
+        are never stranded by an in-progress heal either.
+
+        Both SQLite phases run with ``self._lock`` RELEASED: the DB-resolution
+        reads and the persist write. Only the in-memory apply (CAS-guarded) and
+        the atomic snapshot capture run under the lock; the snapshot's version
+        lets ``_persist_routing_data`` drop the write if a concurrent route save
+        superseded it while the lock was released.
+        """
+        self._heal_state = self._HEAL_RUNNING
+        items = list(self._entries.items())
+        try:
+            self._lock.release()
+            try:
+                actions = self._resolve_stale_sessions(items)
+            except Exception:
+                logger.warning(
+                    "gateway.session: startup-heal resolution failed "
+                    "unexpectedly; no routing changes applied",
+                    exc_info=True,
+                )
+                actions = []
+            finally:
+                self._lock.acquire()
+
+            snapshot = None
+            try:
+                if self._apply_stale_session_actions_locked(actions):
+                    # Capture the versioned snapshot atomically under _lock…
+                    snapshot = self._snapshot_routing_locked()
+            except Exception:
+                logger.warning(
+                    "gateway.session: startup-heal apply failed unexpectedly",
+                    exc_info=True,
+                )
+
+            # …then write it with _lock RELEASED — the SQLite/file write must
+            # not run under the routing lock. _persist_routing_data's generation guard
+            # keeps this snapshot from clobbering a concurrent route save.
+            if snapshot is not None:
+                self._lock.release()
+                try:
+                    self._persist_routing_data(*snapshot)
+                except Exception:
+                    logger.warning(
+                        "gateway.session: startup-heal persist failed unexpectedly",
+                        exc_info=True,
+                    )
+                finally:
+                    self._lock.acquire()
+        finally:
+            self._heal_state = self._HEAL_TERMINAL
+            self._heal_cond.notify_all()
+
+    def _wait_for_startup_heal_locked(self) -> None:
+        """Block the real inbound routing consumer until startup heal is terminal.
+
+        Must be called with ``self._lock`` held. Releases the lock while
+        waiting (``Condition.wait``) so the heal owner — and any other
+        direct ``_ensure_loaded_locked`` caller — is never blocked by this
+        wait. Only ``get_or_create_session`` calls this; see
+        ``_run_startup_heal_locked`` for the owner side of the barrier.
+        """
+        while self._heal_state == self._HEAL_RUNNING:
+            self._heal_cond.wait()
 
     def _save(self) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
@@ -1457,9 +1753,25 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+            # SQLite is authoritative: once it commits, this generation is
+            # durable even if the best-effort JSON mirror fails afterward.
+            if db_saved:
+                self._persisted_routing_generation = generation
+
             if getattr(self, "_write_sessions_json", True) or not db_saved:
-                self._save_sessions_json(data)
-            self._persisted_routing_generation = generation
+                try:
+                    self._save_sessions_json(data)
+                except Exception:
+                    if not db_saved:
+                        raise
+                    logger.warning(
+                        "gateway.session: sessions.json mirror write failed; "
+                        "routing already persisted to state.db",
+                        exc_info=True,
+                    )
+                else:
+                    if not db_saved:
+                        self._persisted_routing_generation = generation
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
@@ -2243,6 +2555,12 @@ class SessionStore:
         if not force_new:
             with self._lock:
                 self._ensure_loaded_locked()
+                # Real inbound routing consumer: block until the startup
+                # heal (compression-route/stale-entry repair) reaches a
+                # terminal state before reading the routing index, so this
+                # never returns or replaces an entry the heal hasn't finished
+                # resolving yet. See _wait_for_startup_heal_locked.
+                self._wait_for_startup_heal_locked()
                 entry = self._entries.get(session_key)
                 if entry is not None:
                     existing_session_id = entry.session_id

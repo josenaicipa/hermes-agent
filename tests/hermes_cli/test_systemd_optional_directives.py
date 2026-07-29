@@ -268,3 +268,20 @@ WantedBy=default.target
         unit_file = tmp_path / "nonexistent.service"
         monkeypatch.setattr(gw, "get_systemd_unit_path", lambda system=False: unit_file)
         assert gw.systemd_unit_is_current(system=False) is False
+
+
+@pytest.mark.parametrize("system", [False, True])
+def test_generated_systemd_units_bound_restart_storms(system):
+    """Both service scopes must retain a finite crash-loop budget."""
+    import getpass
+
+    from hermes_cli.gateway import generate_systemd_unit
+
+    text = generate_systemd_unit(
+        system=system,
+        run_as_user=getpass.getuser() if system else None,
+    )
+
+    assert "StartLimitIntervalSec=60" in text
+    assert "StartLimitBurst=6" in text
+    assert "StartLimitIntervalSec=0" not in text

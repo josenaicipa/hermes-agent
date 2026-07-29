@@ -1528,15 +1528,40 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+def _resolve_skills_index_mode(index_mode: "str | None" = None) -> str:
+    """Resolve ``skills.index_mode`` to ``full`` or ``names_only``.
+
+    Config.yaml only (no env var). Default ``full`` keeps the historical
+    name+description index. ``names_only`` / ``selective`` / ``names-only``
+    demote every category to names so long descriptions stay out of the
+    stable system-prompt tier; ``skill_view`` still loads full content.
+    """
+    if index_mode is None:
+        try:
+            from hermes_cli.config import load_config
+
+            index_mode = (
+                (load_config() or {}).get("skills") or {}
+            ).get("index_mode", "full")
+        except Exception:
+            index_mode = "full"
+    mode = str(index_mode or "full").strip().lower().replace("-", "_")
+    if mode in {"names_only", "name_only", "selective"}:
+        return "names_only"
+    return "full"
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    index_mode: "str | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
     Two-layer cache:
-      1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
+      1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden,
+         index_mode)
       2. Disk snapshot (``.skills_prompt_snapshot.json``) validated by
          mtime/size manifest — survives process restarts
 
@@ -1552,6 +1577,11 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    ``index_mode`` (``skills.index_mode`` in config.yaml): ``full`` (default,
+    backward-compatible descriptions) or ``names_only`` / ``selective``
+    (names+categories only in the stable index). Included in the cache key
+    so modes never cross-contaminate.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1559,9 +1589,14 @@ def build_skills_system_prompt(
     if not skills_dir.exists() and not external_dirs:
         return ""
 
+    resolved_index_mode = _resolve_skills_index_mode(index_mode)
+    names_only_index = resolved_index_mode == "names_only"
+
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
+    # index_mode is part of the key so a full entry never leaks into a
+    # names-only session (prompt-cache safety).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
@@ -1572,6 +1607,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        resolved_index_mode,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1714,13 +1750,26 @@ def build_skills_system_prompt(
     # what the index stops showing them. Match on the top-level category
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
-    )
+    #
+    # Global ``skills.index_mode: names_only`` demotes *every* category the
+    # same way — selective/heavy-skill profiles keep names visible without
+    # paying description tokens on every API call.
+    if names_only_index:
+        demoted = frozenset(skills_by_category.keys())
+    else:
+        demoted = frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in (compact_categories or frozenset())
+        )
 
     hidden_note = ""
-    if demoted:
+    if names_only_index:
+        hidden_note = (
+            "\n(Skill index is names-only: descriptions are omitted from the "
+            "system prompt. Skills still work — load full instructions with "
+            "skill_view(name) when the task clearly needs one.)"
+        )
+    elif demoted:
         hidden_note = (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
@@ -1752,35 +1801,85 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
-        result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
-            + hidden_note
-        )
+        if names_only_index:
+            skills_header = (
+                "## Skills (selective)\n"
+                "The index below lists skill names and categories only — full "
+                "instructions are not in this system prompt. Load a skill with "
+                "skill_view(name) when at least one of these is true: (1) "
+                "Context Fabric / `# AGENT_CONTEXT` lists it as required, "
+                "(2) the user explicitly invokes it by name, or (3) the task "
+                "clearly and directly matches that skill's purpose. Do NOT "
+                "load heavy skills on partial keyword overlap or speculative "
+                "relevance when AGENT_CONTEXT does not call for them.\n"
+                "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+                "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+                "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+                "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+                "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+                "Context Fabric governs channel-context questions. If the available context "
+                "already contains `# AGENT_CONTEXT` (Context Fabric output) and the user asks "
+                "about this channel's context, scope, memories, crons, reports, deploys, "
+                "Notion, or citations, answer from that AGENT_CONTEXT first. Do NOT load "
+                "broad workspace/routing skills (e.g. `jose-workspace-context`) as the "
+                "primary source for that question. Only load them when the user explicitly "
+                "asks for global routing, when Context Fabric lists them as required, or "
+                "when AGENT_CONTEXT is absent or empty — and in that case label them as "
+                "fallback/auxiliary. Any skill or tool consulted after AGENT_CONTEXT must "
+                "be labeled as an additional source, never as the Context Fabric source.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only load a skill when the criteria above apply; otherwise proceed without one."
+                + hidden_note
+            )
+        else:
+            skills_header = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+                "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+                "and proven workflows that outperform general-purpose approaches. Load the skill "
+                "even if you think you could handle the task with basic tools like web_search or terminal. "
+                "Skills also encode the user's preferred approach, conventions, and quality standards "
+                "for tasks like code review, planning, and testing — load them even for tasks you "
+                "already know how to do, because the skill defines how it should be done here.\n"
+                "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+                "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+                "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+                "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+                "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+                "Context Fabric governs channel-context questions. If the available context "
+                "already contains `# AGENT_CONTEXT` (Context Fabric output) and the user asks "
+                "about this channel's context, scope, memories, crons, reports, deploys, "
+                "Notion, or citations, answer from that AGENT_CONTEXT first. Do NOT load "
+                "broad workspace/routing skills (e.g. `jose-workspace-context`) as the "
+                "primary source for that question. Only load them when the user explicitly "
+                "asks for global routing, when Context Fabric lists them as required, or "
+                "when AGENT_CONTEXT is absent or empty — and in that case label them as "
+                "fallback/auxiliary. Any skill or tool consulted after AGENT_CONTEXT must "
+                "be labeled as an additional source, never as the Context Fabric source.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+                + hidden_note
+            )
+        result = skills_header
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:

@@ -2069,6 +2069,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+def _apply_claude_execution_envelope_to_direct_kwargs(agent, kwargs: dict) -> dict:
+    """Guard/canonicalize direct summary calls that bypass the transport."""
+    from agent.claude_execution_profiles import require_claude_execution_profile
+
+    envelope = require_claude_execution_profile(
+        provider=getattr(agent, "provider", None),
+        base_url=getattr(agent, "base_url", None),
+        request_overrides=getattr(agent, "request_overrides", None),
+    )
+    if envelope:
+        existing_extra_body = kwargs.get("extra_body") or {}
+        if not isinstance(existing_extra_body, dict):
+            raise ValueError("summary extra_body must be an object")
+        extra_body = dict(existing_extra_body)
+        # OpenAI Python merges extra_body into the top-level JSON request.
+        # Passing custom fields as Python kwargs raises TypeError before HTTP.
+        extra_body.update(envelope)
+        kwargs["extra_body"] = extra_body
+    return kwargs
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
@@ -2299,6 +2320,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                _apply_claude_execution_envelope_to_direct_kwargs(agent, summary_kwargs)
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
@@ -2361,6 +2383,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                _apply_claude_execution_envelope_to_direct_kwargs(agent, summary_kwargs)
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )

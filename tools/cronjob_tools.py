@@ -9,12 +9,21 @@ import json
 import logging
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+# Manual ``cronjob(action="run")`` executions must not hold the calling
+# conversation open for the full cron duration. Keep a small in-process
+# registry so a repeated request for the same job is rejected while its worker
+# is alive. The durable at-most-once guard remains ``fire_claim`` in the
+# cron job store; this registry is only the local execution handle.
+_manual_runs_lock = threading.Lock()
+_manual_run_threads: Dict[str, threading.Thread] = {}
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -26,6 +35,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
+    new_fire_claim_owner,
     parse_schedule,
     pause_job,
     remove_job,
@@ -562,7 +572,44 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("category"):
+        result["category"] = job["category"]
+    if job.get("material_result_criterion"):
+        result["material_result_criterion"] = job["material_result_criterion"]
     return result
+
+
+def _fire_claim_owner_from_job(job: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Stable fire_claim owner from a claimed/dispatched job dict, or None."""
+    if not isinstance(job, dict):
+        return None
+    claim = job.get("fire_claim")
+    if not isinstance(claim, dict):
+        return None
+    owner = str(claim.get("by") or "")
+    return owner or None
+
+
+def _mark_job_run_owned(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    *,
+    expected_fire_claim_owner: Optional[str] = None,
+):
+    """Call ``mark_job_run``, passing expected owner only when known.
+
+    Preserves the historical positional call shape for paths without a
+    fire_claim owner so existing assert_called_with mocks keep working.
+    """
+    if expected_fire_claim_owner is None:
+        return mark_job_run(job_id, success, error)
+    return mark_job_run(
+        job_id,
+        success,
+        error,
+        expected_fire_claim_owner=expected_fire_claim_owner,
+    )
 
 
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -582,15 +629,20 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    # Per-fire fencing token: generate once, pass into the claim, then require
+    # the durable record still holds this exact token (not just any non-empty
+    # owner). Same-process reclaim generations must not share an owner string.
+    expected_fire_claim_owner: Optional[str] = new_fire_claim_owner()
     try:
         from cron.scheduler import run_one_job
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
+        if not claim_job_for_fire(job_id, claim_owner=expected_fire_claim_owner):
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
             # (#60703): that message sends the user chasing a phantom
             # in-flight run when the job simply isn't runnable.
+            expected_fire_claim_owner = None  # never won the claim
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
@@ -600,9 +652,28 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
+        # Require the post-claim store record still carries THIS caller's
+        # fencing token. Never fall back to the pre-claim snapshot (no claim,
+        # would skip heartbeat / owner-conditional mark). Missing, malformed,
+        # or different-token records fail closed; leave the durable claim for
+        # TTL recovery rather than clearing a possibly-replacement owner.
+        claimed_job = get_job(job_id)
+        stored_owner = _fire_claim_owner_from_job(claimed_job)
+        if stored_owner != expected_fire_claim_owner:
+            return {
+                "claimed": True,
+                "success": False,
+                "error": (
+                    "Post-claim fire_claim owner does not match this caller's "
+                    "fencing token; not run."
+                ),
+            }
+
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        # Pre-execution fire-claim aborts return False so a stale prior
+        # last_status='ok' cannot be reported as this run's success.
+        processed = run_one_job(claimed_job)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -614,10 +685,122 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         try:
-            mark_job_run(job_id, False, str(e))
+            # Pass the stable claim owner so an outer failure cannot erase a
+            # replacement owner's fire_claim / job state.
+            _mark_job_run_owned(
+                job_id,
+                False,
+                str(e),
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            )
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
+
+
+def _dispatch_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Claim and dispatch a manual cron run without blocking the caller.
+
+    The old model-tool path called :func:`_execute_job_now` inline. A cron that
+    waited on ``TERMINAL_CWD`` or performed long agent work therefore froze the
+    interactive turn for minutes. Claim synchronously (preserving at-most-once
+    behavior), then run the shared scheduler body on a worker thread so the
+    tool can return a pending handle immediately. The worker is intentionally
+    non-daemon so a short-lived CLI process still honors the execution guarantee
+    from #41037 instead of exiting before the cron finishes.
+    """
+    job_id = job["id"]
+
+    with _manual_runs_lock:
+        existing = _manual_run_threads.get(job_id)
+        if existing is not None and existing.is_alive():
+            return {
+                "claimed": False,
+                "dispatched": False,
+                "error": "Job already has a manual run in progress.",
+            }
+
+    # Per-fire fencing token: generate once, pass into the claim, then require
+    # the durable record still holds this exact token.
+    expected_fire_claim_owner = new_fire_claim_owner()
+    if not claim_job_for_fire(job_id, claim_owner=expected_fire_claim_owner):
+        return {
+            "claimed": False,
+            "dispatched": False,
+            "error": "Job is already being fired by the scheduler; not run again.",
+        }
+
+    # Require the post-claim store record still carries THIS caller's fencing
+    # token. Never fall back to the pre-claim snapshot (no claim, would skip
+    # singleflight protection). Missing/malformed/different-token fails closed;
+    # leave the durable claim for TTL recovery rather than mutating it.
+    claimed_job = get_job(job_id)
+    stored_owner = _fire_claim_owner_from_job(claimed_job)
+    if stored_owner != expected_fire_claim_owner:
+        return {
+            "claimed": True,
+            "dispatched": False,
+            "error": (
+                "Post-claim fire_claim owner does not match this caller's "
+                "fencing token; not run."
+            ),
+        }
+
+    def _worker() -> None:
+        try:
+            from cron.scheduler import run_one_job
+
+            run_one_job(claimed_job)
+        except Exception as exc:
+            logger.exception("Background manual cron run %s failed: %s", job_id, exc)
+            try:
+                # Owner-conditional so a stale/outer failure cannot clear a
+                # replacement owner's durable fire_claim.
+                _mark_job_run_owned(
+                    job_id,
+                    False,
+                    str(exc),
+                    expected_fire_claim_owner=expected_fire_claim_owner,
+                )
+            except Exception:
+                pass
+        finally:
+            with _manual_runs_lock:
+                if _manual_run_threads.get(job_id) is threading.current_thread():
+                    _manual_run_threads.pop(job_id, None)
+            # The run (or its failure fallback above) has now persisted its
+            # final last_run_at/last_status — reconcile external scheduler
+            # providers the same way the old synchronous path did. Claim time
+            # and completion time are no longer the same instant now that
+            # this runs on a worker thread, so this is the completion half of
+            # that reconciliation; see the claim-time notify at the
+            # ``_dispatch_job_now`` call site in ``cronjob()`` for the other half.
+            _notify_provider_jobs_changed_safe()
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"cron-manual-{job_id[:12]}",
+        daemon=False,
+    )
+    with _manual_runs_lock:
+        _manual_run_threads[job_id] = thread
+    try:
+        thread.start()
+    except Exception as exc:
+        with _manual_runs_lock:
+            _manual_run_threads.pop(job_id, None)
+        try:
+            _mark_job_run_owned(
+                job_id,
+                False,
+                str(exc),
+                expected_fire_claim_owner=expected_fire_claim_owner,
+            )
+        except Exception:
+            pass
+        return {"claimed": True, "dispatched": False, "error": str(exc)}
+
+    return {"claimed": True, "dispatched": True, "error": None}
 
 
 def cronjob(
@@ -641,6 +824,8 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    category: Optional[str] = None,
+    material_result_criterion: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -658,7 +843,8 @@ def cronjob(
             #   - no_agent=True → script is the job; prompt/skills are optional
             #     (and irrelevant to execution).
             #   - no_agent=False (default) → at least one of prompt/skills must
-            #     be set, same as before.
+            #     be set, same as before. LLM jobs also require admission
+            #     declarations (category + material_result_criterion).
             if _no_agent:
                 if not script:
                     return tool_error(
@@ -714,6 +900,8 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                category=category,
+                material_result_criterion=material_result_criterion,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -800,27 +988,33 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
-            # Execute the job immediately rather than only scheduling it for the
-            # next scheduler tick — a manual `run` should actually run, even when
-            # no gateway/ticker is active (the #41037 case). The claim inside
-            # _execute_job_now advances next_run_at and blocks a concurrent tick
-            # from double-firing.
-            exec_result = _execute_job_now(job)
-            # A claimed direct run advances next_run_at and may race the
-            # external one-shot for the same occurrence. If Chronos loses that
-            # claim, its consumed fire cannot re-arm itself; reconcile from the
-            # winning direct path after the run has persisted its final state.
+            # Claim and dispatch immediately, but do not hold the interactive
+            # model-tool turn open while a potentially long cron executes. The
+            # worker uses the same run_one_job body as the scheduler.
+            exec_result = _dispatch_job_now(job)
+            # A claimed dispatch advances next_run_at immediately and may race
+            # the external one-shot for the same occurrence. If Chronos loses
+            # that claim, its consumed fire cannot re-arm itself; reconcile
+            # from the winning direct path now for the claim itself — the
+            # worker thread (see ``_dispatch_job_now``) reconciles again once
+            # the run has persisted its final last_run_at/last_status.
             if exec_result.get("claimed", False):
                 _notify_provider_jobs_changed_safe()
-            # Re-read so the response reflects the post-run last_run_at/last_status.
+            # Re-read so the response reflects the post-claim job state.
             result = _format_job(get_job(job_id) or {"id": job_id})
-            result["executed"] = exec_result.get("claimed", False)
-            result["execution_success"] = exec_result.get("success", False)
+            result["dispatched"] = exec_result.get("dispatched", False)
+            result["execution_pending"] = bool(
+                exec_result.get("claimed") and exec_result.get("dispatched")
+            )
+            # Retain these compatibility fields without pretending an
+            # asynchronous run has already completed successfully.
+            result["executed"] = result["execution_pending"]
+            result["execution_success"] = None if result["execution_pending"] else False
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
-            elif exec_result.get("error"):
+            if exec_result.get("error"):
                 result["execution_error"] = exec_result["error"]
             return json.dumps({"success": True, "job": result}, indent=2)
 
@@ -911,6 +1105,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if category is not None:
+                updates["category"] = category
+            if material_result_criterion is not None:
+                updates["material_result_criterion"] = material_result_criterion
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -951,6 +1149,14 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
+LLM admission policy: every NEW enabled LLM cron (no_agent=false) MUST declare
+category (event | justified_cadence | necessary_as_is) AND a non-empty
+material_result_criterion describing the verifiable outcome that counts.
+Without both, create fails closed. The same rule applies when resuming a paused
+LLM cron that lacks either field — set them via update first. no_agent=true
+script-only jobs are exempt. Existing enabled jobs without these fields are
+grandfathered until paused and reactivated.
+
 NOTE: The agent's final response is auto-delivered to the target. Put the primary
 user-facing content in the final response. Cron jobs run autonomously with no user
 present — they cannot ask questions or request clarification.
@@ -961,7 +1167,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. For LLM jobs (no_agent=false), also declare category and material_result_criterion."
             },
             "job_id": {
                 "type": "string",
@@ -1011,7 +1217,30 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "(c) non-zero exit / timeout sends an error alert so a broken watchdog can't fail silently. "
                     "\n\n"
                     "WHEN TO USE True: recurring script-only pings where the script itself produces the exact message text (memory/disk/GPU watchdogs, threshold alerts, heartbeats, CI notifications, API pollers with a fixed output shape). "
-                    "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
+                    "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content. "
+                    "LLM jobs (False) MUST also declare category + material_result_criterion at create (and before resume if missing)."
+                ),
+            },
+            "category": {
+                "type": "string",
+                "enum": ["event", "justified_cadence", "necessary_as_is"],
+                "description": (
+                    "REQUIRED for new enabled LLM crons (no_agent=false). Admission category: "
+                    "'event' (fires on a discrete event/condition), "
+                    "'justified_cadence' (recurring on a justified schedule), "
+                    "'necessary_as_is' (must run as specified; no thinner alternative). "
+                    "Invalid values fail closed. Exempt when no_agent=true. "
+                    "On update, set this before resume if a paused LLM job is missing it."
+                ),
+            },
+            "material_result_criterion": {
+                "type": "string",
+                "description": (
+                    "REQUIRED for new enabled LLM crons (no_agent=false). Non-empty description of "
+                    "the verifiable material result that counts as success for this job "
+                    "(e.g. 'CRM deal X has a Calendar event with matching deal id'). "
+                    "Empty/missing values fail closed on create and on resume/reactivate. "
+                    "Exempt when no_agent=true. On update, set this before resume if missing."
                 ),
             },
             "context_from": {
@@ -1034,7 +1263,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "workdir": {
                 "type": "string",
-                "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
+                "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Workdir jobs are isolated per task and can run concurrently."
             },
             "attach_to_session": {
                 "type": "boolean",
@@ -1097,6 +1326,8 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        category=args.get("category"),
+        material_result_criterion=args.get("material_result_criterion"),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,

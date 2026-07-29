@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import subprocess
 import threading
 import time
 import types
@@ -71,6 +72,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("execution_profile", props)
+        self.assertIn("execution_profile", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -294,6 +297,134 @@ class TestStripBlockedTools(unittest.TestCase):
 
 
 class TestDelegateTask(unittest.TestCase):
+    @staticmethod
+    def _claude_creds():
+        return {
+            "model": "claude-sonnet-5",
+            "provider": "claude-sdk-local",
+            "base_url": "http://127.0.0.1:4318/v1",
+            "api_key": "local",
+            "api_mode": "chat_completions",
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+
+    def test_local_claude_bridge_missing_execution_profile_fails_before_child_build(self):
+        parent = _make_mock_parent()
+        with (
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=self._claude_creds()),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            result = json.loads(delegate_task(goal="must fail locally", parent_agent=parent))
+
+        self.assertIn("error", result)
+        self.assertIn("execution_profile is required", result["error"])
+        mock_agent.assert_not_called()
+
+    def test_inherited_local_claude_bridge_requires_and_injects_profile(self):
+        parent = _make_mock_parent()
+        parent.provider = "claude-sdk-local"
+        parent.base_url = "http://127.0.0.1:4318/v1"
+        parent.request_overrides = {"service_tier": "standard"}
+        inherited = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+
+        with (
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=inherited),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            missing = json.loads(delegate_task(goal="must fail locally", parent_agent=parent))
+        self.assertIn("execution_profile is required", missing["error"])
+        mock_agent.assert_not_called()
+
+        with (
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=inherited),
+            patch("tools.delegate_tool._run_single_child", return_value={
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            }),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            mock_agent.return_value = MagicMock()
+            result = json.loads(
+                delegate_task(
+                    goal="probe inherited bridge",
+                    execution_profile="probe",
+                    parent_agent=parent,
+                )
+            )
+        self.assertEqual(result["results"][0]["status"], "completed")
+        overrides = mock_agent.call_args.kwargs["request_overrides"]
+        self.assertEqual(overrides["profile"], "probe")
+        self.assertEqual(overrides["service_tier"], "standard")
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_local_claude_bridge_injects_each_explicit_execution_profile(self, mock_run):
+        mock_run.return_value = {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+        }
+        parent = _make_mock_parent()
+        repo = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+        sha = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+        ).strip()
+
+        cases = [
+            ("probe", {}),
+            ("review_bundle", {"project": "delivery-2", "candidate_sha": sha}),
+            (
+                "code",
+                {
+                    "project": "delivery-2",
+                    "candidate_sha": sha,
+                    "cwd": repo,
+                    "skills": ["test-driven-development"],
+                    "rules": ["No deploy"],
+                },
+            ),
+        ]
+        for profile, fields in cases:
+            with self.subTest(profile=profile):
+                with (
+                    patch("tools.delegate_tool._resolve_delegation_credentials", return_value=self._claude_creds()),
+                    patch("run_agent.AIAgent") as mock_agent,
+                ):
+                    mock_agent.return_value = MagicMock()
+                    result = json.loads(
+                        delegate_task(
+                            goal=f"smoke {profile}",
+                            execution_profile=profile,
+                            parent_agent=parent,
+                            **fields,
+                        )
+                    )
+
+                    self.assertEqual(result["results"][0]["status"], "completed")
+                    request_overrides = mock_agent.call_args.kwargs["request_overrides"]
+                    self.assertEqual(request_overrides["profile"], profile)
+                    for key, value in fields.items():
+                        self.assertEqual(request_overrides[key], value)
+
     def test_no_parent_agent(self):
         result = json.loads(delegate_task(goal="test"))
         self.assertIn("error", result)
@@ -2151,6 +2282,302 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+
+class TestChildTaskEnvironmentInheritance(unittest.TestCase):
+    """Delegated children inherit and clean up a cron parent's cwd isolation."""
+
+    def _make_parent_child(self, run_side_effect):
+        parent = _make_mock_parent()
+        parent._current_task_id = "cron-parent-task"
+
+        child = MagicMock()
+        child._subagent_id = "cron-child-task"
+        child.session_id = "different-child-session"
+        child._delegate_depth = 1
+        child._parent_subagent_id = None
+        child._credential_pool = None
+        child.get_activity_summary.return_value = {
+            "current_tool": None,
+            "api_call_count": 1,
+            "max_iterations": 50,
+            "last_activity_desc": "running",
+        }
+        child.run_conversation.side_effect = run_side_effect
+        return parent, child
+
+    def test_child_inherits_parent_override_and_cleans_after_success(self):
+        from tools.delegate_tool import _run_single_child
+        from tools import terminal_tool
+
+        seen = {}
+
+        def _run(**kwargs):
+            task_id = kwargs["task_id"]
+            seen.update(terminal_tool.resolve_task_overrides(task_id))
+            seen["container_id"] = terminal_tool._resolve_container_task_id(task_id)
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        parent, child = self._make_parent_child(_run)
+        terminal_tool.register_task_env_overrides(
+            "cron-parent-task", {"cwd": "/tmp/project-a", "isolate_env": True}
+        )
+        try:
+            result = _run_single_child(0, "child", child, parent)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(seen["cwd"], "/tmp/project-a")
+            self.assertEqual(seen["container_id"], "cron-child-task")
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides("cron-child-task"), {}
+            )
+        finally:
+            terminal_tool.clear_task_env_overrides("cron-child-task")
+            terminal_tool.clear_task_env_overrides("cron-parent-task")
+
+    def test_prepared_child_override_survives_parent_cleanup_before_worker_start(self):
+        from tools.delegate_tool import (
+            _run_single_child,
+            _snapshot_child_task_environment,
+        )
+        from tools import terminal_tool
+
+        seen = {}
+
+        def _run(**kwargs):
+            seen.update(terminal_tool.resolve_task_overrides(kwargs["task_id"]))
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        parent, child = self._make_parent_child(_run)
+        terminal_tool.register_task_env_overrides(
+            "cron-parent-task",
+            {
+                "cwd": "/tmp/project-a",
+                "host_cwd": "/tmp/project-a",
+                "isolate_env": True,
+            },
+        )
+        try:
+            self.assertTrue(_snapshot_child_task_environment(parent, child))
+            # Reproduce cron teardown after background dispatch returns but before
+            # the queued child worker begins.
+            terminal_tool.clear_task_env_overrides("cron-parent-task")
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides("cron-child-task")["cwd"],
+                "/tmp/project-a",
+            )
+
+            result = _run_single_child(0, "child", child, parent)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(seen["cwd"], "/tmp/project-a")
+            self.assertEqual(seen["host_cwd"], "/tmp/project-a")
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides("cron-child-task"), {}
+            )
+        finally:
+            terminal_tool.clear_task_env_overrides("cron-child-task")
+            terminal_tool.clear_task_env_overrides("cron-parent-task")
+
+    def test_child_override_cleans_after_exception(self):
+        from tools.delegate_tool import _run_single_child
+        from tools import terminal_tool
+
+        def _run(**kwargs):
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides(kwargs["task_id"])["cwd"],
+                "/tmp/project-b",
+            )
+            raise RuntimeError("boom")
+
+        parent, child = self._make_parent_child(_run)
+        terminal_tool.register_task_env_overrides(
+            "cron-parent-task", {"cwd": "/tmp/project-b", "isolate_env": True}
+        )
+        try:
+            result = _run_single_child(0, "child", child, parent)
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides("cron-child-task"), {}
+            )
+        finally:
+            terminal_tool.clear_task_env_overrides("cron-child-task")
+            terminal_tool.clear_task_env_overrides("cron-parent-task")
+
+    def test_build_child_agent_uses_subagent_id_as_session_id(self):
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent") as mock_agent_cls:
+            child = MagicMock()
+            child._session_init_model_config = None
+            mock_agent_cls.return_value = child
+            built = _build_child_agent(
+                task_index=0,
+                goal="child",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+            )
+        self.assertIs(built, child)
+        self.assertEqual(
+            mock_agent_cls.call_args.kwargs["session_id"], child._subagent_id
+        )
+
+    def test_child_prompt_and_init_context_prefer_parent_task_workdir(self):
+        import tempfile
+
+        from agent.runtime_cwd import _SESSION_CWD
+        from tools import terminal_tool
+
+        parent = _make_mock_parent()
+        seen = {}
+        with tempfile.TemporaryDirectory() as root:
+            project_a = os.path.join(root, "project-a")
+            project_b = os.path.join(root, "project-b")
+            os.mkdir(project_a)
+            os.mkdir(project_b)
+            parent._current_task_id = "cron-parent-hint"
+            parent.session_cwd = project_b
+            parent.terminal_cwd = project_b
+            parent.cwd = project_b
+            parent._subdirectory_hints.working_dir = project_b
+            terminal_tool.register_task_env_overrides(
+                "cron-parent-hint", {"cwd": project_a, "isolate_env": True}
+            )
+
+            def _capture_agent(**kwargs):
+                seen["context_cwd"] = _SESSION_CWD.get()
+                seen["kwargs"] = kwargs
+                child = MagicMock()
+                child._session_init_model_config = None
+                return child
+
+            try:
+                with patch.dict(os.environ, {"TERMINAL_CWD": project_b}):
+                    with patch("run_agent.AIAgent", side_effect=_capture_agent):
+                        child = _build_child_agent(
+                            task_index=0,
+                            goal="child",
+                            context=None,
+                            toolsets=None,
+                            model=None,
+                            max_iterations=10,
+                            task_count=1,
+                            parent_agent=parent,
+                        )
+                self.assertEqual(seen["context_cwd"], project_a)
+                self.assertEqual(getattr(child, "session_cwd", None), project_a)
+                prompt = seen["kwargs"]["ephemeral_system_prompt"]
+                self.assertIn(f"WORKSPACE PATH:\n{project_a}", prompt)
+                self.assertNotIn(f"WORKSPACE PATH:\n{project_b}", prompt)
+            finally:
+                terminal_tool.clear_task_env_overrides("cron-parent-hint")
+
+    def test_child_worker_pins_runtime_cwd_for_codex(self):
+        import tempfile
+
+        from agent.runtime_cwd import _SESSION_CWD, resolve_agent_cwd
+        from tools.delegate_tool import _run_single_child
+        from tools import terminal_tool
+
+        seen = {}
+        with tempfile.TemporaryDirectory() as cwd:
+            def _run(**_kwargs):
+                seen["context_cwd"] = _SESSION_CWD.get()
+                seen["resolved_cwd"] = str(resolve_agent_cwd())
+                seen["agent_cwd"] = child.session_cwd
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            parent, child = self._make_parent_child(_run)
+            child.api_mode = "codex_app_server"
+            terminal_tool.register_task_env_overrides(
+                "cron-parent-task", {"cwd": cwd, "isolate_env": True}
+            )
+            try:
+                result = _run_single_child(0, "child", child, parent)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(seen["context_cwd"], cwd)
+                self.assertEqual(seen["resolved_cwd"], cwd)
+                self.assertEqual(seen["agent_cwd"], cwd)
+            finally:
+                terminal_tool.clear_task_env_overrides("cron-child-task")
+                terminal_tool.clear_task_env_overrides("cron-parent-task")
+
+    def test_timeout_keeps_override_until_worker_exits_then_cleans(self):
+        from tools.delegate_tool import _run_single_child
+        from tools import terminal_tool
+
+        entered = threading.Event()
+        release = threading.Event()
+        late_env = MagicMock()
+
+        def _run(**kwargs):
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides(kwargs["task_id"])["cwd"],
+                "/tmp/project-c",
+            )
+            entered.set()
+            release.wait(timeout=2)
+            with terminal_tool._env_lock:
+                terminal_tool._active_environments[kwargs["task_id"]] = late_env
+            return {
+                "final_response": "late",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        parent, child = self._make_parent_child(_run)
+        terminal_tool.register_task_env_overrides(
+            "cron-parent-task", {"cwd": "/tmp/project-c", "isolate_env": True}
+        )
+        try:
+            with patch("tools.delegate_tool._get_child_timeout", return_value=0.05):
+                result = _run_single_child(0, "child", child, parent)
+            self.assertEqual(result["status"], "timeout")
+            self.assertTrue(entered.is_set())
+            # The abandoned worker may still issue tool calls, so its inherited
+            # cwd must remain registered until the future actually finishes.
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides("cron-child-task")["cwd"],
+                "/tmp/project-c",
+            )
+            child.close.assert_not_called()
+            release.set()
+            deadline = time.monotonic() + 2
+            while (
+                terminal_tool.resolve_task_overrides("cron-child-task")
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                terminal_tool.resolve_task_overrides("cron-child-task"), {}
+            )
+            child.close.assert_called_once()
+            late_env.cleanup.assert_called_once()
+        finally:
+            release.set()
+            terminal_tool.clear_task_env_overrides("cron-child-task")
+            terminal_tool.clear_task_env_overrides("cron-parent-task")
 
 
 class TestDelegateHeartbeat(unittest.TestCase):

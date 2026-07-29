@@ -136,3 +136,17 @@ class TestSessionCwdOverride:
             assert resolve_agent_cwd() == tmp_path
         finally:
             rt._SESSION_CWD.reset(token)
+
+    def test_agent_subdirectory_tracker_root_uses_session_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.agent_init import _resolve_subdirectory_hint_working_dir
+
+        other = tmp_path / "cron-project"
+        other.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        token = set_session_cwd(str(other))
+        try:
+            assert _resolve_subdirectory_hint_working_dir() == str(other)
+        finally:
+            rt._SESSION_CWD.reset(token)

@@ -322,14 +322,22 @@ def test_dry_run_skips_snapshot(backup_env, monkeypatch):
 
 
 def _write_cron_jobs(home: Path, jobs: list) -> Path:
-    """Write a synthetic cron/jobs.json under HERMES_HOME. Returns the path.
-    Mirrors cron.jobs.save_jobs() wrapper shape: `{"jobs": [...], "updated_at": ...}`.
-    """
+    """Write policy-valid synthetic cron/jobs.json under HERMES_HOME."""
+    normalized = []
+    for job in jobs:
+        record = dict(job)
+        if not record.get("no_agent") and record.get("enabled", True) is not False:
+            record.setdefault("category", "necessary_as_is")
+            record.setdefault(
+                "material_result_criterion",
+                "The curator rollback preserves the expected cron skill links",
+            )
+        normalized.append(record)
     cron_dir = home / "cron"
     cron_dir.mkdir(parents=True, exist_ok=True)
     path = cron_dir / "jobs.json"
     path.write_text(
-        json.dumps({"jobs": jobs, "updated_at": "2026-05-01T00:00:00Z"}, indent=2),
+        json.dumps({"jobs": normalized, "updated_at": "2026-05-01T00:00:00Z"}, indent=2),
         encoding="utf-8",
     )
     return path
@@ -435,8 +443,14 @@ def test_rollback_restores_cron_skill_links(backup_env):
     _write_skill(backup_env["skills"], "umbrella")
 
     cj = _reload_cron_jobs(home)
-    cj.create_job(name="weekly", prompt="p", schedule="every 7d",
-                  skills=["alpha", "beta"])
+    cj.create_job(
+        name="weekly",
+        prompt="p",
+        schedule="every 7d",
+        skills=["alpha", "beta"],
+        category="necessary_as_is",
+        material_result_criterion="verify curator rollback restores cron skill links",
+    )
 
     snap = cb.snapshot_skills(reason="pre-curator-run")
     assert snap is not None
@@ -542,8 +556,14 @@ def test_rollback_leaves_new_jobs_untouched(backup_env):
 
     cj = _reload_cron_jobs(home)
     jobs = cj.load_jobs()
-    jobs.append({"id": "new-after-snapshot", "name": "new",
-                 "schedule": "every 15m", "skills": ["brand-new-skill"]})
+    jobs.append({
+        "id": "new-after-snapshot",
+        "name": "new",
+        "schedule": "every 15m",
+        "skills": ["brand-new-skill"],
+        "category": "necessary_as_is",
+        "material_result_criterion": "The new cron remains unchanged by rollback",
+    })
     cj.save_jobs(jobs)
 
     ok, _, _ = cb.rollback(backup_id=snap.name)

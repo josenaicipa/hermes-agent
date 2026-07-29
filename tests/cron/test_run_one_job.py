@@ -31,7 +31,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, **_kwargs):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -44,9 +44,13 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
 def test_tick_process_job_sequence(monkeypatch):
     """Characterization: a single due job driven through tick() runs the
     sequence run_job → save → deliver → mark, in that order."""
+    from tests.cron.tick_claim_helpers import install_successful_tick_fire_claims
+
     calls = _patch_pipeline(monkeypatch)
-    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j1", "name": "t"}])
+    due = [{"id": "j1", "name": "t"}]
+    monkeypatch.setattr(s, "get_due_jobs", lambda: due)
     monkeypatch.setattr(s, "advance_next_run", lambda jid: True)
+    install_successful_tick_fire_claims(monkeypatch, due, sched=s)
 
     s.tick(verbose=False, sync=True)
 
@@ -423,3 +427,90 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     assert ok is False
     assert "deliver" not in order
     assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_legacy_mark_none_still_success(monkeypatch):
+    """No fire_claim: mark returning None must not be treated as lease loss.
+
+    Legacy scheduled paths omit expected_fire_claim_owner. Older mocks often
+    return None (void). run_one_job must still report True on a normal body
+    completion — only an explicit False *with* an expected owner is abort.
+    """
+    calls = _patch_pipeline(monkeypatch)
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, **_kwargs):
+        calls.append(("mark", jid, ok))
+        return None  # legacy mock / void-style mark
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+
+    ok = s.run_one_job({"id": "j-legacy-none", "name": "t"})
+
+    assert ok is True
+    assert ("mark", "j-legacy-none", True) in calls
+
+
+def test_run_one_job_legacy_mark_false_still_success(monkeypatch):
+    """No fire_claim: mark returning False is not ownership-lost abort."""
+    calls = _patch_pipeline(monkeypatch)
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, **_kwargs):
+        calls.append(("mark", jid, ok))
+        return False
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+
+    ok = s.run_one_job({"id": "j-legacy-false", "name": "t"})
+
+    assert ok is True
+    assert ("mark", "j-legacy-false", True) in calls
+
+
+def test_run_one_job_owned_mark_false_aborts(monkeypatch):
+    """With fire_claim owner, mark returning False aborts (False, no leak)."""
+    calls = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        calls.append("run_job")
+        return (True, "out", "[SILENT]", None)
+
+    def fake_save(jid, out):
+        calls.append("save")
+        return f"/tmp/{jid}.txt"
+
+    def fake_deliver(*_a, **_k):
+        calls.append("deliver")
+        return None
+
+    mark_returns = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, **kwargs):
+        calls.append(("mark", jid, ok, kwargs.get("expected_fire_claim_owner")))
+        # First (success) mark rejects; ownership-lost handler may mark again.
+        mark_returns.append(False)
+        return False
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", fake_save)
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    # Preflight/heartbeat must succeed so the body reaches the final mark.
+    monkeypatch.setattr(s, "heartbeat_fire_claim", lambda *a, **k: True)
+    monkeypatch.setattr(s, "_RUN_CLAIM_HEARTBEAT_SECONDS", 60.0)
+
+    job = {
+        "id": "j-owned-reject",
+        "name": "t",
+        "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner-a"},
+    }
+    try:
+        ok = s.run_one_job(job)
+    except Exception as exc:  # pragma: no cover - must not leak
+        raise AssertionError(f"run_one_job leaked: {exc!r}") from exc
+
+    assert ok is False
+    assert "deliver" not in calls
+    assert any(
+        c[0] == "mark" and c[3] == "owner-a" for c in calls if isinstance(c, tuple)
+    )
+    assert mark_returns  # at least one rejected mark

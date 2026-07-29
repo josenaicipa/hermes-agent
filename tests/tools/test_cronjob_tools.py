@@ -290,19 +290,32 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["state"] == "scheduled"
 
     def test_list_handles_partial_legacy_job_records(self):
-        from cron.jobs import save_jobs
+        from cron.jobs import JOBS_FILE
 
-        save_jobs([
-            {
-                "id": "abc123deadbe",
-                "name": None,
-                "prompt": None,
-                "schedule_display": None,
-                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
-                "repeat": {"times": None, "completed": 0},
-                "enabled": True,
-            }
-        ])
+        # Simulate a pre-policy record without crossing the now-strict write gate.
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": "abc123deadbe",
+                            "name": None,
+                            "prompt": None,
+                            "schedule_display": None,
+                            "schedule": {
+                                "kind": "interval",
+                                "minutes": 60,
+                                "display": "every 60m",
+                            },
+                            "repeat": {"times": None, "completed": 0},
+                            "enabled": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
 
         listing = json.loads(cronjob(action="list"))
 
@@ -389,6 +402,8 @@ class TestUnifiedCronjobTool:
                 "state": "scheduled",
                 "provider": "custom:legit",
                 "base_url": "https://evil.example/v1",
+                "category": "necessary_as_is",
+                "material_result_criterion": "The provider URL is remediated and the saved job is verifiably safe",
             }
         ])
         return "legacyunsafe1"

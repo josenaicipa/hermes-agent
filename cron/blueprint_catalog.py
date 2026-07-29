@@ -81,7 +81,13 @@ class BlueprintSlot:
 
 @dataclass(frozen=True)
 class AutomationBlueprint:
-    """A parameterized automation blueprint."""
+    """A parameterized automation blueprint.
+
+    ``category`` is the free-form display taxonomy used in the catalog UI.
+    ``admission_category`` and ``material_result_criterion`` are the LLM
+    admission declarations passed unchanged to ``create_job`` — required,
+    with no defaults or runtime inference.
+    """
 
     key: str
     title: str
@@ -93,6 +99,9 @@ class AutomationBlueprint:
     schedule_template: str
     # Seed instruction for the agent / the cron job prompt; may contain {slot}s.
     prompt_template: str
+    # LLM admission declarations (required; no defaults).
+    admission_category: str
+    material_result_criterion: str
     slots: List[BlueprintSlot] = field(default_factory=list)
     deliver_default: str = "origin"
     skills: tuple = ()        # skills the job loads before running
@@ -131,6 +140,8 @@ CATALOG: List[AutomationBlueprint] = [
             "scannable. If no data sources are connected, give a brief "
             "good-morning with the date and offer to connect calendar/email."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="archivo_entregado",
         slots=[_TIME("08:00"), _DELIVER],
         tags=("daily", "briefing"),
     ),
@@ -148,6 +159,8 @@ CATALOG: List[AutomationBlueprint] = [
             "respond with [SILENT]. Requires a connected mail source; if none is "
             "configured, explain how to connect one and stop."
         ),
+        admission_category="event",
+        material_result_criterion="alerta_accionable",
         slots=[
             BlueprintSlot(
                 name="interval_min", type="enum", label="How often?",
@@ -176,6 +189,8 @@ CATALOG: List[AutomationBlueprint] = [
             "week, still-open items, and next week's calendar. Pull from "
             "connected sources. Keep it tight."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="archivo_entregado",
         slots=[
             _TIME("18:00"),
             BlueprintSlot(
@@ -198,6 +213,8 @@ CATALOG: List[AutomationBlueprint] = [
             "and the 1-3 highest-priority things to focus on, inferred from "
             "recent context and any task tools. Encouraging, short, one message."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[_TIME("09:00"), _DELIVER],
         tags=("daily", "focus"),
     ),
@@ -208,6 +225,8 @@ CATALOG: List[AutomationBlueprint] = [
         category="general",
         schedule_template="{minute} {hour} * * {dow}",
         prompt_template="Remind the user: {what}",
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[
             BlueprintSlot(name="what", type="text", label="Remind me to…",
                        default="take a break and stretch"),
@@ -235,6 +254,8 @@ CATALOG: List[AutomationBlueprint] = [
             "calendar is connected, just offer a friendly sign-off and the "
             "weather for tomorrow."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[_TIME("21:00"), _DELIVER],
         tags=("daily", "evening"),
     ),
@@ -252,6 +273,8 @@ CATALOG: List[AutomationBlueprint] = [
             "{count} bullets, each one line with a link. If nothing new since "
             "last run, respond with [SILENT]."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="archivo_entregado",
         slots=[
             BlueprintSlot(
                 name="topic", type="text", label="What topic?",
@@ -284,6 +307,8 @@ CATALOG: List[AutomationBlueprint] = [
             "Phrase it as an actionable heads-up (e.g. 'review or cancel before "
             "it renews'), not just a notification. One short message."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[
             BlueprintSlot(
                 name="what", type="text", label="What's due?",
@@ -311,6 +336,8 @@ CATALOG: List[AutomationBlueprint] = [
             "today, keep it warm and non-judgmental, and offer a one-line word "
             "of encouragement. One short message."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[
             BlueprintSlot(
                 name="habit", type="text", label="Which habit?",
@@ -341,6 +368,8 @@ CATALOG: List[AutomationBlueprint] = [
             "up, and stretch for a moment. Vary the wording each time so it "
             "doesn't feel robotic. One short line."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[
             BlueprintSlot(
                 name="interval_hours", type="enum", label="How often?",
@@ -374,6 +403,8 @@ CATALOG: List[AutomationBlueprint] = [
             "Include a consolidated grocery list grouped by aisle. Keep blueprints "
             "simple and skimmable."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="archivo_entregado",
         slots=[
             BlueprintSlot(
                 name="diet", type="enum", label="Diet?",
@@ -413,6 +444,8 @@ CATALOG: List[AutomationBlueprint] = [
             "a couple of short paragraphs with one concrete example, and end "
             "with a single question to check understanding."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="archivo_entregado",
         slots=[
             BlueprintSlot(
                 name="topic", type="text", label="Learn about…",
@@ -441,6 +474,8 @@ CATALOG: List[AutomationBlueprint] = [
             "are grateful for, and one small win. If they reply, acknowledge it "
             "kindly. One message."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="alerta_accionable",
         slots=[
             _TIME("21:30"),
             BlueprintSlot(
@@ -464,6 +499,8 @@ CATALOG: List[AutomationBlueprint] = [
             "short, surprising, and genuinely interesting. One or two sentences, "
             "no filler."
         ),
+        admission_category="justified_cadence",
+        material_result_criterion="archivo_entregado",
         slots=[
             BlueprintSlot(
                 name="flavor", type="enum", label="What kind?",
@@ -496,6 +533,8 @@ def blueprint_form_schema(blueprint: AutomationBlueprint) -> Dict[str, Any]:
         "title": blueprint.title,
         "description": blueprint.description,
         "category": blueprint.category,
+        "admissionCategory": blueprint.admission_category,
+        "materialResultCriterion": blueprint.material_result_criterion,
         "tags": list(blueprint.tags),
         "fields": [
             {
@@ -705,6 +744,9 @@ def fill_blueprint(
         "schedule": schedule,
         "name": blueprint.title,
         "deliver": resolved.get("deliver", blueprint.deliver_default),
+        # Admission declarations are catalog-authored and passed unchanged.
+        "category": blueprint.admission_category,
+        "material_result_criterion": blueprint.material_result_criterion,
     }
     if blueprint.skills:
         spec["skills"] = list(blueprint.skills)

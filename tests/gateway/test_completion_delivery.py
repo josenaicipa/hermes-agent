@@ -308,10 +308,17 @@ def test_midflight_compression_rotation_stays_pending_for_retry(
     assert restored.get_nowait()["delegation_id"] == event["delegation_id"]
 
 
-def test_retry_attempts_are_capped_to_a_terminal_drop(
+def test_retry_attempts_are_capped_to_a_terminal_fail(
     monkeypatch, isolated_registry,
 ):
-    """Endless claim/release churn converges to a terminal 'dropped' state."""
+    """Endless claim/release churn converges to a terminal 'failed-terminal' state.
+
+    ``_MAX_DELIVERY_ATTEMPTS`` was raised from 8 to 25 and the exhausted-retry
+    terminal state renamed from 'dropped' to 'failed-terminal' (see
+    tools/async_delegation.py's terminal-fail-after-25-attempts fix and its
+    tests/tools/test_async_delegation.py coverage). 'dropped' is now reserved
+    for drop_completion_delivery's distinct "target permanently gone" path.
+    """
     from tools import async_delegation
 
     event = _async_event("deleg_attempt_cap")
@@ -338,7 +345,7 @@ def test_retry_attempts_are_capped_to_a_terminal_drop(
     adapter.handle_message.assert_not_awaited()
     durable = async_delegation.get_durable_delegation(event["delegation_id"])
     assert durable is not None
-    assert durable["delivery_state"] == "dropped"
+    assert durable["delivery_state"] == "failed-terminal"
     assert durable["delivery_attempts"] <= async_delegation._MAX_DELIVERY_ATTEMPTS
     restored = queue.Queue()
     assert async_delegation.restore_undelivered_completions(restored) == 0

@@ -36,6 +36,19 @@ def hermes_env(tmp_path, monkeypatch):
     import cron.scheduler
     importlib.reload(cron.scheduler)
 
+    # The reload above replaces cron.jobs.create_job with a fresh, unwrapped
+    # function object, discarding the LLM-admission test-defaults wrapper the
+    # autouse fixture (tests/conftest.py::_cron_llm_admission_test_defaults)
+    # installed before this fixture ran. Re-apply it so legacy calls in this
+    # file that predate category/material_result_criterion keep working.
+    from tests.fixtures.cron_llm_admission import (
+        wrap_create_job_with_test_admission_defaults,
+    )
+    monkeypatch.setattr(
+        cron.jobs, "create_job",
+        wrap_create_job_with_test_admission_defaults(cron.jobs.create_job),
+    )
+
     return home
 
 
@@ -84,7 +97,14 @@ def test_update_job_roundtrips_no_agent_flag(hermes_env):
     script_path.write_text("echo hi\n")
     job = create_job(prompt=None, schedule="every 5m", script="w.sh", no_agent=True, deliver="local")
 
-    update_job(job["id"], {"no_agent": False})
+    # Flipping no_agent off turns this into an LLM-invoking job, which must
+    # declare admission fields at that transition (script-only creation was
+    # exempt, so the job has none yet).
+    update_job(job["id"], {
+        "no_agent": False,
+        "category": "necessary_as_is",
+        "material_result_criterion": "test material result criterion",
+    })
     reloaded = get_job(job["id"])
     assert reloaded["no_agent"] is False
 
@@ -145,7 +165,11 @@ def test_cronjob_tool_update_toggles_no_agent(hermes_env):
     )
     job_id = created["job_id"]
 
-    off = json.loads(cronjob(action="update", job_id=job_id, no_agent=False, prompt="run"))
+    off = json.loads(cronjob(
+        action="update", job_id=job_id, no_agent=False, prompt="run",
+        category="necessary_as_is",
+        material_result_criterion="test material result criterion",
+    ))
     assert off["success"] is True
     assert off["job"].get("no_agent") in {False, None}
 

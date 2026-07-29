@@ -91,6 +91,10 @@ deepseek = DeepSeekProfile(
     display_name="DeepSeek",
     description="DeepSeek — native DeepSeek API",
     signup_url="https://platform.deepseek.com/",
+    # V4 listed first: DeepSeek retires the deepseek-chat/deepseek-reasoner
+    # ids on 2026-07-24 (actualidad-ai 2026-07-05 daily report). Legacy ids
+    # stay in the list so explicit selection and cost tracking for existing
+    # calls keep working until that date.
     fallback_models=(
         "deepseek-v4-pro",
         "deepseek-v4-flash",

@@ -328,6 +328,40 @@ class ChatCompletionsTransport(ProviderTransport):
             anthropic_max_output: int | None
             extra_body_additions: dict | None
         """
+        # Fail before the OpenAI client is invoked when a caller targets the
+        # local Claude Agent SDK bridge without a complete execution envelope.
+        # delegate_task validates earlier (before sa-* construction); this
+        # transport guard covers every equivalent chat-completions dispatcher.
+        from agent.claude_execution_profiles import require_claude_execution_profile
+
+        canonical_execution = require_claude_execution_profile(
+            base_url=params.get("base_url"),
+            request_overrides=params.get("request_overrides"),
+        )
+        if canonical_execution:
+            overrides = dict(params.get("request_overrides") or {})
+            # The OpenAI Python SDK rejects arbitrary keyword arguments such
+            # as ``profile``. ``extra_body`` is its supported escape hatch:
+            # those fields are merged into the top-level JSON request body,
+            # which is exactly what the Claude bridge validates.
+            for key in (
+                "execution_profile",
+                "profile",
+                "project",
+                "candidate_sha",
+                "cwd",
+                "skills",
+                "rules",
+            ):
+                overrides.pop(key, None)
+            existing_extra_body = overrides.get("extra_body") or {}
+            if not isinstance(existing_extra_body, dict):
+                raise ValueError("request_overrides.extra_body must be an object")
+            extra_body = dict(existing_extra_body)
+            extra_body.update(canonical_execution)
+            overrides["extra_body"] = extra_body
+            params["request_overrides"] = overrides
+
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.

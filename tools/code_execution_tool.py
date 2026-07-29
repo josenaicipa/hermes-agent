@@ -710,7 +710,8 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
+        _creation_locks, _creation_locks_lock,
+        resolve_task_environment_paths, resolve_task_overrides,
         _resolve_container_task_id,
     )
 
@@ -736,7 +737,7 @@ def _get_or_create_env(task_id: str):
 
         config = _get_env_config()
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = resolve_task_overrides(task_id)
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -749,7 +750,7 @@ def _get_or_create_env(task_id: str):
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        cwd, host_cwd = resolve_task_environment_paths(task_id, config)
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona"}:
@@ -759,6 +760,10 @@ def _get_or_create_env(task_id: str):
                 "container_disk": config.get("container_disk", 51200),
                 "container_persistent": config.get("container_persistent", True),
                 "docker_volumes": config.get("docker_volumes", []),
+                "docker_mount_cwd_to_workspace": config.get(
+                    "docker_mount_cwd_to_workspace", False
+                ),
+                "docker_forward_env": config.get("docker_forward_env", []),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_network": config.get("docker_network", True),
             }
@@ -790,7 +795,7 @@ def _get_or_create_env(task_id: str):
             container_config=container_config,
             local_config=local_config,
             task_id=effective_task_id,
-            host_cwd=config.get("host_cwd"),
+            host_cwd=host_cwd,
         )
 
         with _env_lock:

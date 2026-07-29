@@ -14,6 +14,7 @@ from gateway.channel_directory import (
     format_directory_for_display,
     load_directory,
     _apply_channel_aliases,
+    _build_discord,
     _build_from_sessions,
     _build_slack,
     _slack_directory_warning_last,
@@ -66,6 +67,24 @@ class TestLoadDirectory:
 
 
 class TestBuildChannelDirectoryWrites:
+    def test_discord_rows_include_stable_guild_id(self, monkeypatch):
+        channel = SimpleNamespace(id=222, name="context-fabric")
+        guild = SimpleNamespace(id=111, name="Current Guild", text_channels=[channel], forum_channels=[])
+        adapter = SimpleNamespace(_client=SimpleNamespace(guilds=[guild]))
+        monkeypatch.setattr("gateway.channel_directory._build_from_sessions", lambda platform: [])
+
+        rows = _build_discord(adapter)
+
+        assert rows == [
+            {
+                "id": "222",
+                "name": "context-fabric",
+                "guild": "Current Guild",
+                "guild_id": "111",
+                "type": "channel",
+            }
+        ]
+
     def test_failed_write_preserves_previous_cache(self, tmp_path, monkeypatch):
         cache_file = _write_directory(tmp_path, {
             "telegram": [{"id": "123", "name": "Alice", "type": "dm"}]

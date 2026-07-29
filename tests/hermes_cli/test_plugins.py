@@ -2393,8 +2393,15 @@ class TestDispatchToolWithoutCliRef:
         registry.register(
             name="_test_dispatch_probe",
             toolset="debugging",
+            # "x" must be declared in properties: registry.dispatch() runs
+            # strip_unrecognized_tool_args() on every call (model_tools.py),
+            # dropping any top-level key the schema doesn't declare before the
+            # handler ever sees it. This test is about the no-cli_ref dispatch
+            # path, not the schema guard, so declare the arg used below.
             schema={"name": "_test_dispatch_probe", "description": "probe",
-                    "parameters": {"type": "object", "properties": {}}},
+                    "parameters": {"type": "object", "properties": {
+                        "x": {"type": "integer"},
+                    }}},
             handler=lambda args, **kw: calls.append((args, kw)) or '{"ok": true}',
         )
         try:

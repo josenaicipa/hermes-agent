@@ -78,11 +78,15 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
-# A pending completion whose delivery keeps failing is retried across claim
-# cycles (and across restarts via restore_undelivered_completions). Cap the
-# attempts so an unroutable row converges to a terminal 'dropped' state
-# instead of replaying on every restart forever.
-_MAX_DELIVERY_ATTEMPTS = 8
+# Max destination-delivery claims before a pending completion is terminal-failed.
+# The claim that increments attempts to this cap may still complete as delivered;
+# only a subsequent failed release (or an exhausted row with no active/fresh claim
+# on restore/claim) transitions delivery_state to 'failed-terminal'. Task outcome
+# state is untouched.
+_MAX_DELIVERY_ATTEMPTS = 25
+# Existing delivery-claim exclusivity window (seconds). Fresh claims within this
+# window block re-claim and protect the 25th attempt from terminal-fail.
+_DELIVERY_CLAIM_STALE_SECONDS = 300
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -341,6 +345,30 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
+def _fail_terminal_exhausted_pending(conn: sqlite3.Connection, now: float) -> None:
+    """Mark exhausted pending rows without an active/fresh claim as failed-terminal.
+
+    Only terminal-fails when ``delivery_attempts >= _MAX_DELIVERY_ATTEMPTS`` AND
+    the claim is absent/incomplete or older than ``_DELIVERY_CLAIM_STALE_SECONDS``.
+    A legitimate 25th claim that is still fresh must remain ``pending`` so its
+    owner can complete as ``delivered``.
+
+    Does NOT mutate task outcome ``state`` — only ``delivery_state`` and claim
+    columns. Caller must already hold ``_DB_LOCK``.
+    """
+    stale_before = now - _DELIVERY_CLAIM_STALE_SECONDS
+    conn.execute(
+        """UPDATE async_delegations
+           SET delivery_state='failed-terminal', updated_at=?,
+               delivery_claim=NULL, delivery_claimed_at=NULL
+           WHERE delivery_state='pending' AND delivery_attempts >= ?
+             AND (delivery_claim IS NULL
+                  OR delivery_claimed_at IS NULL
+                  OR delivery_claimed_at < ?)""",
+        (now, _MAX_DELIVERY_ATTEMPTS, stale_before),
+    )
+
+
 def restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
 
@@ -352,13 +380,24 @@ def restore_undelivered_completions(target_queue) -> int:
     leave them queued for a consumer that can positively prove ownership,
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
+
+    Pending rows already at ``_MAX_DELIVERY_ATTEMPTS`` without an active/fresh
+    claim are terminal-failed before enqueue. Rows holding a fresh claim are
+    neither terminal-failed nor re-enqueued (their owner may still complete).
     """
     recover_abandoned_delegations()
     with _DB_LOCK, _transaction() as conn:
+        now = time.time()
+        stale_before = now - _DELIVERY_CLAIM_STALE_SECONDS
+        _fail_terminal_exhausted_pending(conn, now)
         rows = conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
-               ORDER BY completed_at, delegation_id"""
+                 AND (delivery_claim IS NULL
+                      OR delivery_claimed_at IS NULL
+                      OR delivery_claimed_at < ?)
+               ORDER BY completed_at, delegation_id""",
+            (stale_before,),
         ).fetchall()
         for _delegation_id, payload in rows:
             evt = json.loads(payload)
@@ -369,20 +408,32 @@ def restore_undelivered_completions(target_queue) -> int:
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
-    """Atomically acknowledge successful injection of a durable completion."""
+    """Atomically acknowledge successful injection of a durable completion.
+
+    Only ``pending`` rows may transition to ``delivered``. Terminal delivery
+    states (``delivered``, ``failed-terminal``) are immutable.
+    """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-               WHERE delegation_id=? AND delivery_state!='delivered'""",
+               WHERE delegation_id=? AND delivery_state='pending'""",
             (now, now, delegation_id),
         )
         return cur.rowcount == 1
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Claim one pending completion across competing consumers/processes."""
+    """Claim one pending completion across competing consumers/processes.
+
+    A successful claim that increments attempts from N-1 to N remains
+    ``pending`` and may still complete as ``delivered``. Pending rows already
+    at ``_MAX_DELIVERY_ATTEMPTS`` cannot be re-claimed: if their claim is
+    absent/incomplete/stale they move to ``failed-terminal``; if a fresh claim
+    is still held the competitor loses and the original owner may complete.
+    """
     now = time.time()
+    stale_before = now - _DELIVERY_CLAIM_STALE_SECONDS
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
@@ -390,14 +441,34 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        if row[0] != "pending":
+            return False
+        # Atomic claim: only below the cap, and only if free or stale.
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
-                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+                 AND delivery_attempts < ?
+                 AND (delivery_claim IS NULL
+                      OR delivery_claimed_at IS NULL
+                      OR delivery_claimed_at < ?)""",
+            (claim_id, now, now, delegation_id, _MAX_DELIVERY_ATTEMPTS, stale_before),
         )
-        return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return True
+        # Exhausted without a fresh claim → terminal-fail (defensive WHERE).
+        conn.execute(
+            """UPDATE async_delegations
+               SET delivery_state='failed-terminal', updated_at=?,
+                   delivery_claim=NULL, delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_attempts >= ?
+                 AND (delivery_claim IS NULL
+                      OR delivery_claimed_at IS NULL
+                      OR delivery_claimed_at < ?)""",
+            (now, delegation_id, _MAX_DELIVERY_ATTEMPTS, stale_before),
+        )
+        return False
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
@@ -414,36 +485,39 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Release a failed delivery claim so another consumer may retry.
 
-    Attempts are counted at claim time, so a row that keeps being claimed and
-    released has burned real delivery attempts. Once the budget is exhausted
-    the row converges to a terminal ``dropped`` state instead of returning to
-    ``pending`` — otherwise an undeliverable completion replays on every
-    gateway restart forever (restore_undelivered_completions only restores
-    pending rows).
+    If the released claim already reached ``_MAX_DELIVERY_ATTEMPTS``, the row
+    transitions atomically to ``failed-terminal`` with claim columns cleared.
+    Terminal delivery states are immutable.
     """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        capped = conn.execute(
-            """UPDATE async_delegations SET delivery_state='dropped',
-                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=? AND delivery_attempts>=?""",
-            (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
-        )
-        if capped.rowcount == 1:
-            logger.warning(
-                "Async delegation %s exhausted its %d delivery attempts; "
-                "marking terminally dropped (result remains queryable).",
-                delegation_id, _MAX_DELIVERY_ATTEMPTS,
+        row = conn.execute(
+            """SELECT delivery_state, delivery_attempts, delivery_claim
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        delivery_state, attempts, held_claim = row[0], int(row[1] or 0), row[2]
+        if delivery_state != "pending" or held_claim != claim_id:
+            return False
+        if attempts >= _MAX_DELIVERY_ATTEMPTS:
+            cur = conn.execute(
+                """UPDATE async_delegations
+                   SET delivery_state='failed-terminal', updated_at=?,
+                       delivery_claim=NULL, delivery_claimed_at=NULL
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND delivery_claim=? AND delivery_attempts >= ?""",
+                (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
             )
-            return True
-        cur = conn.execute(
-            """UPDATE async_delegations SET delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
-                 AND delivery_claim=?""",
-            (now, delegation_id, claim_id),
-        )
+        else:
+            cur = conn.execute(
+                """UPDATE async_delegations SET delivery_claim=NULL,
+                          delivery_claimed_at=NULL, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND delivery_claim=?""",
+                (now, delegation_id, claim_id),
+            )
         return cur.rowcount == 1
 
 

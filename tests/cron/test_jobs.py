@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import os
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,62 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+from tests.fixtures.cron_llm_admission import LEGACY_TEST_LLM_ADMISSION
+
+
+def _enrich_job_with_test_admission(job):
+    """Fill mandatory LLM admission fields on incomplete enabled seed records.
+
+    Production ``save_jobs`` rejects new incomplete enabled LLM crons. Legacy
+    unit tests seed hand-built job dicts without those fields; this helper is
+    test-only and never weakens the production gate.
+    """
+    if not isinstance(job, dict):
+        return job
+    if bool(job.get("no_agent")):
+        return job
+    # Treat missing enabled as True to match store semantics.
+    if job.get("enabled", True) is False:
+        return job
+    state = str(job.get("state") or "").strip()
+    if state == "paused":
+        return job
+    cat = job.get("category", None)
+    crit = job.get("material_result_criterion", None)
+    if cat is not None and crit is not None:
+        return job
+    enriched = dict(job)
+    if cat is None:
+        enriched["category"] = LEGACY_TEST_LLM_ADMISSION["category"]
+    if crit is None:
+        enriched["material_result_criterion"] = LEGACY_TEST_LLM_ADMISSION[
+            "material_result_criterion"
+        ]
+    return enriched
+
+
+@pytest.fixture(autouse=True)
+def _save_jobs_admission_test_defaults(monkeypatch):
+    """Inject admission defaults into save_jobs seeds for this legacy suite.
+
+    Mirrors the create_job test-only defaults in tests/conftest.py. The focused
+    admission suite (test_llm_admission_policy.py) exercises the real gate
+    without this wrapper.
+    """
+    import cron.jobs as jobs_mod
+
+    real_save = jobs_mod.save_jobs
+
+    def save_jobs_with_test_admission_defaults(jobs):
+        if isinstance(jobs, list):
+            jobs = [_enrich_job_with_test_admission(j) for j in jobs]
+        return real_save(jobs)
+
+    monkeypatch.setattr(jobs_mod, "save_jobs", save_jobs_with_test_admission_defaults)
+    monkeypatch.setattr(
+        "tests.cron.test_jobs.save_jobs", save_jobs_with_test_admission_defaults
+    )
+    yield
 
 
 # =========================================================================
@@ -2185,8 +2242,13 @@ class TestJobsJsonUtf8Bom:
 
         assert load_jobs() == []
 
-    def test_load_jobs_bom_plus_bare_list_auto_repairs(self, tmp_cron_dir):
-        """BOM + bare list (hand-edited) must load and rewrap to dict envelope."""
+    def test_load_jobs_bom_plus_bare_list_preserves_file(self, tmp_cron_dir):
+        """BOM + bare list (hand-edited) must load WITHOUT rewriting the file.
+
+        ``load_jobs`` is a pure read: it tolerates the legacy bare-list shape
+        and returns the jobs, but never rewrites. Explicit
+        ``repair_legacy_jobs_store`` / ``hermes cron repair`` owns canonicalize.
+        """
         import json
         from cron.jobs import JOBS_FILE, load_jobs
 
@@ -2200,22 +2262,20 @@ class TestJobsJsonUtf8Bom:
             }
         ]
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        JOBS_FILE.write_bytes(b"\xef\xbb\xbf" + json.dumps(bare).encode("utf-8"))
+        original = b"\xef\xbb\xbf" + json.dumps(bare).encode("utf-8")
+        JOBS_FILE.write_bytes(original)
 
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["barebom01"]
-        # Auto-repair rewrites via save_jobs (plain utf-8) — heals the BOM.
-        on_disk = JOBS_FILE.read_bytes()
-        assert not on_disk.startswith(b"\xef\xbb\xbf"), "save_jobs should rewrite without BOM"
-        rewritten = json.loads(on_disk.decode("utf-8"))
-        assert isinstance(rewritten, dict)
-        assert [j["id"] for j in rewritten["jobs"]] == ["barebom01"]
+        # Pure read: BOM'd bare list preserved exactly, not rewrapped.
+        assert JOBS_FILE.read_bytes() == original
 
     def test_load_jobs_bom_plus_control_char_uses_strict_false_arm(self, tmp_cron_dir):
         """BOM + bare control char in a string value exercises the strict=False arm.
 
         json.load (strict) rejects unescaped control chars; the retry path must
-        also open with utf-8-sig so the BOM does not re-crash the repair.
+        also open with utf-8-sig so the BOM does not re-crash the parse. Load
+        remains read-only (bytes preserved).
         """
         from cron.jobs import JOBS_FILE, load_jobs
 
@@ -2232,3 +2292,384 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["ctrlbom01"]
         assert "newline" in loaded[0]["name"]
+        assert JOBS_FILE.read_bytes() == raw
+
+
+# =========================================================================
+# Pure-read load_jobs + explicit repair_legacy_jobs_store
+# =========================================================================
+
+def _policy_valid_llm_job(**overrides):
+    """Enabled LLM job that passes the central admission gate."""
+    job = {
+        "id": "validjob0001",
+        "name": "valid",
+        "enabled": True,
+        "prompt": "do work",
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+        "category": LEGACY_TEST_LLM_ADMISSION["category"],
+        "material_result_criterion": LEGACY_TEST_LLM_ADMISSION[
+            "material_result_criterion"
+        ],
+    }
+    job.update(overrides)
+    return job
+
+
+def _enabled_incomplete_llm_job(**overrides):
+    """Enabled LLM job missing mandatory admission fields."""
+    job = {
+        "id": "incomplt0001",
+        "name": "incomplete",
+        "enabled": True,
+        "prompt": "do work",
+        "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+    }
+    job.update(overrides)
+    return job
+
+
+class TestLoadJobsPureRead:
+    """load_jobs must never mkdir/rewrite; legacy formats stay on disk."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_legacy_warn_registry(self):
+        import cron.jobs as jobs_mod
+
+        jobs_mod._legacy_store_warnings_emitted.clear()
+        yield
+        jobs_mod._legacy_store_warnings_emitted.clear()
+
+    def test_missing_store_returns_empty_and_creates_no_directory(self, tmp_cron_dir):
+        from cron.jobs import CRON_DIR, JOBS_FILE, load_jobs
+
+        assert not CRON_DIR.exists()
+        assert not JOBS_FILE.exists()
+        assert load_jobs() == []
+        assert not CRON_DIR.exists()
+        assert not JOBS_FILE.exists()
+
+    def test_bare_list_load_preserves_bytes_mtime_and_lists(self, tmp_cron_dir, caplog):
+        import json
+        import logging
+        import time
+        from cron.jobs import JOBS_FILE, list_jobs, load_jobs
+
+        bare = [_policy_valid_llm_job(id="barelist01", name="bare-root")]
+        original = json.dumps(bare).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+        # Stabilize mtime so a pure read is distinguishable from a rewrite.
+        os.utime(JOBS_FILE, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        before_mtime = JOBS_FILE.stat().st_mtime_ns
+
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            loaded = load_jobs()
+            listed = list_jobs(include_disabled=True)
+
+        assert [j["id"] for j in loaded] == ["barelist01"]
+        assert any(j["id"] == "barelist01" for j in listed)
+        assert JOBS_FILE.read_bytes() == original
+        assert JOBS_FILE.stat().st_mtime_ns == before_mtime
+        warn_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warn_msgs) == 1
+        assert "bare" in warn_msgs[0].lower() or "list" in warn_msgs[0].lower()
+        assert "repair" in warn_msgs[0].lower()
+        # No job content leaked into the warning.
+        assert "do work" not in warn_msgs[0]
+        assert "bare-root" not in warn_msgs[0]
+
+    def test_control_char_load_preserves_bytes_mtime_and_lists(self, tmp_cron_dir, caplog):
+        import logging
+        from cron.jobs import JOBS_FILE, list_jobs, load_jobs
+
+        # Raw newline inside a string — invalid under json strict=True.
+        raw = (
+            b'{"jobs": [{"id": "ctrlchar01", "name": "has\nnewline",'
+            b' "enabled": true, "prompt": "x",'
+            b' "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},'
+            b' "category": "necessary_as_is",'
+            b' "material_result_criterion": "test material result criterion"}]}'
+        )
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(raw)
+        os.utime(JOBS_FILE, ns=(1_700_000_000_123_000_000, 1_700_000_000_123_000_000))
+        before_mtime = JOBS_FILE.stat().st_mtime_ns
+
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            loaded = load_jobs()
+            listed = list_jobs(include_disabled=True)
+
+        assert [j["id"] for j in loaded] == ["ctrlchar01"]
+        assert "\n" in loaded[0]["name"]
+        assert any(j["id"] == "ctrlchar01" for j in listed)
+        assert JOBS_FILE.read_bytes() == raw
+        assert JOBS_FILE.stat().st_mtime_ns == before_mtime
+        warn_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warn_msgs) == 1
+        assert "control" in warn_msgs[0].lower()
+        assert "repair" in warn_msgs[0].lower()
+        assert "has\nnewline" not in warn_msgs[0]
+        assert "ctrlchar01" not in warn_msgs[0]
+
+    @pytest.mark.parametrize("legacy_format", ["bare_list", "control_chars"])
+    def test_scheduler_scan_reads_legacy_store_without_writing(
+        self, tmp_cron_dir, legacy_format
+    ):
+        """The scheduler's real due-job scan can consume either legacy format.
+
+        A future ``next_run_at`` keeps this a read/listing path rather than a
+        legitimate scheduler bookkeeping write. The jobs store must remain
+        byte- and mtime-identical.
+        """
+        import json
+        from cron.jobs import JOBS_FILE, get_due_jobs
+
+        job = _policy_valid_llm_job(
+            id=f"sched-{legacy_format}",
+            name="scheduler legacy",
+            next_run_at="2099-01-01T00:00:00+00:00",
+        )
+        if legacy_format == "bare_list":
+            original = json.dumps([job]).encode("utf-8")
+        else:
+            strict = json.dumps({"jobs": [job]})
+            original = strict.replace(
+                "scheduler legacy", "scheduler\nlegacy"
+            ).encode("utf-8")
+
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+        os.utime(
+            JOBS_FILE,
+            ns=(1_700_000_000_654_000_000, 1_700_000_000_654_000_000),
+        )
+        before_mtime = JOBS_FILE.stat().st_mtime_ns
+
+        assert get_due_jobs() == []
+        assert JOBS_FILE.read_bytes() == original
+        assert JOBS_FILE.stat().st_mtime_ns == before_mtime
+
+    def test_legacy_warning_deduplicated_per_path_and_format(self, tmp_cron_dir, caplog):
+        import json
+        import logging
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        bare = [_policy_valid_llm_job(id="dedupe0001")]
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(json.dumps(bare).encode("utf-8"))
+
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            load_jobs()
+            load_jobs()
+            load_jobs()
+
+        warn_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warn_msgs) == 1
+
+    def test_canonical_store_load_is_silent_and_preserves_bytes(self, tmp_cron_dir, caplog):
+        import json
+        import logging
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        payload = {
+            "jobs": [_policy_valid_llm_job(id="canon0001")],
+            "updated_at": "2030-01-01T00:00:00+00:00",
+        }
+        original = json.dumps(payload, indent=2).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+        os.utime(JOBS_FILE, ns=(1_700_000_000_456_000_000, 1_700_000_000_456_000_000))
+        before_mtime = JOBS_FILE.stat().st_mtime_ns
+
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            loaded = load_jobs()
+
+        assert [j["id"] for j in loaded] == ["canon0001"]
+        assert JOBS_FILE.read_bytes() == original
+        assert JOBS_FILE.stat().st_mtime_ns == before_mtime
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestRepairLegacyJobsStore:
+    """Explicit repair_legacy_jobs_store canonicalizes only via the write gate."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_legacy_warn_registry(self):
+        import cron.jobs as jobs_mod
+
+        jobs_mod._legacy_store_warnings_emitted.clear()
+        yield
+        jobs_mod._legacy_store_warnings_emitted.clear()
+
+    def test_repair_missing_store_is_noop(self, tmp_cron_dir):
+        from cron.jobs import CRON_DIR, JOBS_FILE, repair_legacy_jobs_store
+
+        assert not JOBS_FILE.exists()
+        result = repair_legacy_jobs_store()
+        assert result["changed"] is False
+        assert not JOBS_FILE.exists()
+        # Pure no-op for a missing store: do not mkdir the cron tree.
+        assert not CRON_DIR.exists()
+
+    def test_repair_canonical_store_is_noop(self, tmp_cron_dir):
+        import json
+        from cron.jobs import JOBS_FILE, repair_legacy_jobs_store
+
+        payload = {
+            "jobs": [_policy_valid_llm_job(id="alreadyok01")],
+            "updated_at": "2030-01-01T00:00:00+00:00",
+        }
+        original = json.dumps(payload, indent=2).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+
+        result = repair_legacy_jobs_store()
+        assert result["changed"] is False
+        assert JOBS_FILE.read_bytes() == original
+
+    def test_repair_bare_list_valid_llm_canonicalizes(self, tmp_cron_dir):
+        import json
+        from cron.jobs import JOBS_FILE, load_jobs, repair_legacy_jobs_store
+
+        bare = [_policy_valid_llm_job(id="repairok01", name="ok")]
+        original = json.dumps(bare).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+
+        result = repair_legacy_jobs_store()
+        assert result["changed"] is True
+        on_disk = json.loads(JOBS_FILE.read_bytes().decode("utf-8"))
+        assert isinstance(on_disk, dict)
+        assert "jobs" in on_disk
+        assert "updated_at" in on_disk
+        assert [j["id"] for j in on_disk["jobs"]] == ["repairok01"]
+        # Round-trip via pure load still works after canonicalize.
+        assert [j["id"] for j in load_jobs()] == ["repairok01"]
+
+    def test_repair_control_char_valid_llm_canonicalizes(self, tmp_cron_dir):
+        import json
+        from cron.jobs import JOBS_FILE, load_jobs, repair_legacy_jobs_store
+
+        raw = (
+            b'{"jobs": [{"id": "repairctrl1", "name": "has\nnewline",'
+            b' "enabled": true, "prompt": "x",'
+            b' "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},'
+            b' "category": "necessary_as_is",'
+            b' "material_result_criterion": "test material result criterion"}]}'
+        )
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(raw)
+
+        result = repair_legacy_jobs_store()
+        assert result["changed"] is True
+        # Canonical rewrite is strict-parseable and escapes the control char.
+        on_disk = JOBS_FILE.read_bytes()
+        parsed = json.loads(on_disk.decode("utf-8"))  # strict=True
+        assert isinstance(parsed, dict)
+        assert parsed["jobs"][0]["id"] == "repairctrl1"
+        assert "\n" in parsed["jobs"][0]["name"]
+        assert [j["id"] for j in load_jobs()] == ["repairctrl1"]
+
+    def test_repair_no_agent_and_disabled_incomplete_succeed(self, tmp_cron_dir):
+        import json
+        from cron.jobs import JOBS_FILE, repair_legacy_jobs_store
+
+        bare = [
+            {
+                "id": "noagent0001",
+                "name": "scripty",
+                "enabled": True,
+                "no_agent": True,
+                "script": "check.sh",
+                "prompt": "",
+                "schedule": {
+                    "kind": "interval",
+                    "minutes": 30,
+                    "display": "every 30m",
+                },
+            },
+            {
+                "id": "disabled001",
+                "name": "paused-incomplete",
+                "enabled": False,
+                "prompt": "later",
+                "schedule": {
+                    "kind": "interval",
+                    "minutes": 60,
+                    "display": "every 60m",
+                },
+            },
+        ]
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(json.dumps(bare).encode("utf-8"))
+
+        result = repair_legacy_jobs_store()
+        assert result["changed"] is True
+        on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        ids = {j["id"] for j in on_disk["jobs"]}
+        assert ids == {"noagent0001", "disabled001"}
+
+    def test_repair_enabled_incomplete_llm_preserves_bytes(self, tmp_cron_dir):
+        import json
+        from cron.jobs import (
+            JOBS_FILE,
+            LlmCronAdmissionError,
+            repair_legacy_jobs_store,
+        )
+
+        bare = [_enabled_incomplete_llm_job(id="badllm00001")]
+        original = json.dumps(bare).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+        os.utime(JOBS_FILE, ns=(1_700_000_000_789_000_000, 1_700_000_000_789_000_000))
+        before_mtime = JOBS_FILE.stat().st_mtime_ns
+
+        with pytest.raises(LlmCronAdmissionError) as excinfo:
+            repair_legacy_jobs_store()
+
+        assert "admission" in str(excinfo.value).lower()
+        assert JOBS_FILE.read_bytes() == original
+        assert JOBS_FILE.stat().st_mtime_ns == before_mtime
+
+    def test_repair_control_char_enabled_incomplete_preserves_bytes(self, tmp_cron_dir):
+        from cron.jobs import (
+            JOBS_FILE,
+            LlmCronAdmissionError,
+            repair_legacy_jobs_store,
+        )
+
+        raw = (
+            b'{"jobs": [{"id": "badctrl0001", "name": "has\nnewline",'
+            b' "enabled": true, "prompt": "x",'
+            b' "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"}}]}'
+        )
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(raw)
+
+        with pytest.raises(LlmCronAdmissionError):
+            repair_legacy_jobs_store()
+
+        assert JOBS_FILE.read_bytes() == raw
+
+    def test_repair_uses_save_gate_under_jobs_lock(self, tmp_cron_dir, monkeypatch):
+        import json
+        import cron.jobs as jobs_mod
+
+        bare = [_policy_valid_llm_job(id="lockcheck01")]
+        jobs_mod.JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        jobs_mod.JOBS_FILE.write_bytes(json.dumps(bare).encode("utf-8"))
+
+        seen = {"depth": None, "called": False}
+        real_save = jobs_mod._save_jobs_unlocked
+
+        def spy(jobs):
+            seen["called"] = True
+            seen["depth"] = getattr(jobs_mod._jobs_lock_state, "depth", 0)
+            return real_save(jobs)
+
+        monkeypatch.setattr(jobs_mod, "_save_jobs_unlocked", spy)
+        result = jobs_mod.repair_legacy_jobs_store()
+        assert result["changed"] is True
+        assert seen["called"] is True
+        assert seen["depth"] is not None and seen["depth"] >= 1

@@ -161,8 +161,18 @@ class TestBuildJobPromptContextFrom:
         assert "News: AI boom" in prompt
         assert "Weather: Sunny" in prompt
 
-    def test_context_injected_before_prompt(self, cron_env):
-        """Context should appear before the job's own prompt."""
+    def test_context_injected_after_prompt(self, cron_env):
+        """Context is runtime data and must appear after the job's own prompt.
+
+        ``_build_job_prompt`` intentionally assembles "static instructions
+        first and runtime data last" (see the [verified] cron
+        context-efficiency-gates refactor of ``cron/scheduler.py``): the
+        job's own prompt/instructions are static, while ``context_from``
+        output is collected in ``dynamic_parts`` and appended as a tail via
+        ``_append_dynamic_tail``. This was previously prepended before the
+        prompt; that ordering changed intentionally and this test was
+        updated to match (it is not itself part of that refactor's diff).
+        """
         from cron.jobs import create_job, OUTPUT_DIR
         from cron.scheduler import _build_job_prompt
 
@@ -179,7 +189,7 @@ class TestBuildJobPromptContextFrom:
         prompt = _build_job_prompt(job_b)
         context_pos = prompt.find("Context data")
         prompt_pos = prompt.find("Process the data above")
-        assert context_pos < prompt_pos
+        assert prompt_pos < context_pos
 
     def test_output_truncated_at_8k_chars(self, cron_env):
         """Output longer than 8000 chars should be truncated."""

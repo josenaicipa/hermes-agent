@@ -19,6 +19,84 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
+    def test_create_forwards_llm_admission_fields(self, monkeypatch, capsys):
+        captured = {}
+
+        def fake_api(**kwargs):
+            captured.update(kwargs)
+            return {
+                "success": True,
+                "job_id": "job-admit",
+                "name": "admitted",
+                "schedule": "every 60m",
+                "next_run_at": "2030-01-01T00:00:00+00:00",
+                "job": {},
+            }
+
+        monkeypatch.setattr(cron_cli, "_cron_api", fake_api)
+        rc = cron_cli.cron_create(Namespace(
+            schedule="every 1h",
+            prompt="produce a report",
+            name="admitted",
+            deliver="local",
+            repeat=None,
+            skill=None,
+            skills=None,
+            script=None,
+            workdir=None,
+            no_agent=False,
+            category="justified_cadence",
+            material_result_criterion="A dated report is written and delivered",
+        ))
+
+        assert rc == 0
+        assert captured["category"] == "justified_cadence"
+        assert captured["material_result_criterion"] == "A dated report is written and delivered"
+        assert "Created job" in capsys.readouterr().out
+
+    def test_edit_forwards_llm_admission_fields(self, monkeypatch, capsys):
+        captured = {}
+        # cron_edit imports resolve_job_ref locally, so supply a real isolated
+        # job and replace only the tool transport being asserted here.
+        monkeypatch.setattr("cron.jobs.resolve_job_ref", lambda _ref: {"id": "job-admit", "skills": []})
+
+        def fake_api(**kwargs):
+            captured.update(kwargs)
+            return {
+                "success": True,
+                "job": {
+                    "job_id": "job-admit",
+                    "name": "admitted",
+                    "schedule": "every 60m",
+                    "skills": [],
+                },
+            }
+
+        monkeypatch.setattr(cron_cli, "_cron_api", fake_api)
+        rc = cron_cli.cron_edit(Namespace(
+            job_id="job-admit",
+            schedule=None,
+            prompt=None,
+            name=None,
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            clear_skills=False,
+            add_skills=None,
+            remove_skills=None,
+            script=None,
+            workdir=None,
+            no_agent=None,
+            category="event",
+            material_result_criterion="An upstream event creates one verified result",
+        ))
+
+        assert rc == 0
+        assert captured["category"] == "event"
+        assert captured["material_result_criterion"] == "An upstream event creates one verified result"
+        assert "Updated job" in capsys.readouterr().out
+
     def test_pause_resume_run(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Check server status", schedule="every 1h")
 
@@ -38,6 +116,29 @@ class TestCronCommandLifecycle:
         assert "Paused job" in out
         assert "Resumed job" in out
         assert "Triggered job" in out
+
+    def test_run_dispatched_pending_is_not_reported_as_failed(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **_kwargs: {
+                "success": True,
+                "job": {
+                    "name": "manual run",
+                    "job_id": "job-run-1",
+                    "executed": True,
+                    "execution_pending": True,
+                    "execution_success": None,
+                },
+            },
+        )
+
+        rc = cron_cli._job_action("run", "job-run-1", "Triggered")
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Run dispatched; completion pending." in out
+        assert "Ran now: failed." not in out
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
@@ -210,6 +311,71 @@ class TestGatewayNotRunningWarning:
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
         assert "Gateway is not running" in out
+
+
+class TestCronRepairCommand:
+    """``hermes cron repair`` explicitly canonicalizes legacy jobs.json stores."""
+
+    def test_repair_bare_list_success(self, tmp_cron_dir, capsys):
+        import json
+        from cron.jobs import JOBS_FILE
+        from tests.fixtures.cron_llm_admission import LEGACY_TEST_LLM_ADMISSION
+
+        bare = [
+            {
+                "id": "clipair001",
+                "name": "cli-ok",
+                "enabled": True,
+                "prompt": "work",
+                "schedule": {
+                    "kind": "interval",
+                    "minutes": 60,
+                    "display": "every 60m",
+                },
+                "category": LEGACY_TEST_LLM_ADMISSION["category"],
+                "material_result_criterion": LEGACY_TEST_LLM_ADMISSION[
+                    "material_result_criterion"
+                ],
+            }
+        ]
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(json.dumps(bare).encode("utf-8"))
+
+        rc = cron_command(Namespace(cron_command="repair"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "repair" in out.lower() or "canonical" in out.lower()
+        on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        assert isinstance(on_disk, dict)
+        assert [j["id"] for j in on_disk["jobs"]] == ["clipair001"]
+
+    def test_repair_enabled_incomplete_returns_nonzero(self, tmp_cron_dir, capsys):
+        import json
+        from cron.jobs import JOBS_FILE
+
+        bare = [
+            {
+                "id": "clibad0001",
+                "name": "cli-bad",
+                "enabled": True,
+                "prompt": "work",
+                "schedule": {
+                    "kind": "interval",
+                    "minutes": 60,
+                    "display": "every 60m",
+                },
+            }
+        ]
+        original = json.dumps(bare).encode("utf-8")
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_bytes(original)
+
+        rc = cron_command(Namespace(cron_command="repair"))
+        captured = capsys.readouterr()
+        combined = (captured.out or "") + (captured.err or "")
+        assert rc == 1
+        assert "admission" in combined.lower()
+        assert JOBS_FILE.read_bytes() == original
 
 
 class TestExternalCronProviderStatus:

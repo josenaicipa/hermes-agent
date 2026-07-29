@@ -314,6 +314,11 @@ def detect_audio_environment() -> dict:
     if is_container():
         if has_forwarded_audio:
             notices.append("Running inside container (Docker/Podman/LXC) with host audio forwarding")
+        elif termux_capture:
+            notices.append(
+                "Running inside container (Docker/Podman/LXC) with confirmed "
+                "Termux:API microphone capture"
+            )
         else:
             warnings.append(
                 "Running inside container (Docker/Podman/LXC) -- no audio devices.\n"

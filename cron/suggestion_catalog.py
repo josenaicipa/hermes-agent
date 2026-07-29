@@ -58,6 +58,8 @@ CATALOG: List[CatalogEntry] = [
             "schedule": "0 8 * * *",
             "name": "Daily briefing",
             "deliver": "origin",
+            "category": "justified_cadence",
+            "material_result_criterion": "archivo_entregado",
         },
     ),
     CatalogEntry(
@@ -82,6 +84,8 @@ CATALOG: List[CatalogEntry] = [
             "schedule": "every 30m",
             "name": "Important-mail monitor",
             "deliver": "origin",
+            "category": "event",
+            "material_result_criterion": "alerta_accionable",
         },
     ),
     CatalogEntry(
@@ -99,6 +103,8 @@ CATALOG: List[CatalogEntry] = [
             "schedule": "0 18 * * 0",
             "name": "Weekly review",
             "deliver": "origin",
+            "category": "justified_cadence",
+            "material_result_criterion": "archivo_entregado",
         },
     ),
     CatalogEntry(
@@ -116,6 +122,8 @@ CATALOG: List[CatalogEntry] = [
             "schedule": "0 9 * * 1-5",
             "name": "Workday start reminder",
             "deliver": "origin",
+            "category": "justified_cadence",
+            "material_result_criterion": "alerta_accionable",
         },
     ),
 ]

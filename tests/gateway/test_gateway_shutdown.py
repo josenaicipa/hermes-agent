@@ -178,6 +178,35 @@ async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monk
     assert (tmp_path / ".restart_pending.json").exists()
 
 
+def test_systemd_restart_shortcut_uses_idempotent_start_not_restart(monkeypatch):
+    """The helper must not stop a fresh automatic restart that won the race."""
+    runner, _adapter = make_restart_runner()
+    current_pid = 4242
+    launched = []
+
+    monkeypatch.setattr(gateway_run.sys, "platform", "linux")
+    monkeypatch.setenv("INVOCATION_ID", "systemd-test")
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: current_pid)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("hermes_cli.gateway.get_service_name", lambda: "hermes-gateway-vpsclone")
+
+    def fake_run(cmd, **_kwargs):
+        result = MagicMock()
+        result.stdout = f"{current_pid}\n" if "--user" in cmd else "0\n"
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", lambda cmd, **kwargs: launched.append((cmd, kwargs)))
+
+    runner._launch_systemd_restart_shortcut()
+
+    assert len(launched) == 1
+    shell_cmd = launched[0][0][-1]
+    assert "systemctl --user reset-failed hermes-gateway-vpsclone" in shell_cmd
+    assert "systemctl --user start hermes-gateway-vpsclone" in shell_cmd
+    assert "systemctl --user restart hermes-gateway-vpsclone" not in shell_cmd
+
+
 @pytest.mark.asyncio
 async def test_gateway_stop_launchd_service_restart_keeps_nonzero_exit(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)

@@ -758,7 +758,7 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
     return "/tmp"
 
 
-def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
+def get_subprocess_home(env: dict[str, str] | None = None, *, prefer_real: bool = False) -> str | None:
     """Return a subprocess ``HOME`` override, if one should be applied.
 
     Policy is controlled by ``terminal.home_mode`` (bridged to
@@ -770,6 +770,14 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     * ``real``: always prefer the real OS-user HOME.
     * ``profile``: use ``{HERMES_HOME}/home`` when it exists, preserving the
       older strict per-profile tool-config isolation.
+
+    ``prefer_real`` lets a caller opt an individual spawn site out of the
+    ``auto`` mode's container-forces-profile-home branch, so it behaves like
+    ``real`` unless the operator explicitly set ``TERMINAL_HOME_MODE=profile``.
+    Use this for children whose credentials/identity live under the real
+    account home even when Hermes itself runs in a container (e.g. the
+    Copilot ACP CLI, which authenticates as the operator, not the profile).
+    Explicit ``profile``/``real`` configuration always takes precedence.
     """
     env = env or {}
     profile_home = _profile_home_path(env)
@@ -784,7 +792,7 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
 
     real_home = get_real_home(env)
     current_home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
-    if mode == "real":
+    if mode == "real" or (prefer_real and mode == "auto"):
         return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
 
     if profile_home and is_container():
@@ -794,12 +802,15 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     return None
 
 
-def apply_subprocess_home_env(env: dict[str, str]) -> None:
-    """Apply Hermes' subprocess HOME contract to *env* in-place."""
+def apply_subprocess_home_env(env: dict[str, str], *, prefer_real: bool = False) -> None:
+    """Apply Hermes' subprocess HOME contract to *env* in-place.
+
+    See :func:`get_subprocess_home` for ``prefer_real``.
+    """
     real_home = get_real_home(env)
     if real_home:
         env["HERMES_REAL_HOME"] = real_home
-    home = get_subprocess_home(env)
+    home = get_subprocess_home(env, prefer_real=prefer_real)
     if home:
         env["HOME"] = home
 

@@ -11,6 +11,16 @@ frontmatter:
           deliver: origin            # optional (default "origin")
           prompt: "..."              # optional task instruction for the run
           no_agent: false            # optional
+          # Required for LLM blueprints (no_agent=false); omitted only when
+          # no_agent=true. No inference / defaults — must be declared explicitly.
+          category: justified_cadence
+          material_result_criterion: archivo_entregado
+
+``category`` must be one of the LLM admission categories
+(``event`` / ``justified_cadence`` / ``necessary_as_is``).
+``material_result_criterion`` must be one of the four standard blueprint
+criteria: ``integracion_produccion``, ``archivo_entregado``,
+``metrica_registrada``, ``alerta_accionable``.
 
 Because a blueprint is just a skill, it flows through the ENTIRE existing
 skills-hub pipeline for free — search, inspect, quarantine, security scan,
@@ -56,7 +66,13 @@ class BlueprintError(ValueError):
 
 @dataclass
 class BlueprintSpec:
-    """Parsed ``metadata.hermes.blueprint`` automation spec for a skill."""
+    """Parsed ``metadata.hermes.blueprint`` automation spec for a skill.
+
+    ``category`` and ``material_result_criterion`` are required for LLM
+    blueprints (``no_agent=False``). There are no semantic defaults — callers
+    and frontmatter must declare them explicitly. ``no_agent=True`` blueprints
+    are exempt and may leave both unset.
+    """
 
     skill_name: str
     schedule: str
@@ -66,6 +82,8 @@ class BlueprintSpec:
     model: Optional[str] = None
     provider: Optional[str] = None
     enabled_toolsets: Optional[List[str]] = None
+    category: Optional[str] = None
+    material_result_criterion: Optional[str] = None
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -92,12 +110,39 @@ def _split_frontmatter(text: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _validate_llm_blueprint_admission(
+    *,
+    no_agent: bool,
+    category: Any,
+    material_result_criterion: Any,
+) -> None:
+    """Enforce blueprint admission against the standard four-criterion allowlist."""
+    from cron.jobs import (
+        LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        LlmCronAdmissionError,
+        check_llm_admission_for_enable,
+    )
+
+    try:
+        check_llm_admission_for_enable(
+            no_agent=no_agent,
+            category=category,
+            material_result_criterion=material_result_criterion,
+            allowed_material_criteria=LLM_BLUEPRINT_MATERIAL_CRITERIA,
+        )
+    except LlmCronAdmissionError as e:
+        raise BlueprintError(str(e)) from e
+
+
 def parse_blueprint(skill_md_text: str) -> Optional[BlueprintSpec]:
     """Extract a BlueprintSpec from a SKILL.md string, or None if not a blueprint.
 
     A skill is a blueprint iff ``metadata.hermes.blueprint`` is a mapping containing
     a non-empty ``schedule``. Raises BlueprintError if the block exists but is
     structurally invalid (so a typo surfaces instead of silently no-op'ing).
+
+    LLM blueprints (``no_agent`` false/absent) must declare ``category`` and
+    ``material_result_criterion`` explicitly — no defaults or inference.
     """
     fm = _split_frontmatter(skill_md_text)
     if not fm:
@@ -128,6 +173,21 @@ def parse_blueprint(skill_md_text: str) -> Optional[BlueprintSpec]:
     if toolsets is not None and not isinstance(toolsets, list):
         raise BlueprintError("blueprint.enabled_toolsets must be a list when present")
 
+    from cron.jobs import (
+        normalize_llm_admission_category,
+        normalize_material_result_criterion,
+    )
+
+    category = normalize_llm_admission_category(blueprint.get("category"))
+    material_result_criterion = normalize_material_result_criterion(
+        blueprint.get("material_result_criterion")
+    )
+    _validate_llm_blueprint_admission(
+        no_agent=no_agent,
+        category=category,
+        material_result_criterion=material_result_criterion,
+    )
+
     return BlueprintSpec(
         skill_name=name,
         schedule=schedule,
@@ -137,6 +197,8 @@ def parse_blueprint(skill_md_text: str) -> Optional[BlueprintSpec]:
         model=str(model).strip() if model else None,
         provider=str(provider).strip() if provider else None,
         enabled_toolsets=[str(t) for t in toolsets] if toolsets else None,
+        category=category,
+        material_result_criterion=material_result_criterion,
         raw=blueprint,
     )
 
@@ -180,8 +242,16 @@ def blueprint_to_job_spec(
     Both the direct ``create_blueprint_job`` path and the suggestion path
     (``register_blueprint_suggestion``) build on it, so a blueprint scheduled now and
     a blueprint accepted from a suggestion produce an identical job.
+
+    Validates direct-constructed specs against the standard blueprint allowlist
+    and propagates ``category`` / ``material_result_criterion`` unchanged.
     """
-    return {
+    _validate_llm_blueprint_admission(
+        no_agent=bool(spec.no_agent),
+        category=spec.category,
+        material_result_criterion=spec.material_result_criterion,
+    )
+    job_spec: Dict[str, Any] = {
         "prompt": spec.prompt,
         "schedule": spec.schedule,
         "name": name or f"blueprint:{spec.skill_name}",
@@ -192,6 +262,10 @@ def blueprint_to_job_spec(
         "enabled_toolsets": spec.enabled_toolsets,
         "no_agent": spec.no_agent,
     }
+    if not spec.no_agent:
+        job_spec["category"] = spec.category
+        job_spec["material_result_criterion"] = spec.material_result_criterion
+    return job_spec
 
 
 def create_blueprint_job(
@@ -250,8 +324,28 @@ def export_blueprint(job: Dict[str, Any], body: str, *, blueprint_name: Optional
     and emit a SKILL.md (with a ``metadata.hermes.blueprint`` block) they can hand
     to ``hermes skills publish`` to share. ``body`` is the plain-language
     description / instructions that become the SKILL.md body.
+
+    LLM jobs must already carry valid blueprint admission declarations
+    (``category`` + one of the four standard criteria); missing/invalid values
+    fail clearly. ``no_agent=True`` jobs are exempt.
     """
     import yaml
+
+    no_agent = bool(job.get("no_agent"))
+    from cron.jobs import (
+        normalize_llm_admission_category,
+        normalize_material_result_criterion,
+    )
+
+    category = normalize_llm_admission_category(job.get("category"))
+    material_result_criterion = normalize_material_result_criterion(
+        job.get("material_result_criterion")
+    )
+    _validate_llm_blueprint_admission(
+        no_agent=no_agent,
+        category=category,
+        material_result_criterion=material_result_criterion,
+    )
 
     name = blueprint_name or job.get("name") or "shared-blueprint"
     # Sanitize to a valid skill identifier.
@@ -266,7 +360,7 @@ def export_blueprint(job: Dict[str, Any], body: str, *, blueprint_name: Optional
         blueprint_block["deliver"] = deliver
     if job.get("prompt"):
         blueprint_block["prompt"] = job["prompt"]
-    if job.get("no_agent"):
+    if no_agent:
         blueprint_block["no_agent"] = True
     if job.get("model"):
         blueprint_block["model"] = job["model"]
@@ -274,6 +368,9 @@ def export_blueprint(job: Dict[str, Any], body: str, *, blueprint_name: Optional
         blueprint_block["provider"] = job["provider"]
     if job.get("enabled_toolsets"):
         blueprint_block["enabled_toolsets"] = job["enabled_toolsets"]
+    if not no_agent:
+        blueprint_block["category"] = category
+        blueprint_block["material_result_criterion"] = material_result_criterion
 
     description = (
         (body.strip().splitlines() or ["Shared automation blueprint."])[0][:200]
