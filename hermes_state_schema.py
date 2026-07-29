@@ -95,26 +95,38 @@ class SessionSchemaMixin:
         'rebuild' source, so we DELETE + reinsert the concatenated content
         the legacy triggers produced. Never touches the v23 shape.
         """
-        cursor.execute("DELETE FROM messages_fts")
-        cursor.execute(
-            "INSERT INTO messages_fts(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
-        if not include_trigram:
-            return
-        cursor.execute("DELETE FROM messages_fts_trigram")
-        cursor.execute(
-            "INSERT INTO messages_fts_trigram(rowid, content) "
-            "SELECT id, "
-            "COALESCE(content, '') || ' ' || "
-            "COALESCE(tool_name, '') || ' ' || "
-            "COALESCE(tool_calls, '') "
-            "FROM messages"
-        )
+        # SessionDB connections use autocommit. Keep each destructive DELETE and
+        # its repopulation in one savepoint so an interruption cannot durably
+        # empty historical search results. SAVEPOINT is safe both at top level
+        # and when the caller already owns a transaction.
+        savepoint = "hermes_rebuild_legacy_fts"
+        cursor.execute(f"SAVEPOINT {savepoint}")
+        try:
+            cursor.execute("DELETE FROM messages_fts")
+            cursor.execute(
+                "INSERT INTO messages_fts(rowid, content) "
+                "SELECT id, "
+                "COALESCE(content, '') || ' ' || "
+                "COALESCE(tool_name, '') || ' ' || "
+                "COALESCE(tool_calls, '') "
+                "FROM messages"
+            )
+            if include_trigram:
+                cursor.execute("DELETE FROM messages_fts_trigram")
+                cursor.execute(
+                    "INSERT INTO messages_fts_trigram(rowid, content) "
+                    "SELECT id, "
+                    "COALESCE(content, '') || ' ' || "
+                    "COALESCE(tool_name, '') || ' ' || "
+                    "COALESCE(tool_calls, '') "
+                    "FROM messages"
+                )
+        except BaseException:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:

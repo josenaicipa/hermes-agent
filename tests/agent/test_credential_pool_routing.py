@@ -383,6 +383,11 @@ class TestFailureAttribution:
     """
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
+        # Credential discovery also probes user-level Claude/OAuth files. Keep
+        # this one-entry fixture isolated from the operator's real HOME.
+        test_home = tmp_path / "home"
+        test_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HOME", str(test_home))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)

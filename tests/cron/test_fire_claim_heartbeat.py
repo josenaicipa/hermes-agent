@@ -74,6 +74,11 @@ def test_long_running_manual_fire_keeps_job_non_due_past_ttl(tmp_path, monkeypat
 
     def _observed_heartbeat(job_id: str, *, expected_owner: str) -> bool:
         updated = real_heartbeat(job_id, expected_owner=expected_owner)
+        # The heartbeat thread may make a final call while run_one_job is
+        # clearing the completed claim. Record the first in-flight observation
+        # only; a post-completion tick must not overwrite the assertion fixture.
+        if heartbeat_seen.is_set():
+            return updated
         # A different scheduler scans after the ORIGINAL claim's TTL while the
         # manual run is still blocked. The refreshed claim must keep the job
         # out of the due set and preserve ownership on the profile store.
