@@ -247,25 +247,43 @@ def _llm_admission_complete(job: Dict[str, Any]) -> bool:
     )
 
 
-def validate_llm_admission_on_persist(jobs: List[Dict[str, Any]]) -> None:
-    """Enforce the LLM admission invariant on every jobs-store write.
+def validate_llm_admission_on_persist(
+    jobs: List[Dict[str, Any]],
+    previous_jobs: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Enforce admission without bricking bookkeeping for grandfathered jobs.
 
-    Every enabled LLM cron in the outgoing store must carry a valid ``category``
-    and a non-empty ``material_result_criterion``. This applies to create,
-    update, enable/reactivate, scheduler bookkeeping, direct/internal API,
-    import, and restore writes. Existing incomplete records remain readable,
-    but no mutation may persist them while enabled.
-
-    Disabled or paused incomplete records may remain on disk. ``no_agent=True``
-    jobs are exempt. This validator never auto-disables jobs or silently fills,
-    rewrites, or removes admission fields.
+    New enabled LLM jobs, reactivated jobs, and previously compliant enabled
+    jobs that lose a declaration fail closed.  Enabled incomplete records that
+    already existed in the previous on-disk snapshot are grandfathered: they
+    may receive unrelated scheduler bookkeeping writes and edits that add the
+    missing declarations.  This keeps legacy jobs operable and remediable while
+    preventing import/restore paths from introducing a new policy bypass.
     """
+    previous_by_id: Dict[str, Dict[str, Any]] = {}
+    for previous in previous_jobs or []:
+        if not isinstance(previous, dict):
+            continue
+        previous_id = previous.get("id")
+        if previous_id is not None:
+            previous_by_id[str(previous_id)] = previous
+
     for job in jobs:
         if not isinstance(job, dict):
             continue
         if bool(job.get("no_agent")) or not _job_will_be_enabled(job):
             continue
         if _llm_admission_complete(job):
+            continue
+
+        previous = previous_by_id.get(str(job.get("id")))
+        grandfathered = (
+            previous is not None
+            and _job_will_be_enabled(previous)
+            and not bool(previous.get("no_agent"))
+            and not _llm_admission_complete(previous)
+        )
+        if grandfathered:
             continue
 
         missing = []
@@ -280,10 +298,10 @@ def validate_llm_admission_on_persist(jobs: List[Dict[str, Any]]) -> None:
         raise LlmCronAdmissionError(
             "LLM cron admission failed: enabled job "
             f"{job_label!r} is missing or has invalid mandatory field(s): "
-            f"{', '.join(missing)}. Every persisted enabled LLM cron must "
-            "declare a valid category and a non-empty material_result_criterion. "
-            "Pause/disable it before removing either declaration. The job was "
-            "not auto-disabled or rewritten."
+            f"{', '.join(missing)}. Every new or reactivated persisted LLM "
+            "cron must declare a valid category and a non-empty "
+            "material_result_criterion. Pause/disable it before removing either "
+            "declaration. The job was not auto-disabled or rewritten."
         )
 
 
@@ -1362,12 +1380,22 @@ def repair_legacy_jobs_store() -> Dict[str, Any]:
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
-    # Central admission lifecycle gate — every store write (public save_jobs,
-    # update/create, scheduler bookkeeping, import/restore) funnels here.
-    # Any enabled incomplete LLM cron is rejected. Never auto-disables.
-    validate_llm_admission_on_persist(jobs)
-
     jobs_file = _current_cron_store().jobs_file
+
+    # Compare against the exact previous snapshot while holding the store lock.
+    # This preserves grandfathered enabled records through scheduler bookkeeping
+    # without weakening admission for new, reactivated, or stripped records.
+    previous_jobs: List[Dict[str, Any]] = []
+    if jobs_file.exists():
+        try:
+            previous_payload, _legacy_format = _read_jobs_payload(jobs_file)
+            previous_jobs = _jobs_list_from_payload(previous_payload)
+        except (OSError, ValueError, json.JSONDecodeError):
+            # Corrupt/unreadable stores get no grandfathering: fail closed on
+            # incomplete enabled records rather than inferring prior state.
+            previous_jobs = []
+    validate_llm_admission_on_persist(jobs, previous_jobs=previous_jobs)
+
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
     # writer (root CLI in Docker) can hand ownership back to the gateway user
@@ -1552,6 +1580,18 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _normalize_autonomous_profile(value: Any) -> Optional[str]:
+    """Return a canonical positive profile name, or None to use the default."""
+    if value is None:
+        return None
+    from cron.autonomous_limits import resolve_autonomous_profile
+
+    return resolve_autonomous_profile(
+        {"autonomous_profile": value},
+        {},
+    ).name
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1572,6 +1612,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     category: Optional[str] = None,
     material_result_criterion: Optional[str] = None,
+    autonomous_profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1621,6 +1662,9 @@ def create_job(
         material_result_criterion: Required for new LLM crons. Non-empty
                 description of the verifiable material result that counts as
                 success for this job.
+        autonomous_profile: Optional fixed positive resource envelope for this
+                job (light, standard, implementation, large, high-risk-review,
+                or retry). Omit to use cron.autonomous_limits.default_profile.
 
     Returns:
         The created job dict
@@ -1655,6 +1699,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_category = normalize_llm_admission_category(category)
     normalized_criterion = normalize_material_result_criterion(material_result_criterion)
+    normalized_autonomous_profile = _normalize_autonomous_profile(autonomous_profile)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1765,6 +1810,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_autonomous_profile is not None:
+        job["autonomous_profile"] = normalized_autonomous_profile
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1889,6 +1936,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             "must be a non-empty string."
                         )
                     updates["material_result_criterion"] = crit
+            if "autonomous_profile" in updates:
+                updates["autonomous_profile"] = _normalize_autonomous_profile(
+                    updates["autonomous_profile"]
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             was_enabled = _job_will_be_enabled(job)

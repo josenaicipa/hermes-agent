@@ -55,12 +55,14 @@ def test_cron_manage_add_forwards_required_llm_admission_fields(monkeypatch):
             "prompt": "Produce a verified report",
             "category": "necessary_as_is",
             "material_result_criterion": "verified report file exists",
+            "autonomous_profile": "standard",
         },
     )
 
     assert response["result"]["success"] is True
     assert captured["category"] == "necessary_as_is"
     assert captured["material_result_criterion"] == "verified report file exists"
+    assert captured["autonomous_profile"] == "standard"
 
 
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):

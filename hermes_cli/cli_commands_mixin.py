@@ -1442,6 +1442,7 @@ class CLICommandsMixin:
                 "schedule": None,
                 "category": None,
                 "material_result_criterion": None,
+                "autonomous_profile": None,
                 "positionals": [],
             }
             i = 0
@@ -1486,6 +1487,9 @@ class CLICommandsMixin:
                     i += 2
                 elif token == "--material-result-criterion" and i + 1 < len(tokens):
                     opts["material_result_criterion"] = tokens[i + 1]
+                    i += 2
+                elif token == "--autonomous-profile" and i + 1 < len(tokens):
+                    opts["autonomous_profile"] = tokens[i + 1]
                     i += 2
                 else:
                     opts["positionals"].append(token)
@@ -1581,6 +1585,7 @@ class CLICommandsMixin:
                 skills=skills or None,
                 category=opts["category"],
                 material_result_criterion=opts["material_result_criterion"],
+                autonomous_profile=opts["autonomous_profile"],
             )
             if result.get("success"):
                 print(f"(^_^)b Created job: {result['job_id']}")
@@ -1629,6 +1634,7 @@ class CLICommandsMixin:
                 skills=final_skills,
                 category=opts["category"],
                 material_result_criterion=opts["material_result_criterion"],
+                autonomous_profile=opts["autonomous_profile"],
             )
             if result.get("success"):
                 job = result["job"]

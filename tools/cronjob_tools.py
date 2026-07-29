@@ -576,6 +576,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["category"] = job["category"]
     if job.get("material_result_criterion"):
         result["material_result_criterion"] = job["material_result_criterion"]
+    if job.get("autonomous_profile"):
+        result["autonomous_profile"] = job["autonomous_profile"]
     return result
 
 
@@ -826,6 +828,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     category: Optional[str] = None,
     material_result_criterion: Optional[str] = None,
+    autonomous_profile: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -902,6 +905,7 @@ def cronjob(
                 attach_to_session=attach_to_session,
                 category=category,
                 material_result_criterion=material_result_criterion,
+                autonomous_profile=autonomous_profile,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -1109,6 +1113,8 @@ def cronjob(
                 updates["category"] = category
             if material_result_criterion is not None:
                 updates["material_result_criterion"] = material_result_criterion
+            if autonomous_profile is not None:
+                updates["autonomous_profile"] = autonomous_profile
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -1243,6 +1249,25 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "Exempt when no_agent=true. On update, set this before resume if missing."
                 ),
             },
+            "autonomous_profile": {
+                "type": "string",
+                "enum": [
+                    "light",
+                    "standard",
+                    "implementation",
+                    "large",
+                    "high-risk-review",
+                    "retry",
+                ],
+                "description": (
+                    "Optional fixed positive resource envelope for this LLM cron. "
+                    "Use light for short reminders, standard for ordinary work, "
+                    "implementation or large for longer tool-driven jobs, "
+                    "high-risk-review for bounded review work, and retry only for "
+                    "a scoped retry. Omit to use cron.autonomous_limits.default_profile. "
+                    "Unknown, empty, zero, or unlimited values fail closed."
+                ),
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1328,6 +1353,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         category=args.get("category"),
         material_result_criterion=args.get("material_result_criterion"),
+        autonomous_profile=args.get("autonomous_profile"),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,

@@ -93,6 +93,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="material_result_criterion",
         help="Required for LLM jobs: verifiable outcome that counts as a material result.",
     )
+    cron_create.add_argument(
+        "--autonomous-profile",
+        choices=(
+            "light", "standard", "implementation", "large",
+            "high-risk-review", "retry",
+        ),
+        help="Fixed positive resource envelope for this job; omit for the configured default.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -179,6 +187,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--material-result-criterion",
         dest="material_result_criterion",
         help="Set the verifiable outcome required before resume/reactivation.",
+    )
+    cron_edit.add_argument(
+        "--autonomous-profile",
+        choices=(
+            "light", "standard", "implementation", "large",
+            "high-risk-review", "retry",
+        ),
+        help="Set the fixed positive resource envelope for this job.",
     )
 
     # lifecycle actions

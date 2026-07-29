@@ -289,6 +289,44 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_and_update_autonomous_profile(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Produce a verified report",
+                schedule="every 1h",
+                category="justified_cadence",
+                material_result_criterion="verified report exists",
+                autonomous_profile="light",
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["autonomous_profile"] == "light"
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                autonomous_profile="standard",
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["autonomous_profile"] == "standard"
+
+    @pytest.mark.parametrize("profile", ["", "0", "unlimited", "turbo"])
+    def test_autonomous_profile_rejects_unknown_or_unbounded_values(self, profile):
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Produce a verified report",
+                schedule="every 1h",
+                category="event",
+                material_result_criterion="verified report exists",
+                autonomous_profile=profile,
+            )
+        )
+        assert result["success"] is False
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import JOBS_FILE
 

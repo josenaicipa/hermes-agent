@@ -2610,34 +2610,29 @@ class TestRepairLegacyJobsStore:
         ids = {j["id"] for j in on_disk["jobs"]}
         assert ids == {"noagent0001", "disabled001"}
 
-    def test_repair_enabled_incomplete_llm_preserves_bytes(self, tmp_cron_dir):
+    def test_repair_enabled_incomplete_llm_is_grandfathered_and_canonicalized(
+        self, tmp_cron_dir
+    ):
         import json
-        from cron.jobs import (
-            JOBS_FILE,
-            LlmCronAdmissionError,
-            repair_legacy_jobs_store,
-        )
+        from cron.jobs import JOBS_FILE, repair_legacy_jobs_store
 
         bare = [_enabled_incomplete_llm_job(id="badllm00001")]
         original = json.dumps(bare).encode("utf-8")
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
         JOBS_FILE.write_bytes(original)
-        os.utime(JOBS_FILE, ns=(1_700_000_000_789_000_000, 1_700_000_000_789_000_000))
-        before_mtime = JOBS_FILE.stat().st_mtime_ns
 
-        with pytest.raises(LlmCronAdmissionError) as excinfo:
-            repair_legacy_jobs_store()
+        result = repair_legacy_jobs_store()
 
-        assert "admission" in str(excinfo.value).lower()
-        assert JOBS_FILE.read_bytes() == original
-        assert JOBS_FILE.stat().st_mtime_ns == before_mtime
+        assert result["changed"] is True
+        payload = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        assert payload["jobs"] == bare
+        assert JOBS_FILE.read_bytes() != original
 
-    def test_repair_control_char_enabled_incomplete_preserves_bytes(self, tmp_cron_dir):
-        from cron.jobs import (
-            JOBS_FILE,
-            LlmCronAdmissionError,
-            repair_legacy_jobs_store,
-        )
+    def test_repair_control_char_enabled_incomplete_is_grandfathered(
+        self, tmp_cron_dir
+    ):
+        import json
+        from cron.jobs import JOBS_FILE, repair_legacy_jobs_store
 
         raw = (
             b'{"jobs": [{"id": "badctrl0001", "name": "has\nnewline",'
@@ -2647,10 +2642,12 @@ class TestRepairLegacyJobsStore:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
         JOBS_FILE.write_bytes(raw)
 
-        with pytest.raises(LlmCronAdmissionError):
-            repair_legacy_jobs_store()
+        result = repair_legacy_jobs_store()
 
-        assert JOBS_FILE.read_bytes() == raw
+        assert result["changed"] is True
+        payload = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        assert payload["jobs"][0]["id"] == "badctrl0001"
+        assert payload["jobs"][0]["name"] == "has\nnewline"
 
     def test_repair_uses_save_gate_under_jobs_lock(self, tmp_cron_dir, monkeypatch):
         import json

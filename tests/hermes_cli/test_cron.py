@@ -47,11 +47,13 @@ class TestCronCommandLifecycle:
             no_agent=False,
             category="justified_cadence",
             material_result_criterion="A dated report is written and delivered",
+            autonomous_profile="standard",
         ))
 
         assert rc == 0
         assert captured["category"] == "justified_cadence"
         assert captured["material_result_criterion"] == "A dated report is written and delivered"
+        assert captured["autonomous_profile"] == "standard"
         assert "Created job" in capsys.readouterr().out
 
     def test_edit_forwards_llm_admission_fields(self, monkeypatch, capsys):
@@ -90,11 +92,13 @@ class TestCronCommandLifecycle:
             no_agent=None,
             category="event",
             material_result_criterion="An upstream event creates one verified result",
+            autonomous_profile="light",
         ))
 
         assert rc == 0
         assert captured["category"] == "event"
         assert captured["material_result_criterion"] == "An upstream event creates one verified result"
+        assert captured["autonomous_profile"] == "light"
         assert "Updated job" in capsys.readouterr().out
 
     def test_pause_resume_run(self, tmp_cron_dir, capsys):
@@ -349,7 +353,7 @@ class TestCronRepairCommand:
         assert isinstance(on_disk, dict)
         assert [j["id"] for j in on_disk["jobs"]] == ["clipair001"]
 
-    def test_repair_enabled_incomplete_returns_nonzero(self, tmp_cron_dir, capsys):
+    def test_repair_grandfathers_enabled_incomplete_store(self, tmp_cron_dir, capsys):
         import json
         from cron.jobs import JOBS_FILE
 
@@ -366,16 +370,17 @@ class TestCronRepairCommand:
                 },
             }
         ]
-        original = json.dumps(bare).encode("utf-8")
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        JOBS_FILE.write_bytes(original)
+        JOBS_FILE.write_bytes(json.dumps(bare).encode("utf-8"))
 
         rc = cron_command(Namespace(cron_command="repair"))
-        captured = capsys.readouterr()
-        combined = (captured.out or "") + (captured.err or "")
-        assert rc == 1
-        assert "admission" in combined.lower()
-        assert JOBS_FILE.read_bytes() == original
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "repair" in out.lower() or "canonical" in out.lower()
+        on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        assert isinstance(on_disk, dict)
+        assert on_disk["jobs"][0]["id"] == "clibad0001"
+        assert not on_disk["jobs"][0].get("category")
 
 
 class TestExternalCronProviderStatus:

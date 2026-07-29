@@ -652,8 +652,8 @@ def test_save_jobs_rejects_stripping_fields_from_enabled_compliant_record(hermes
     assert reloaded[0]["enabled"] is True
 
 
-def test_save_jobs_rejects_unrelated_persist_of_legacy_enabled_incomplete(hermes_env):
-    """Even bookkeeping cannot persist an enabled LLM cron without declarations."""
+def test_save_jobs_allows_bookkeeping_for_legacy_enabled_incomplete(hermes_env):
+    """Grandfathered LLM jobs remain writable by scheduler bookkeeping."""
     from cron.jobs import ensure_dirs, load_jobs, save_jobs
 
     ensure_dirs()
@@ -664,36 +664,62 @@ def test_save_jobs_rejects_unrelated_persist_of_legacy_enabled_incomplete(hermes
     assert len(jobs) == 1
     jobs[0]["last_run_at"] = "2030-01-02T00:00:00+00:00"
     jobs[0]["last_status"] = "ok"
+    save_jobs(jobs)
 
-    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
-        save_jobs(jobs)
-
-    # Failed mutation leaves the pre-policy record byte-for-byte semantically intact.
     reloaded = load_jobs()
     assert reloaded[0]["id"] == "legacy44crm"
     assert reloaded[0]["enabled"] is True
-    assert reloaded[0].get("last_status") is None
+    assert reloaded[0]["last_status"] == "ok"
     assert not reloaded[0].get("category")
     assert not reloaded[0].get("material_result_criterion")
 
 
-def test_update_job_rejects_any_edit_of_legacy_enabled_incomplete(hermes_env):
-    """update_job cannot mutate an enabled legacy LLM until it is classified."""
+def test_update_job_allows_unrelated_edit_of_legacy_enabled_incomplete(hermes_env):
+    """Legacy jobs can be edited and classified without pausing first."""
     from cron.jobs import ensure_dirs, get_job, update_job
 
     ensure_dirs()
     legacy = _legacy_enabled_incomplete_llm()
     _write_raw_jobs(hermes_env / "cron" / "jobs.json", [legacy])
 
-    with pytest.raises(ValueError, match="category|material_result_criterion|admission"):
-        update_job("legacy44crm", {"name": "renamed but still incomplete"})
+    updated = update_job("legacy44crm", {"name": "renamed but still incomplete"})
+    assert updated is not None
+    assert updated["name"] == "renamed but still incomplete"
 
-    unchanged = get_job("legacy44crm")
-    assert unchanged is not None
-    assert unchanged["name"] == "CRM↔Calendar #44"
-    assert unchanged["enabled"] is True
-    assert not unchanged.get("category")
-    assert not unchanged.get("material_result_criterion")
+    persisted = get_job("legacy44crm")
+    assert persisted is not None
+    assert persisted["name"] == "renamed but still incomplete"
+    assert persisted["enabled"] is True
+    assert not persisted.get("category")
+    assert not persisted.get("material_result_criterion")
+
+
+def test_multiple_legacy_jobs_do_not_lock_store_remediation(hermes_env):
+    """One legacy record cannot block classification or bookkeeping of another."""
+    from cron.jobs import ensure_dirs, get_job, load_jobs, save_jobs, update_job
+
+    ensure_dirs()
+    first = _legacy_enabled_incomplete_llm(id="legacy-a", name="Legacy A")
+    second = _legacy_enabled_incomplete_llm(id="legacy-b", name="Legacy B")
+    _write_raw_jobs(hermes_env / "cron" / "jobs.json", [first, second])
+
+    jobs = load_jobs()
+    jobs[0]["last_status"] = "ok"
+    save_jobs(jobs)
+    classified = update_job(
+        "legacy-a",
+        {
+            "category": "event",
+            "material_result_criterion": "Execution A records a verified result",
+        },
+    )
+
+    assert classified is not None
+    assert classified["category"] == "event"
+    remaining = get_job("legacy-b")
+    assert remaining is not None
+    assert remaining["enabled"] is True
+    assert not remaining.get("category")
 
 
 def test_save_jobs_rejects_enabling_legacy_incomplete_via_direct_write(hermes_env):

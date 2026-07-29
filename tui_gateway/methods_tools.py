@@ -1636,6 +1636,7 @@ def _(rid, params: dict) -> dict:
                         material_result_criterion=params.get(
                             "material_result_criterion"
                         ),
+                        autonomous_profile=params.get("autonomous_profile"),
                     )
                 ),
             )

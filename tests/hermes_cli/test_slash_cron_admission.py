@@ -27,11 +27,13 @@ def test_slash_cron_add_forwards_required_llm_admission_fields(monkeypatch, caps
     CLICommandsMixin()._handle_cron_command(
         '/cron add "every 2h" "Check server status" '
         '--category event '
-        '--material-result-criterion "verified status report delivered"'
+        '--material-result-criterion "verified status report delivered" '
+        '--autonomous-profile light'
     )
 
     assert captured["category"] == "event"
     assert captured["material_result_criterion"] == "verified status report delivered"
+    assert captured["autonomous_profile"] == "light"
     assert "Created job: job-1" in capsys.readouterr().out
 
 
@@ -53,8 +55,10 @@ def test_slash_cron_edit_forwards_required_llm_admission_fields(monkeypatch):
     CLICommandsMixin()._handle_cron_command(
         '/cron edit job-1 '
         '--category justified_cadence '
-        '--material-result-criterion "verified weekly report exists"'
+        '--material-result-criterion "verified weekly report exists" '
+        '--autonomous-profile standard'
     )
 
     assert captured["category"] == "justified_cadence"
     assert captured["material_result_criterion"] == "verified weekly report exists"
+    assert captured["autonomous_profile"] == "standard"

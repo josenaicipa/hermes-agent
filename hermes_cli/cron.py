@@ -354,6 +354,7 @@ def cron_create(args):
         no_agent=getattr(args, "no_agent", False) or None,
         category=getattr(args, "category", None),
         material_result_criterion=getattr(args, "material_result_criterion", None),
+        autonomous_profile=getattr(args, "autonomous_profile", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -421,6 +422,7 @@ def cron_edit(args):
         no_agent=getattr(args, "no_agent", None),
         category=getattr(args, "category", None),
         material_result_criterion=getattr(args, "material_result_criterion", None),
+        autonomous_profile=getattr(args, "autonomous_profile", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -470,8 +472,9 @@ def cron_repair():
     """Canonicalize a legacy/hand-edited jobs.json via the central write gate.
 
     Load paths are pure-read; this is the only explicit rewrite for bare-list
-    and control-character stores. Admission-invalid enabled LLM records fail
-    closed with a clear error and leave the file byte-identical.
+    and control-character stores. Existing admission-incomplete enabled LLM
+    records are grandfathered during this rewrite so the repair command cannot
+    brick the store; enabling a previously disabled record still fails closed.
     """
     from cron.jobs import LlmCronAdmissionError, repair_legacy_jobs_store
 
