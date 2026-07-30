@@ -74,14 +74,16 @@ class TestStripUnrecognizedToolArgs:
         with patch("model_tools.registry.get_schema", return_value=schema):
             args = {"name": "click", "selector": "#submit"}
             result = strip_unrecognized_tool_args("test_tool", args)
-            assert result == args
+            assert result == {"name": "click", "selector": "#submit"}
+            assert "selector" in result
 
     def test_open_schema_without_additional_properties_is_not_filtered(self):
         schema = self._mock_schema({"name": {"type": "string"}}, None)
         with patch("model_tools.registry.get_schema", return_value=schema):
             args = {"name": "click", "selector": "#submit"}
             result = strip_unrecognized_tool_args("test_tool", args)
-            assert result == args
+            assert result == {"name": "click", "selector": "#submit"}
+            assert "selector" in result
 
     @pytest.mark.parametrize(
         ("keyword", "value"),
@@ -99,7 +101,8 @@ class TestStripUnrecognizedToolArgs:
         with patch("model_tools.registry.get_schema", return_value=schema):
             args = {"name": "click", "extra": "valid-via-schema"}
             result = strip_unrecognized_tool_args("test_tool", args)
-            assert result == args
+            assert result == {"name": "click", "extra": "valid-via-schema"}
+            assert "extra" in result
 
     def test_empty_properties_schema_strips_all_hallucinated_args(self):
         """A zero-arg tool (properties: {}) still must not silently accept
@@ -150,4 +153,8 @@ class TestStripUnrecognizedToolArgs:
         """Missing additionalProperties means open under JSON Schema semantics."""
         args = {"file_path": "/tmp/x", "hallucinated_extra_param": True}
         result = strip_unrecognized_tool_args("read_file", args)
-        assert result == args
+        assert result == {
+            "file_path": "/tmp/x",
+            "hallucinated_extra_param": True,
+        }
+        assert "hallucinated_extra_param" in result
