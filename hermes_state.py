@@ -2818,16 +2818,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row else None
 
+    # Bound the strict lineage walk defensively. Mirrors the bound used by
+    # ``get_compression_tip``: chains this deep are pathological, and an
+    # unbounded walk over a corrupted parent pointer must never spin.
+    _MAX_COMPRESSION_LINEAGE_HOPS = 100
+
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
+        """Return the unique live continuation of a compression-ended session.
 
         A stale agent may observe that another compression path already rotated
         its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
-        ambiguous and fail closed rather than guessing which transcript owns
-        subsequent messages.
+        exactly one live continuation. Ambiguity fails closed rather than
+        guessing which transcript owns subsequent messages.
+
+        The parent may have been rotated more than once while this agent was
+        stalled (P -> C1 -> C2 -> C3), so the walk follows the canonical chain
+        across generations instead of only inspecting direct children. Every
+        hop must re-prove uniqueness: a single canonical candidate that is
+        either live (the tip) or itself compression-ended (keep walking).
+
+        This deliberately does NOT delegate to ``get_compression_tip``. That
+        helper is best-effort for read/routing healing — it ranks siblings and
+        picks a winner *through* ambiguity, which would defeat the fail-closed
+        contract adoption depends on — and it re-acquires ``self._lock`` per
+        hop, which would deadlock the non-reentrant lock held here. Holding the
+        lock across the whole walk also keeps the traversal a single consistent
+        snapshot rather than a series of racing reads.
+
+        Fails closed (returns ``None``) on: a parent that was not ended by
+        compression, ambiguity at any generation, a chain that dead-ends in a
+        non-compression end reason, missing/broken lineage, malformed rows, and
+        cycles or over-long chains from corrupted parent pointers.
         """
         if not parent_session_id:
             return None
@@ -2842,20 +2865,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 or parent["end_reason"] != "compression"
             ):
                 return None
-            rows = self._conn.execute(
-                """
-                SELECT * FROM sessions
-                WHERE parent_session_id = ?
-                  AND ended_at IS NULL
-                  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
-                  AND COALESCE(source, '') != 'tool'
-                ORDER BY started_at ASC
-                LIMIT 2
-                """,
-                (parent_session_id,),
-            ).fetchall()
-        return dict(rows[0]) if len(rows) == 1 else None
+            current = parent_session_id
+            seen = {current}
+            for _ in range(self._MAX_COMPRESSION_LINEAGE_HOPS):
+                # Candidates are canonical continuations only: branch,
+                # delegate and tool children never own the parent transcript.
+                # Siblings closed by anything other than compression (e.g. a
+                # stale 'ws_orphan_reap') are dead ends, not forks, so they are
+                # excluded here instead of being counted as ambiguity — that
+                # preserves the original one-hop tolerance for dead siblings.
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE parent_session_id = ?
+                      AND (ended_at IS NULL OR end_reason = 'compression')
+                      AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
+                      AND COALESCE(source, '') != 'tool'
+                    ORDER BY started_at ASC
+                    LIMIT 2
+                    """,
+                    (current,),
+                ).fetchall()
+                if len(rows) != 1:
+                    return None
+                row = rows[0]
+                child_id = row["id"]
+                if not child_id or child_id in seen:
+                    return None
+                if row["ended_at"] is None:
+                    return dict(row)
+                seen.add(child_id)
+                current = child_id
+        return None
 
     def publish_compression_child(
         self,
