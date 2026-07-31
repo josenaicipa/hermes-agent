@@ -1258,14 +1258,17 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "large",
                     "high-risk-review",
                     "retry",
+                    "experimental",
                 ],
                 "description": (
-                    "Optional fixed positive resource envelope for this LLM cron. "
-                    "Use light for short reminders, standard for ordinary work, "
-                    "implementation or large for longer tool-driven jobs, "
-                    "high-risk-review for bounded review work, and retry only for "
-                    "a scoped retry. Omit to use cron.autonomous_limits.default_profile. "
-                    "Unknown, empty, zero, or unlimited values fail closed."
+                    "Optional routing/audit label describing what kind of work this "
+                    "LLM cron does. Use light for short reminders, standard for "
+                    "ordinary work, implementation or large for longer tool-driven "
+                    "jobs, high-risk-review for review work, retry for a scoped "
+                    "retry, and experimental for exploratory jobs. This is a label "
+                    "only — it does NOT cap runtime, turns, tokens or spend. Omit to "
+                    "use cron.autonomous_limits.default_profile. Unknown, empty, "
+                    "zero, or unlimited values fail closed."
                 ),
             },
             "context_from": {

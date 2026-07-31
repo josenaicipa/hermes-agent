@@ -1,6 +1,6 @@
 # ADR-0001: Positive limits for autonomous model execution
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0002](ADR-0002-autonomous-profiles-as-labels.md) (2026-07-31)
 - **Date:** 2026-07-23
 - **Scope:** Hermes profile `vpsclone`
 - **Owners:** Jose / Hermes architecture

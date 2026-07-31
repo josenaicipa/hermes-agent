@@ -1108,7 +1108,7 @@ class TestGetDueJobs:
     def test_one_shot_run_claim_expires_after_ttl(self, tmp_cron_dir, monkeypatch):
         """A claiming tick that DIED mid-run must not wedge the one-shot forever:
         once the run_claim is older than the TTL it is re-dispatched (recovered)."""
-        # Pin the inactivity timeout unset so the derived TTL is deterministic.
+        # Pin the quiet-period hint unset so the derived TTL is deterministic.
         monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
         from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
         ttl = _oneshot_run_claim_ttl_seconds()
@@ -1133,26 +1133,29 @@ class TestGetDueJobs:
         assert [j["id"] for j in recovered] == ["wedged"]
 
     def test_run_claim_ttl_derived_from_cron_timeout(self, tmp_cron_dir, monkeypatch):
-        """The stale-recovery TTL tracks HERMES_CRON_TIMEOUT (3x headroom), with
-        the fixed constant as a floor, and falls back to the constant when runs
-        are unbounded (timeout=0)."""
+        """The stale-recovery TTL tracks the HERMES_CRON_TIMEOUT quiet-period
+        hint (3x headroom), with the fixed constant as a floor, and falls back
+        to the constant when no finite hint is configured (0).
+
+        Deriving the dead-owner TTL is the ONLY remaining role of that env var
+        since V2.9 — it does not bound, cap, or stop an agentic run."""
         from cron.jobs import (
             _oneshot_run_claim_ttl_seconds as ttl,
             ONESHOT_RUN_CLAIM_TTL_SECONDS as FLOOR,
         )
-        # Unset → default 600s inactivity → 1800s (== the historical constant).
+        # Unset → default 600s hint → 1800s (== the historical constant).
         monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
         assert ttl() == 1800.0
 
-        # A large custom timeout scales the TTL up (3x headroom).
+        # A large custom hint scales the TTL up (3x headroom).
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1200")
         assert ttl() == 3600.0
 
-        # A tiny timeout is floored so a claim can never expire mid-run.
+        # A tiny hint is floored so a claim can never expire mid-run.
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "30")
         assert ttl() == float(FLOOR)
 
-        # Unlimited runs (0) → no finite bound → fall back to the floor.
+        # No finite hint (0) → fall back to the floor.
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
         assert ttl() == float(FLOOR)
 

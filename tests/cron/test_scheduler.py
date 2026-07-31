@@ -1477,39 +1477,85 @@ class TestRunJobSessionPersistence:
             expected_session_id, "cron_complete"
         )
 
-    def test_run_job_timeout_finalizes_original_session(self, tmp_path, monkeypatch):
+    def test_run_job_failure_finalizes_compression_tip_session(self, tmp_path):
+        """A FAILED run must still finalize the session on its compression tip.
+
+        Session teardown lives in ``run_job``'s ``finally`` block, so it is
+        independent of *why* the run ended. This used to be exercised through
+        the scheduler's inactivity watchdog (which faked
+        ``concurrent.futures.wait`` as permanently incomplete); V2.9 removed
+        that watchdog entirely, so the invariant is now driven by a real
+        failure — the agent raises. No wall-clock, turn, token or spend cap is
+        involved, and the scheduler never interrupts the agent itself.
+        """
         job = {
-            "id": "timeout-job",
-            "name": "Timeout",
+            "id": "failure-session-job",
+            "name": "Failure",
             "prompt": "hello",
         }
-        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1")
 
-        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls), \
-             patch(
-                 "cron.scheduler.concurrent.futures.wait",
-                 return_value=(set(), set()),
-             ):
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
             mock_agent = mock_agent_cls.return_value
-            mock_agent.get_activity_summary.return_value = {
-                "seconds_since_activity": 2.0,
-                "last_activity_desc": "api_call_streaming",
-            }
-            fake_db.get_compression_tip.return_value = "timeout-compression-tip"
+            mock_agent.run_conversation.side_effect = RuntimeError(
+                "provider exploded"
+            )
+            fake_db.get_compression_tip.return_value = "failure-compression-tip"
 
             success, _output, _final_response, error = run_job(job)
 
         assert success is False
-        assert "TimeoutError" in error
+        assert "RuntimeError: provider exploded" in error
         original_session_id = mock_agent_cls.call_args.kwargs["session_id"]
-        mock_agent.interrupt.assert_called_once()
+        # The scheduler no longer stops runs on its own, so nothing in this
+        # path may call interrupt(); only a real caller/operator cancels.
+        mock_agent.interrupt.assert_not_called()
         fake_db.get_compression_tip.assert_called_once_with(original_session_id)
         assert (
             fake_db.set_session_title.call_args.args[0]
-            == "timeout-compression-tip"
+            == "failure-compression-tip"
         )
         fake_db.end_session.assert_called_once_with(
-            "timeout-compression-tip", "cron_complete"
+            "failure-compression-tip", "cron_complete"
+        )
+
+    def test_run_job_operator_cancellation_finalizes_session(self, tmp_path):
+        """Explicit cancellation still ends the run — and is still a failure.
+
+        Cancellation in V2.9 is caller-driven: something calls
+        ``agent.interrupt()`` and the conversation loop unwinds itself,
+        returning ``completed=False``. ``run_job`` must surface that as a
+        failure and still finalize the session.
+        """
+        job = {
+            "id": "cancelled-job",
+            "name": "Cancelled",
+            "prompt": "hello",
+        }
+
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            mock_agent = mock_agent_cls.return_value
+
+            def _cancelled_turn(*_args, **_kwargs):
+                # What run_conversation returns after an external interrupt.
+                mock_agent.interrupt("operator cancelled")
+                return {
+                    "final_response": "partial work",
+                    "completed": False,
+                    "failed": False,
+                    "turn_exit_reason": "interrupted_by_user",
+                    "messages": [],
+                }
+
+            mock_agent.run_conversation.side_effect = _cancelled_turn
+            fake_db.get_compression_tip.return_value = "cancelled-compression-tip"
+
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert error
+        mock_agent.interrupt.assert_called_once_with("operator cancelled")
+        fake_db.end_session.assert_called_once_with(
+            "cancelled-compression-tip", "cron_complete"
         )
 
     def test_run_job_reaps_stale_auxiliary_clients_per_tick(self, tmp_path):
@@ -1867,12 +1913,15 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "all good"
 
-    def test_run_job_marks_max_iteration_fallback_as_limit_failure(self, tmp_path):
-        """Exhausting max turns is a bounded failure, never a success delivery.
+    def test_run_job_never_delivers_an_incomplete_turn_as_success(self, tmp_path):
+        """An incomplete turn is a failure, never a healthy delivery.
 
-        A final no-tools fallback may still exist, but the scheduler must surface
-        ``limit_reason=max-turns`` and the one-rescope action instead of marking
-        the cron run healthy.
+        V2.9 runs cron with an unlimited iteration cap, so the scheduler no
+        longer translates ``max_iterations_reached`` into
+        ``limit_reason=max-turns`` / ``action=rescope-permitted`` (that whole
+        rescope guard is gone). The invariant that actually mattered survives
+        and is asserted here: a ``completed=False`` result — whatever produced
+        it — must fail the run and must not be delivered as the agent's answer.
         """
         job = {
             "id": "summary-job",
@@ -1909,11 +1958,17 @@ class TestRunJobSessionPersistence:
 
         assert success is False
         assert error is not None
-        combined = "\n".join(str(value or "") for value in (output, final_response, error))
-        assert "limit_reason=max-turns" in combined
-        assert "limit_count=1" in combined
-        assert "action=rescope-permitted" in combined
         assert "(FAILED)" in output
+        # The withheld fallback text surfaces as the failure reason...
+        assert "final fallback report" in error
+        # ...and is never returned as a deliverable answer.
+        assert final_response == ""
+        # The removed cap vocabulary must not reappear anywhere.
+        combined = "\n".join(str(value or "") for value in (output, final_response, error))
+        for banned in ("limit_reason=", "limit_count=", "action=rescope-permitted"):
+            assert banned not in combined, (
+                f"{banned!r} belongs to the removed autonomous-cap contract"
+            )
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
@@ -2085,11 +2140,14 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         fake_db.close.assert_called_once()
 
-    @pytest.mark.parametrize("timeout_value", ["600", "0"])
-    def test_run_job_heartbeats_oneshot_claim_in_both_wait_modes(
-        self, tmp_path, monkeypatch, timeout_value
-    ):
-        """Timed and unlimited one-shot monitors both refresh their owned claim."""
+    def test_run_job_heartbeats_oneshot_claim_while_waiting(self, tmp_path):
+        """The one-shot monitor refreshes its owned claim while the run works.
+
+        V2.9 has a single, no-cap wait path (there is no longer a timed vs.
+        unlimited monitor to parametrize over). The poll interval exists only
+        to pace this heartbeat: the first wait reports the worker still
+        running, the second reports it done.
+        """
         job = {
             "id": "heartbeat-job",
             "name": "heartbeat",
@@ -2107,15 +2165,31 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            # Completion is driven by the scripted ``wait`` results below, so
+            # ``done()`` changes only when the second wait reports completion.
+            # This gives exactly one heartbeat opportunity and also satisfies
+            # the teardown contract after the worker has completed.
+            def __init__(self):
+                self._done = False
+
+            def done(self):
+                return self._done
+
             def result(self):
                 return {"final_response": "ok"}
 
         fake_future = FakeFuture()
         fake_pool = MagicMock()
         fake_pool.submit.return_value = fake_future
-        wait_results = [(set(), set()), ({fake_future}, set())]
+        wait_results = iter([(set(), set()), ({fake_future}, set())])
+
+        def scripted_wait(*_args, **_kwargs):
+            done, pending = next(wait_results)
+            if done:
+                fake_future._done = True
+            return done, pending
+
         monotonic_ticks = itertools.count(step=61.0)
-        monkeypatch.setenv("HERMES_CRON_TIMEOUT", timeout_value)
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
@@ -2130,7 +2204,7 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent", FakeAgent), \
              patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", return_value=fake_pool), \
-             patch("cron.scheduler.concurrent.futures.wait", side_effect=wait_results), \
+             patch("cron.scheduler.concurrent.futures.wait", side_effect=scripted_wait), \
              patch("cron.scheduler.time.monotonic", side_effect=monotonic_ticks.__next__), \
              patch("cron.scheduler.heartbeat_run_claim", return_value=True) as heartbeat:
             success, _output, final_response, error = run_job(job)

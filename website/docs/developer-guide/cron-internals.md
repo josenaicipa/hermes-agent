@@ -213,7 +213,7 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 3600 seconds (1 hour)
 
-This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs have no scheduler-imposed budget at all: since V2.9 an agentic cron run is not stopped by wall-clock duration, API-call count, token totals, estimated spend, or inactivity, and it runs with an explicitly unlimited iteration cap (`resolve_cron_iteration_cap()` → `UNLIMITED_ITERATIONS`, never `agent.max_turns` and never the 500 default). Such a run ends when the agent finishes, when it is cancelled, or when the provider/model refuses. `HERMES_CRON_TIMEOUT` survives only as the quiet-period hint used to derive the one-shot run-claim dead-owner TTL. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
 
 ### Provider Recovery
 

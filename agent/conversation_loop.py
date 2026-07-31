@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.iteration_budget import cap_reached, iterations_available
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1255,7 +1256,10 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    # ``iterations_available`` keeps the historical bounded semantics
+    # (``api_call_count < max_iterations`` AND budget left) and returns True
+    # unconditionally when the cap is UNLIMITED_ITERATIONS.
+    while iterations_available(agent, api_call_count) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -6992,9 +6996,12 @@ def run_conversation(
             # If we're near the limit, break to avoid infinite loops.
             # Local processing errors are deterministic — stop immediately
             # rather than retrying until the budget is exhausted.
+            # ``cap_reached(agent, api_call_count + 1)`` is exactly
+            # ``api_call_count >= max_iterations - 1`` for a bounded cap, and
+            # stays False for an unlimited one (no "near the limit" exists).
             if (
                 _is_local_processing_error
-                or api_call_count >= agent.max_iterations - 1
+                or cap_reached(agent, api_call_count + 1)
             ):
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"

@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.iteration_budget import IterationBudget
+from agent.iteration_budget import IterationBudget, IterationCap, iteration_cap_repr
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -462,7 +462,9 @@ def init_agent(
     command: str = None,
     args: list[str] | None = None,
     model: str = "",
-    max_iterations: int = 500,  # Default tool-calling iterations (shared with subagents)
+    # Default tool-calling iterations (shared with subagents). May also be
+    # ``UNLIMITED_ITERATIONS`` for a true-unlimited run (cron agentic jobs).
+    max_iterations: IterationCap = 500,
     tool_delay: float = 1.0,
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
@@ -1547,7 +1549,9 @@ def init_agent(
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
     agent._session_init_model_config = {
-        "max_iterations": agent.max_iterations,
+        # JSON-normalized: an unlimited cap persists as "unlimited", never as
+        # a raw sentinel object the session store cannot serialize.
+        "max_iterations": iteration_cap_repr(agent.max_iterations),
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }

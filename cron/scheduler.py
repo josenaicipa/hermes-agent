@@ -3172,8 +3172,9 @@ def run_job(
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     #
-    # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT, which
-    # only watches the agent's run_conversation below): SessionDB.__init__
+    # Bounded with its own timeout — this is startup I/O, not agent work, and
+    # is the ONE bounded step in run_job (the agent's run_conversation below
+    # has no scheduler-imposed cap): SessionDB.__init__
     # opens/migrates state.db synchronously and has no timeout of its own
     # against a wedged sqlite3.connect (e.g. a stale flock left by a crashed
     # sibling process). An unbounded hang here is invisible to every other
@@ -3220,8 +3221,9 @@ def run_job(
                 _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
             finally:
                 # Don't wait for a wedged connect() to unwind — abandon the
-                # worker thread (same pattern as the agent inactivity timeout
-                # further down) rather than blocking shutdown on it too.
+                # worker thread rather than blocking shutdown on it too
+                # (the agent supervisor further down uses the same
+                # non-blocking shutdown for its own worker pool).
                 _session_db_pool.shutdown(wait=False)
         else:
             # 0 = unlimited (legacy behavior, opt-in for debugging)
@@ -3643,15 +3645,18 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Autonomous limits: resolve a fixed positive profile BEFORE constructing
-        # AIAgent so unknown/sentinel/nonpositive profiles fail closed without a
-        # model spawn. max_iterations is the profile's max_turns (not global
-        # agent.max_turns). no_agent script-only jobs never reach this path.
+        # Autonomous profile: resolve the routing/audit LABEL before constructing
+        # AIAgent so unknown/sentinel labels fail closed without a model spawn.
+        # The label carries no resource envelope (V2.9) — the iteration cap comes
+        # from resolve_cron_iteration_cap() and is explicitly unlimited, never
+        # agent.max_turns and never the 500 default. no_agent script-only jobs
+        # never reach this path.
         from cron.autonomous_limits import (
             AutonomousLimitError,
             AutonomousProfileError,
             resolve_autonomous_profile,
-            run_with_autonomous_limits,
+            resolve_cron_iteration_cap,
+            run_supervised_agentic_run,
         )
 
         try:
@@ -3660,16 +3665,12 @@ def run_job(
             raise RuntimeError(
                 f"Cron autonomous profile rejected before agent spawn: {_profile_exc}"
             ) from _profile_exc
-        max_iterations = _auto_profile.max_turns
+        max_iterations = resolve_cron_iteration_cap()
         logger.info(
-            "Job '%s': autonomous profile=%s timeout=%ss max_turns=%s "
-            "token_budget=%s usd_budget=%s",
+            "Job '%s': autonomous profile=%s (label only) max_iterations=%s",
             job_id,
             _auto_profile.name,
-            _auto_profile.timeout_seconds,
-            _auto_profile.max_turns,
-            _auto_profile.token_budget,
-            _auto_profile.usd_budget,
+            max_iterations,
         )
 
         # Agentic-efficiency tipo is resolved before AIAgent construction so
@@ -3954,27 +3955,12 @@ def run_job(
                 (_session_db, _cron_session_id, job_name, job_id),
             )
         
-        # Run the agent with an *inactivity*-based timeout: the job can run
-        # for hours if it's actively calling tools / receiving stream tokens,
-        # but a hung API call or stuck tool with no activity for the configured
-        # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
-        #
-        # Uses the agent's built-in activity tracker (updated by
-        # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
-        _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+        # V2.9: agentic cron runs are NOT stopped by an inactivity watchdog.
+        # A long quiet stretch (a slow provider, a long-running tool) is not
+        # evidence of a hung run, and killing on it truncated legitimate work.
+        # The run ends when the agent ends, when the operator cancels it, or
+        # when the provider/model refuses — see cron/autonomous_limits.py.
+        # The poll interval only paces the run_claim heartbeat below.
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
@@ -4010,65 +3996,38 @@ def run_job(
 
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
-        # thread used by the autonomous-limits supervisor.
+        # thread used by the agentic-run supervisor.
         _cron_context = contextvars.copy_context()
-        # Supervised run: wall-clock hard timeout, max turns, token/USD budget,
-        # plus the existing inactivity watchdog. max_iterations_reached is
-        # treated as limit_reason=max-turns failure (never successful delivery).
-        # Pass task_id so the per-task cwd override registered above actually
-        # reaches the tool calls; it matches the agent's session_id so sandbox
-        # teardown (cleanup_vm) targets the same key.
+        # Supervised run — plumbing only, no resource caps (V2.9): worker
+        # Future for teardown, ContextVars, task_id and the run_claim
+        # heartbeat. Pass task_id so the per-task cwd override registered
+        # above actually reaches the tool calls; it matches the agent's
+        # session_id so sandbox teardown (cleanup_vm) targets the same key.
         try:
             # Model path reached: any return or exception from here records
-            # exactly one agentic_efficiency row (including limits/failures).
+            # exactly one agentic_efficiency row (including failures).
             _agentic_model_attempted = True
-            result = run_with_autonomous_limits(
+            result = run_supervised_agentic_run(
                 agent,
                 _auto_profile,
                 prompt=prompt,
-                task_key=str(job_id),
                 task_id=_job_task_id,
                 poll_interval=_POLL_INTERVAL,
                 heartbeat_fn=_heartbeat_run_claim_if_due,
-                inactivity_limit=_cron_inactivity_limit,
                 context=_cron_context,
             )
             _agentic_result = result if isinstance(result, dict) else None
         except AutonomousLimitError as _limit_exc:
-            # Re-raise so the outer except builds the failure delivery; the
-            # exception string already carries limit_reason=/limit_count=/action=
-            # for Discord/chat alerts.
+            # Administrative/manual stop only — no resource threshold raises
+            # this any more. Re-raise so the outer except builds the failure
+            # delivery; the string already carries limit_reason=/limit_count=/
+            # action= for Discord/chat alerts.
             logger.error(
                 "Job '%s' autonomous limit: %s",
                 job_name,
                 _limit_exc,
             )
             raise
-        except TimeoutError as _idle_exc:
-            # Inactivity path preserved from the pre-limits watchdog.
-            _activity = {}
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    _activity = agent.get_activity_summary()
-                except Exception:
-                    pass
-            _last_desc = _activity.get("last_activity_desc", "unknown")
-            _secs_ago = _activity.get("seconds_since_activity", 0)
-            _cur_tool = _activity.get("current_tool")
-            _iter_n = _activity.get("api_call_count", 0)
-            _iter_max = _activity.get("max_iterations", 0)
-            logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
-                "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
-                _cur_tool or "none",
-            )
-            raise TimeoutError(
-                f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit or 0)}s) "
-                f"— last activity: {_last_desc}"
-            ) from _idle_exc
 
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
@@ -4084,9 +4043,10 @@ def run_job(
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
         #
-        # max_iterations_reached is already converted to AutonomousLimitError
-        # inside run_with_autonomous_limits (limit_reason=max-turns) — never
-        # treat it as a successful fallback delivery here.
+        # Cron runs with an unlimited iteration cap, so max_iterations_reached
+        # is unreachable here; if some other path ever reports it, the
+        # completed=False check below still treats it as a failure and never
+        # as a successful fallback delivery.
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
         if result.get("failed") is True or result.get("completed") is False:
@@ -4259,7 +4219,7 @@ def run_job(
         # Telemetry is deliberately last: a synchronous ledger write can fail
         # (for example on ENOSPC/read-only storage), but that must never skip
         # compression restoration, ContextVar cleanup, session finalization,
-        # or agent/resource teardown. Hard-limit and inactivity paths can
+        # or agent/resource teardown. An early-returning failure path can
         # return while the worker thread is still unwinding; in that case this
         # attaches a callback after teardown has been scheduled so messages
         # and token totals are read only after the worker is done.

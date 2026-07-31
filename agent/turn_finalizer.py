@@ -25,6 +25,11 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.iteration_budget import (
+    cap_reached,
+    iteration_cap_repr,
+    iterations_exhausted,
+)
 from agent.message_content import flatten_message_text
 
 
@@ -91,10 +96,9 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
-    budget_exhausted = (
-        api_call_count >= agent.max_iterations
-        or agent.iteration_budget.remaining <= 0
-    )
+    # Unlimited caps are never "exhausted": there is no ceiling to summarise
+    # against, so the budget-fallback branches below stay unreachable.
+    budget_exhausted = iterations_exhausted(agent, api_call_count)
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
@@ -196,7 +200,7 @@ def finalize_turn(
         final_response is not None
         and not failed
         and (
-            api_call_count < agent.max_iterations
+            not cap_reached(agent, api_call_count)
             or normal_text_response
         )
     )
@@ -378,12 +382,13 @@ def finalize_turn(
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
     _diag_msg = (
-        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+        "Turn ended: reason=%s model=%s api_calls=%d/%s budget=%d/%s "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
-        _budget_used, _budget_max,
+        _turn_exit_reason, agent.model, api_call_count,
+        iteration_cap_repr(agent.max_iterations),
+        _budget_used, iteration_cap_repr(_budget_max),
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",
     )

@@ -49,14 +49,6 @@ _UNSET = "__UNSET__"
 _STATE: dict = {}
 
 
-class _FakeEnvironment:
-    def __init__(self):
-        self.cleaned = False
-
-    def cleanup(self):
-        self.cleaned = True
-
-
 class _FakeAgent:
     """Stand-in for ``run_agent.AIAgent`` that records the cwd-isolation
     signals visible while ``run_conversation`` runs, without touching a real
@@ -103,25 +95,20 @@ class _FakeAgent:
             entered.set()
         blocker = _STATE.get("block_event")
         if blocker is not None:
+            # Deterministic test-process guard only — never an agent cap.
             blocker.wait(timeout=10)
-        late_env = _STATE.get("late_env")
-        if late_env is not None and task_id:
-            from tools import terminal_tool
-
-            with terminal_tool._env_lock:
-                terminal_tool._active_environments[task_id] = late_env
 
         if _STATE.get("raise_in_run"):
             raise RuntimeError("boom (injected agent failure)")
         return {"final_response": "done", "messages": []}
 
     def get_activity_summary(self):
+        # Read only by run_job's failure diagnostics; no threshold uses it.
         return {
-            "seconds_since_activity": _STATE.get("idle_seconds", 0.0),
-            "last_activity_desc": "test agent blocked",
+            "last_activity_desc": "test agent working",
             "current_tool": "terminal",
             "api_call_count": 1,
-            "max_iterations": 10,
+            "max_iterations": "unlimited",
         }
 
     def interrupt(self, *_a, **_k):
@@ -171,7 +158,9 @@ def stub_run_job(monkeypatch):
     monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
     monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
     monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
-    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+    # No HERMES_CRON_TIMEOUT setup needed: since V2.9 the agent run has no
+    # scheduler-imposed cap, and the poll loop returns as soon as the worker
+    # future completes.
 
     # run_job re-loads ~/.hermes/.env; keep it from clobbering TERMINAL_CWD.
     import dotenv
@@ -303,41 +292,62 @@ class TestRunJobCleanup:
         assert cur in ("", rc._UNSET), f"_SESSION_CWD not cleared after failure: {cur!r}"
 
 
-    def test_timeout_keeps_override_until_worker_finishes(self, tmp_path, monkeypatch, fake_agent_state, stub_run_job):
-        """A timed-out agent may still unwind in its worker thread; its cwd
-        override must survive until that future is actually done."""
-        from tools.terminal_tool import resolve_task_overrides
+    def test_teardown_keeps_override_until_worker_future_finishes(
+        self, tmp_path, monkeypatch, fake_agent_state, stub_run_job
+    ):
+        """Teardown must defer while the worker Future is still in flight.
+
+        Previously this scenario was reached through the inactivity watchdog,
+        which returned control to the scheduler while the worker thread was
+        still unwinding. V2.9 removed that watchdog (agentic cron runs are not
+        stopped by inactivity), so the invariant is exercised directly against
+        ``_teardown_cron_agent``: an agent whose ``_cron_worker_future`` has
+        not completed must keep its per-task cwd override — and stay unclosed —
+        until that future is done.
+        """
+        import concurrent.futures
+
+        from tools.terminal_tool import (
+            register_task_env_overrides,
+            resolve_task_overrides,
+        )
 
         sched = stub_run_job
-        entered = threading.Event()
-        release = threading.Event()
-        _STATE["entered_event"] = entered
-        _STATE["block_event"] = release
-        _STATE["idle_seconds"] = 999.0
-        late_env = _FakeEnvironment()
-        _STATE["late_env"] = late_env
-        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.01")
+        task_id = "cron-teardown-defer"
+        register_task_env_overrides(
+            task_id, {"cwd": str(tmp_path), "isolate_env": True}
+        )
+
+        closed: list[str] = []
+
+        class _Agent:
+            def __init__(self):
+                self._cron_cleanup_task_id = task_id
+
+            def close(self):
+                closed.append(task_id)
+
+        agent = _Agent()
+        pending: concurrent.futures.Future = concurrent.futures.Future()
+        agent._cron_worker_future = pending
 
         try:
-            ok, _out, _resp, err = sched.run_job(_workdir_job("timeout", tmp_path))
-            assert ok is False
-            assert "TimeoutError" in (err or "")
-            assert entered.is_set()
-            sid = next(iter(_STATE["run"]))
-            assert resolve_task_overrides(sid)["cwd"] == str(tmp_path)
-            assert sid not in _STATE.get("closed", [])
+            sched._teardown_cron_agent(agent, "job-teardown-defer")
 
-            release.set()
+            # Worker still running: nothing may be released yet.
+            assert closed == []
+            assert resolve_task_overrides(task_id)["cwd"] == str(tmp_path)
+
+            # Worker finishes -> deferred teardown fires.
+            pending.set_result({"final_response": "done", "messages": []})
             deadline = time.monotonic() + 2
-            while (
-                (resolve_task_overrides(sid) or not late_env.cleaned)
-                and time.monotonic() < deadline
-            ):
+            while resolve_task_overrides(task_id) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            assert resolve_task_overrides(sid) == {}
-            assert late_env.cleaned is True
+            assert closed == [task_id]
+            assert resolve_task_overrides(task_id) == {}
         finally:
-            release.set()
+            if not pending.done():
+                pending.set_result(None)
 
 
 # ---------------------------------------------------------------------------

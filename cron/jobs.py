@@ -379,10 +379,9 @@ def get_cron_output_dir() -> Path:
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
-# the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
-# in which case no finite run bound exists to derive from. Also acts as the
-# floor for the derived value so a very short configured timeout can't make the
-# claim expire mid-run.
+# ``HERMES_CRON_TIMEOUT`` is 0, in which case no finite hint exists to derive
+# from. Also acts as the floor for the derived value so a very short configured
+# value can't make the claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 
 # Stale-recovery TTL for a multi-machine / manual ``fire_claim`` (#Phase 4C).
@@ -391,39 +390,40 @@ ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 # After this TTL with no refresh, another fire may reclaim (crashed owner).
 FIRE_CLAIM_TTL_SECONDS = 300
 
-# The derived TTL is the cron inactivity timeout times this headroom multiplier.
-# A healthy run clears its claim via mark_job_run() long before the TTL; the
-# TTL only recovers a claim left by a tick that DIED mid-run. HERMES_CRON_TIMEOUT
-# is an *inactivity* limit, not a wall-clock cap — a job that keeps producing
-# output legitimately runs past it — so the multiplier gives comfortable
-# headroom over any healthy run before we treat a claim as stale.
+# The derived TTL is the configured quiet-period hint times this headroom
+# multiplier. A healthy run clears its claim via mark_job_run() long before the
+# TTL, and refreshes it from the scheduler heartbeat while it works; the TTL
+# only recovers a claim left by a tick that DIED mid-run.
 _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
-_DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
+_DEFAULT_CRON_QUIET_PERIOD_HINT = 600.0
 
 
 def _oneshot_run_claim_ttl_seconds() -> float:
     """Resolve the one-shot running-claim stale-recovery TTL.
 
-    Derived from ``HERMES_CRON_TIMEOUT`` (the cron inactivity timeout the
-    scheduler enforces on each run) so the safety valve tracks how long a run
-    is actually allowed to go quiet, instead of a magic constant:
+    Since V2.9 the scheduler no longer stops agentic runs on inactivity, so
+    ``HERMES_CRON_TIMEOUT`` bounds nothing by itself — it survives only as the
+    operator-tunable hint for how long a run may plausibly go quiet, which is
+    exactly what this dead-owner TTL needs:
 
-    - unset / invalid → default 600s inactivity limit → TTL = 1800s
-    - ``0`` (unlimited runs) → no finite bound to derive from → fall back to
+    - unset / invalid → default 600s hint → TTL = 1800s
+    - ``0`` → no finite hint to derive from → fall back to
       ``ONESHOT_RUN_CLAIM_TTL_SECONDS``
     - positive N → ``max(N * headroom, ONESHOT_RUN_CLAIM_TTL_SECONDS)`` so a
-      tiny configured timeout can never expire a claim mid-run.
+      tiny configured value can never expire a claim mid-run.
+
+    A live run is protected by the heartbeat regardless of this value.
     """
     raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    timeout = _DEFAULT_CRON_QUIET_PERIOD_HINT
     if raw:
         try:
             timeout = float(raw)
         except (ValueError, TypeError):
-            timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+            timeout = _DEFAULT_CRON_QUIET_PERIOD_HINT
     if timeout <= 0:
-        # Unlimited runs — cannot bound; use the fixed fallback floor.
+        # No finite hint configured; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
     return max(
         timeout * _ONESHOT_RUN_CLAIM_TTL_HEADROOM,
@@ -1581,7 +1581,7 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
 
 
 def _normalize_autonomous_profile(value: Any) -> Optional[str]:
-    """Return a canonical positive profile name, or None to use the default."""
+    """Return a canonical profile label, or None to use the default."""
     if value is None:
         return None
     from cron.autonomous_limits import resolve_autonomous_profile
@@ -1662,9 +1662,10 @@ def create_job(
         material_result_criterion: Required for new LLM crons. Non-empty
                 description of the verifiable material result that counts as
                 success for this job.
-        autonomous_profile: Optional fixed positive resource envelope for this
-                job (light, standard, implementation, large, high-risk-review,
-                or retry). Omit to use cron.autonomous_limits.default_profile.
+        autonomous_profile: Optional routing/audit label for this job (light,
+                standard, implementation, large, high-risk-review, retry, or
+                experimental). It is a label only and caps nothing. Omit to
+                use cron.autonomous_limits.default_profile.
 
     Returns:
         The created job dict
@@ -2717,7 +2718,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 needs_save = True
 
     # Resolve the one-shot running-claim stale-recovery TTL once per scan
-    # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
+    # (derived from the HERMES_CRON_TIMEOUT quiet-period hint, which does not
+    # cap runs). See _oneshot_run_claim_ttl_seconds.
     _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
 
     for job in jobs:

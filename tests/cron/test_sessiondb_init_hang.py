@@ -3,8 +3,7 @@
 Real-world incident: a cron job's ``SessionDB()`` construction inside
 ``run_job`` blocked forever (a wedged sqlite3.connect against state.db, no
 other process holding a competing lock by the time it was diagnosed). Because
-that call had no timeout of its own — unlike the agent's run_conversation,
-which is already bounded by HERMES_CRON_TIMEOUT — the worker thread submitted
+that call had no timeout of its own, the worker thread submitted
 by ``_submit_with_guard`` never returned. Its ``finally`` block, which is the
 only thing that discards the job ID from ``_running_job_ids``, never ran.
 Every later tick logged "already running — skipping" and the job never fired
@@ -14,6 +13,11 @@ These tests prove ``run_job`` now bounds the SessionDB init with its own
 timeout (HERMES_CRON_SESSION_DB_TIMEOUT, default 10s) so a hang there can
 never again wedge the job past that bound, and — end to end — that the
 dispatch guard is released and the job becomes dispatchable again afterward.
+
+This bound covers *startup I/O only*. Since V2.9 the agent's own
+``run_conversation`` has no scheduler-imposed cap at all (no wall-clock,
+turn, token, spend or inactivity limit) — see
+``docs/adr/ADR-0002-autonomous-profiles-as-labels.md``.
 
 Note: each test releases its ``never_set`` event in a ``finally`` before
 returning. concurrent.futures.thread registers an atexit hook that joins
@@ -83,7 +87,7 @@ class TestSessionDbInitTimeout:
 
     def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still
-        bounds the call (mirrors HERMES_CRON_TIMEOUT's own fallback)."""
+        bounds the call with the default."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "not-a-number")
         fake_db = MagicMock()
         job = {"id": "bad-timeout-env", "name": "test", "prompt": "hello"}

@@ -97,9 +97,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--autonomous-profile",
         choices=(
             "light", "standard", "implementation", "large",
-            "high-risk-review", "retry",
+            "high-risk-review", "retry", "experimental",
         ),
-        help="Fixed positive resource envelope for this job; omit for the configured default.",
+        help=(
+            "Routing/audit label for this job (it caps nothing); "
+            "omit for the configured default."
+        ),
     )
 
     # cron edit
@@ -192,9 +195,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--autonomous-profile",
         choices=(
             "light", "standard", "implementation", "large",
-            "high-risk-review", "retry",
+            "high-risk-review", "retry", "experimental",
         ),
-        help="Set the fixed positive resource envelope for this job.",
+        help="Set the routing/audit label for this job (it caps nothing).",
     )
 
     # lifecycle actions

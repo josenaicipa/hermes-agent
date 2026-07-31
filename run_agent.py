@@ -113,7 +113,12 @@ from agent.process_bootstrap import (
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
 )
-from agent.iteration_budget import IterationBudget
+from agent.iteration_budget import (  # noqa: F401  # re-exported for callers
+    UNLIMITED_ITERATIONS,
+    IterationBudget,
+    IterationCap,
+    iteration_cap_repr,
+)
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -439,7 +444,9 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 500,  # Default tool-calling iterations (shared with subagents)
+        # Default tool-calling iterations (shared with subagents). May also be
+        # ``UNLIMITED_ITERATIONS`` for a true-unlimited run (cron agentic jobs).
+        max_iterations: IterationCap = 500,
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -3765,9 +3772,11 @@ class AIAgent:
             "seconds_since_activity": round(elapsed, 1),
             "current_tool": self._current_tool,
             "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
+            # JSON-safe: an unlimited cap reports as "unlimited" so gateway /
+            # cron diagnostics can log or serialize this snapshot verbatim.
+            "max_iterations": iteration_cap_repr(self.max_iterations),
             "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
+            "budget_max": iteration_cap_repr(self.iteration_budget.max_total),
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
