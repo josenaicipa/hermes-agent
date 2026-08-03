@@ -2127,11 +2127,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         failing construction closed and leaving the interrupted migration's
         legacy table in place for diagnosis and recovery.
 
-        The previous timeout is restored in ``finally`` so the normal write
-        path keeps its short 1 s timeout plus application-level jitter retry
+        The previous timeout is restored afterwards so the normal write path
+        keeps its short 1 s timeout plus application-level jitter retry
         (which is what avoids the convoy effect under sustained load).
         Schema init runs once per construction, not per write, so the wider
         handler is not a convoy risk.
+
+        Restoration is NOT best-effort on the success path.  Handing back a
+        connection still carrying the 15 s handler would silently change the
+        contention behaviour of every subsequent write on it — a live
+        gateway's ``append_message`` would block for 15 s per attempt instead
+        of 1 s, inflating ``_execute_write``'s budget ~15x with no signal.  A
+        failed restore therefore fails construction.  When ``_init_schema``
+        itself raised, the original exception is what the caller must see, so
+        restoration there is best-effort and merely logged.
         """
         previous_ms: Optional[int] = None
         try:
@@ -2153,16 +2162,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         try:
             self._init_schema()
-        finally:
+        except BaseException:
+            # Preserve the original failure: it is the actionable one. Put the
+            # handler back if we can, but never let a restore error replace or
+            # chain over the cause of the construction failure.
             if previous_ms is not None:
                 try:
                     self._conn.execute(f"PRAGMA busy_timeout = {previous_ms}")
                 except sqlite3.Error as exc:
-                    # Restoration is best effort and must never mask the
-                    # in-flight exception.
-                    logger.debug(
-                        "Could not restore busy_timeout after schema init: %s", exc
+                    logger.warning(
+                        "Could not restore busy_timeout after a failed schema "
+                        "init (connection is being discarded): %s", exc,
                     )
+            raise
+        if previous_ms is not None:
+            try:
+                self._conn.execute(f"PRAGMA busy_timeout = {previous_ms}")
+            except sqlite3.Error as exc:
+                # Fail closed: a usable-looking SessionDB whose every write
+                # silently inherits the 15 s handler is worse than no
+                # SessionDB, because callers cannot detect it.
+                raise sqlite3.OperationalError(
+                    "state.db schema init completed but the connection's "
+                    f"busy_timeout could not be restored to {previous_ms}ms "
+                    f"({exc}); refusing to return a connection with the "
+                    "widened schema-init handler"
+                ) from exc
 
     def _execute_write(
         self,

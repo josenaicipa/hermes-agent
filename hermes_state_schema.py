@@ -232,6 +232,133 @@ class SessionSchemaMixin:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    # Name the interrupted-rebuild table carries between the RENAME and the
+    # DROP.  Its mere existence means a previous rebuild did not finish.
+    _GATEWAY_ROUTING_LEGACY = "gateway_routing_legacy_pk"
+    _GATEWAY_ROUTING_PK = ["scope", "session_key"]
+    # Columns the copy needs.  A source table missing any of them is not a
+    # shape we can merge, so we fail closed instead of guessing.
+    _GATEWAY_ROUTING_REQUIRED = ("session_key", "entry_json", "updated_at")
+    _GATEWAY_ROUTING_NEW_TABLE_SQL = """CREATE TABLE IF NOT EXISTS gateway_routing (
+    scope TEXT NOT NULL DEFAULT '',
+    session_key TEXT NOT NULL,
+    entry_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (scope, session_key)
+)"""
+
+    @staticmethod
+    def _pragma_col(row, idx, name):
+        return row[idx] if isinstance(row, (tuple, list)) else row[name]
+
+    def _table_shape(self, cursor: sqlite3.Cursor, table: str):
+        """Return ``(columns, pk_cols)`` for *table*, or ``None`` if absent."""
+        try:
+            rows = cursor.execute(f'PRAGMA table_info("{table}")').fetchall()
+        except sqlite3.OperationalError:
+            return None
+        if not rows:
+            return None
+        columns = [self._pragma_col(r, 1, "name") for r in rows]
+        pk_cols = [
+            self._pragma_col(r, 1, "name")
+            for r in sorted(
+                (r for r in rows if self._pragma_col(r, 5, "pk")),
+                key=lambda r: self._pragma_col(r, 5, "pk"),
+            )
+        ]
+        return columns, pk_cols
+
+    def _merge_gateway_routing_legacy(
+        self, cursor: sqlite3.Cursor, legacy_columns
+    ) -> None:
+        """Fold ``gateway_routing_legacy_pk`` into canonical ``gateway_routing``.
+
+        Conflict rule — newest wins, canonical never loses a tie:
+
+        * a legacy row is written only when its ``updated_at`` is STRICTLY
+          greater than the canonical row already holding that
+          ``(scope, session_key)``.  So a canonical row written after the
+          interrupted rebuild (a live gateway kept saving routing entries
+          into the new table) is never clobbered by the older legacy copy;
+        * on an exact ``updated_at`` tie the canonical row is kept — strict
+          ``>`` makes that the defined outcome, not an accident of scan order;
+        * among legacy rows that collide with each other (only reachable on a
+          legacy table that lost its PK entirely — the shipped legacy shape
+          keys on ``session_key``, so it cannot contain duplicates) the
+          ordering ``updated_at, scope, session_key`` picks the winner
+          deterministically.  Positional ORDER BY is used so it cannot
+          reference a column the source table lacks.
+
+        Rows are never filtered: a legacy row with a NULL ``entry_json`` /
+        ``updated_at`` violates the canonical NOT NULL constraints and aborts
+        the whole repair, which is the fail-closed outcome we want.  Silently
+        skipping such rows would be data loss disguised as a clean open.
+
+        The trailing ``WHERE TRUE`` is required, not cosmetic: SQLite cannot
+        disambiguate ``ON CONFLICT`` from a join's ``ON`` clause in
+        ``INSERT ... SELECT ... ON CONFLICT`` without a WHERE clause.
+        """
+        scope_expr = (
+            "COALESCE(scope, '')" if "scope" in legacy_columns else "''"
+        )
+        cursor.execute(
+            f"""INSERT INTO gateway_routing
+                    (scope, session_key, entry_json, updated_at)
+                SELECT {scope_expr}, session_key, entry_json, updated_at
+                FROM "{self._GATEWAY_ROUTING_LEGACY}"
+                WHERE TRUE
+                ORDER BY 4 ASC, 1 ASC, 2 ASC
+                ON CONFLICT(scope, session_key) DO UPDATE SET
+                    entry_json = excluded.entry_json,
+                    updated_at = excluded.updated_at
+                WHERE excluded.updated_at > gateway_routing.updated_at"""
+        )
+
+    def _repair_gateway_routing(
+        self, cursor: sqlite3.Cursor, *, rename_first: bool, legacy_columns
+    ) -> None:
+        """Rebuild/recover ``gateway_routing`` atomically.
+
+        One SAVEPOINT wraps RENAME -> CREATE -> COPY -> DROP.  SQLite DDL is
+        transactional, so a failure anywhere in that sequence — including
+        ``database is locked`` — rolls the whole thing back and leaves the
+        original table exactly as it was.  That is what stops a fresh
+        interruption from ever producing the stranded-rows shape this method
+        also knows how to recover from.  (Same pattern, and same top-level
+        safety, as ``_rebuild_legacy_fts_indexes`` above: SAVEPOINT is valid
+        both in autocommit and inside a caller's transaction.)
+        """
+        savepoint = "hermes_heal_gateway_routing"
+        cursor.execute(f"SAVEPOINT {savepoint}")
+        try:
+            if rename_first:
+                cursor.execute(
+                    "ALTER TABLE gateway_routing "
+                    f'RENAME TO "{self._GATEWAY_ROUTING_LEGACY}"'
+                )
+                legacy_columns = list(legacy_columns)
+            # Recreates the canonical table for the recovery case where the
+            # interruption landed between the RENAME and the CREATE.
+            cursor.execute(self._GATEWAY_ROUTING_NEW_TABLE_SQL)
+            # Re-check under the repair: a concurrent constructor may have
+            # completed the same recovery between our inspection and here.
+            # Its DROP is only visible once it committed, so finding the
+            # table gone means the merge already happened.
+            if self._table_shape(cursor, self._GATEWAY_ROUTING_LEGACY) is None:
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+                return
+            self._merge_gateway_routing_legacy(cursor, legacy_columns)
+            # Only ever dropped after the merge succeeded, inside the same
+            # savepoint — so the rows are in the canonical table before the
+            # copy they came from disappears.
+            cursor.execute(f'DROP TABLE "{self._GATEWAY_ROUTING_LEGACY}"')
+        except BaseException:
+            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.
 
@@ -254,56 +381,77 @@ class SessionSchemaMixin:
         so a legacy-shaped table produces endless per-save warning spam.
         Rebuild it once, preserving rows.  On a session_key collision across
         scopes (possible while the PK was wrong) the newest row wins.
+
+        Recovery, not just migration.  The canonical PK shape alone is NOT
+        sufficient evidence that the rebuild finished: an interrupted rebuild
+        leaves a correctly-shaped but EMPTY ``gateway_routing`` next to a
+        ``gateway_routing_legacy_pk`` still holding every row.  Returning
+        early on the PK check alone (the pre-fix behaviour) declared that
+        database healthy forever and stranded the routing entries.  So the
+        leftover table is checked FIRST, and finding it triggers an
+        idempotent merge on the very next ``SessionDB()`` — no operator SQL.
+
+        Fails closed rather than guessing on shapes it cannot merge safely:
+        a source table missing ``session_key`` / ``entry_json`` /
+        ``updated_at``, or a leftover table sitting next to a canonical table
+        that is ITSELF still legacy-shaped (renaming over it would collide,
+        and merging into it would recreate the broken key).  Those raise, so
+        construction fails with the tables intact instead of silently
+        dropping or emptying anything.
         """
-        try:
-            rows = cursor.execute(
-                'PRAGMA table_info("gateway_routing")'
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return
-        if not rows:
-            return
+        canonical = self._table_shape(cursor, "gateway_routing")
+        legacy = self._table_shape(cursor, self._GATEWAY_ROUTING_LEGACY)
 
-        def _col(row, idx, name):
-            return row[idx] if isinstance(row, (tuple, list)) else row[name]
-
-        pk_cols = [
-            _col(r, 1, "name")
-            for r in sorted(
-                (r for r in rows if _col(r, 5, "pk")),
-                key=lambda r: _col(r, 5, "pk"),
+        if legacy is None:
+            if canonical is None:
+                return
+            if canonical[1] == self._GATEWAY_ROUTING_PK:
+                return  # healthy, and no interrupted rebuild to finish
+            missing = [
+                c for c in self._GATEWAY_ROUTING_REQUIRED
+                if c not in canonical[0]
+            ]
+            if missing:
+                raise sqlite3.DatabaseError(
+                    "gateway_routing has a legacy primary key but is missing "
+                    f"column(s) {missing}; refusing to rebuild it blindly"
+                )
+            logger.info(
+                "gateway_routing has legacy primary key %r; rebuilding with "
+                "composite (scope, session_key) key",
+                canonical[1],
             )
-        ]
-        if pk_cols == ["scope", "session_key"]:
+            self._repair_gateway_routing(
+                cursor, rename_first=True, legacy_columns=canonical[0]
+            )
             return
 
-        logger.info(
-            "gateway_routing has legacy primary key %r; rebuilding with "
-            "composite (scope, session_key) key",
-            pk_cols,
+        # A leftover legacy table means a previous rebuild was interrupted
+        # between its RENAME and its DROP.
+        legacy_columns, _legacy_pk = legacy
+        missing = [
+            c for c in self._GATEWAY_ROUTING_REQUIRED if c not in legacy_columns
+        ]
+        if missing:
+            raise sqlite3.DatabaseError(
+                f"{self._GATEWAY_ROUTING_LEGACY} exists but is missing column(s) "
+                f"{missing}; refusing to merge it into gateway_routing"
+            )
+        if canonical is not None and canonical[1] != self._GATEWAY_ROUTING_PK:
+            raise sqlite3.DatabaseError(
+                f"{self._GATEWAY_ROUTING_LEGACY} exists alongside a "
+                f"gateway_routing whose primary key is {canonical[1]!r}; this "
+                "shape is ambiguous and is left untouched for inspection"
+            )
+        logger.warning(
+            "%s left over from an interrupted gateway_routing rebuild; "
+            "merging its rows back into gateway_routing (newest updated_at "
+            "wins per (scope, session_key))",
+            self._GATEWAY_ROUTING_LEGACY,
         )
-        cursor.execute(
-            "ALTER TABLE gateway_routing RENAME TO gateway_routing_legacy_pk"
+        self._repair_gateway_routing(
+            cursor, rename_first=False, legacy_columns=legacy_columns
         )
-        cursor.execute(
-            """CREATE TABLE gateway_routing (
-    scope TEXT NOT NULL DEFAULT '',
-    session_key TEXT NOT NULL,
-    entry_json TEXT NOT NULL,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (scope, session_key)
-)"""
-        )
-        # INSERT OR REPLACE + updated_at ordering: if the broken PK ever let
-        # two scopes race over one session_key, keep the newest row per
-        # (scope, session_key) pair.
-        cursor.execute(
-            "INSERT OR REPLACE INTO gateway_routing "
-            "(scope, session_key, entry_json, updated_at) "
-            "SELECT COALESCE(scope, ''), session_key, entry_json, updated_at "
-            "FROM gateway_routing_legacy_pk ORDER BY updated_at ASC"
-        )
-        cursor.execute("DROP TABLE gateway_routing_legacy_pk")
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.

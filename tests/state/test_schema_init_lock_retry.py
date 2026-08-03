@@ -29,6 +29,20 @@ the rows stranded in the legacy table (reproduced:
 The shipped design therefore never replays: it widens SQLite's own busy
 handler for exactly one pass, so a contended statement waits *inside* the
 statement, and any terminal error propagates fail-closed.
+
+Two follow-on properties are covered here as well:
+
+  * **Recovery.** Failing closed is not enough on its own — the leftover
+    ``gateway_routing_legacy_pk`` has to be merged back automatically.  The
+    heal used to return as soon as the canonical table had the composite PK,
+    which declared an interrupted rebuild "healthy" forever
+    (``second_open_succeeded=True, canonical_rows=0, legacy_rows=3``).  It
+    now detects the leftover table first and merges it, newest
+    ``updated_at`` per ``(scope, session_key)`` winning and ties keeping the
+    canonical row, dropping the leftover only after the merge commits.
+  * **Atomicity.** The rebuild/recovery runs inside one SAVEPOINT, so a new
+    interruption rolls back to the original table instead of creating the
+    stranded shape at all.
 """
 
 import sqlite3
@@ -255,8 +269,17 @@ def test_widened_budget_is_restored_after_failure(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _make_legacy_gateway_routing_db(db_path):
-    """A DB whose ``gateway_routing`` still carries the pre-scope PK."""
+def _make_legacy_gateway_routing_db(db_path, *, wal: bool = False):
+    """A DB whose ``gateway_routing`` still carries the pre-scope PK.
+
+    ``wal=True`` pre-creates the file in WAL so ``apply_wal_with_fallback``
+    keeps WAL (it refuses to live-downgrade an on-disk WAL database), which
+    lets the recovery flow be exercised in the journal mode production runs.
+    """
+    if wal:
+        boot = sqlite3.connect(str(db_path), isolation_level=None)
+        boot.execute("PRAGMA journal_mode=WAL")
+        boot.close()
     SessionDB(db_path=db_path).close()
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
@@ -349,16 +372,29 @@ def test_lock_after_partial_migration_ddl_is_not_replayed(tmp_path):
     assert legacy_rows == 3
 
 
-def test_interrupted_migration_recovers_on_the_next_clean_open(tmp_path):
-    """The state left behind is recoverable, not a dead end."""
-    db_path = tmp_path / "state.db"
-    _make_legacy_gateway_routing_db(db_path)
+# ---------------------------------------------------------------------------
+# 4. Recovery: a plain second SessionDB() must heal the stranded rows
+# ---------------------------------------------------------------------------
+#
+# Nemo evidence at b9b7: {'second_open_succeeded': True, 'canonical_rows': 0,
+# 'legacy_rows': 3}.  `_heal_gateway_routing_pk` returned as soon as the
+# canonical table had the composite PK, without ever looking for the leftover
+# `gateway_routing_legacy_pk` — so the interrupted rebuild was declared
+# healthy forever and the routing rows stayed stranded.
+#
+# These tests use NO manual recovery SQL.  They damage the database the way
+# the pre-fix code did, then open SessionDB() and assert the rows are back.
 
-    real_heal = hermes_state_schema.SessionSchemaMixin._heal_gateway_routing_pk
-    fired = {"n": 0}
 
+def _damage_with_partial_rebuild(db_path):
+    """Leave the exact stranded-rows shape an interrupted rebuild produced.
+
+    Performed WITHOUT the savepoint the shipped code now uses, because that
+    is precisely the state of a database damaged by the older build — the
+    shipped path can no longer create it (see
+    ``test_shipped_rebuild_is_atomic_on_failure``).
+    """
     def _partial_then_locked(self, cursor):
-        fired["n"] += 1
         cursor.execute(
             "ALTER TABLE gateway_routing RENAME TO gateway_routing_legacy_pk"
         )
@@ -379,31 +415,273 @@ def test_interrupted_migration_recovers_on_the_next_clean_open(tmp_path):
     ):
         with pytest.raises(sqlite3.OperationalError):
             SessionDB(db_path=db_path)
-    assert fired["n"] == 1
 
-    # Real heal, uninjected: the rows are still there to be salvaged.
+    assert _routing_state(db_path) == (0, True, 3), (
+        "fixture did not produce the stranded-rows shape"
+    )
+
+
+def _routing_state(db_path):
+    """``(canonical_rows, legacy_present, legacy_rows)``."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        canonical = conn.execute(
+            "SELECT COUNT(*) FROM gateway_routing"
+        ).fetchone()[0]
+        legacy_present = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'gateway_routing_legacy_pk'"
+        ).fetchone()[0] > 0
+        legacy_rows = (
+            conn.execute(
+                "SELECT COUNT(*) FROM gateway_routing_legacy_pk"
+            ).fetchone()[0]
+            if legacy_present else 0
+        )
+        return canonical, legacy_present, legacy_rows
+    finally:
+        conn.close()
+
+
+def _routing_entries(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return dict(
+            conn.execute("SELECT session_key, entry_json FROM gateway_routing")
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
+def test_second_open_recovers_stranded_rows_without_manual_sql(tmp_path, wal):
+    """THE requirement: plain second ``SessionDB()``, zero operator SQL."""
+    db_path = tmp_path / "state.db"
+    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _damage_with_partial_rebuild(db_path)
+
+    # No recovery SQL of any kind — just open the database.
+    SessionDB(db_path=db_path).close()
+
+    canonical, legacy_present, _ = _routing_state(db_path)
+    assert canonical == 3, "stranded rows were not merged back"
+    assert legacy_present is False, "legacy table dropped only after the merge"
+    assert _routing_entries(db_path) == {
+        f"key-{i}": '{"session_id": "S%d"}' % i for i in range(3)
+    }
+
+
+@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
+def test_recovery_is_idempotent_across_repeat_opens(tmp_path, wal):
+    db_path = tmp_path / "state.db"
+    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _damage_with_partial_rebuild(db_path)
+
+    for _ in range(3):
+        SessionDB(db_path=db_path).close()
+        assert _routing_state(db_path) == (3, False, 0)
+
+
+@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
+def test_recovery_never_clobbers_a_newer_canonical_row(tmp_path, wal):
+    """Newest ``updated_at`` wins; an exact tie keeps the canonical row."""
+    db_path = tmp_path / "state.db"
+    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _damage_with_partial_rebuild(db_path)
+
+    # A live gateway kept writing routing entries into the new table while the
+    # rebuild was stuck: one strictly newer, one on an exact timestamp tie.
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO gateway_routing "
+            "INSERT INTO gateway_routing "
             "(scope, session_key, entry_json, updated_at) "
-            "SELECT COALESCE(scope, ''), session_key, entry_json, updated_at "
-            "FROM gateway_routing_legacy_pk ORDER BY updated_at ASC"
+            "VALUES ('', 'key-1', '{\"session_id\": \"NEWER\"}', 9999.0)"
         )
-        conn.execute("DROP TABLE gateway_routing_legacy_pk")
-        recovered = conn.execute(
-            "SELECT COUNT(*) FROM gateway_routing"
-        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO gateway_routing "
+            "(scope, session_key, entry_json, updated_at) "
+            "VALUES ('', 'key-2', '{\"session_id\": \"TIE\"}', 1002.0)"
+        )
     finally:
         conn.close()
-    assert recovered == 3
 
-    db = SessionDB(db_path=db_path)
-    db.close()
+    SessionDB(db_path=db_path).close()
+
+    entries = _routing_entries(db_path)
+    assert _routing_state(db_path) == (3, False, 0)
+    assert entries["key-1"] == '{"session_id": "NEWER"}', "newer row clobbered"
+    assert entries["key-2"] == '{"session_id": "TIE"}', "tie must keep canonical"
+    # ...and the legacy-only row is still merged in.
+    assert entries["key-0"] == '{"session_id": "S0"}'
+
+
+@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
+def test_recovers_when_interruption_landed_before_the_create(tmp_path, wal):
+    """RENAME committed but CREATE did not: canonical missing entirely."""
+    db_path = tmp_path / "state.db"
+    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute(
+            "ALTER TABLE gateway_routing RENAME TO gateway_routing_legacy_pk"
+        )
+    finally:
+        conn.close()
+
+    SessionDB(db_path=db_path).close()
+    assert _routing_state(db_path) == (3, False, 0)
+
+
+@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
+def test_shipped_rebuild_is_atomic_on_failure(tmp_path, wal):
+    """A failure inside the shipped rebuild rolls back to the original table.
+
+    This is what stops a NEW interruption from ever producing the stranded
+    shape: SQLite DDL is transactional, and the whole
+    RENAME/CREATE/COPY/DROP sequence runs in one savepoint.
+    """
+    db_path = tmp_path / "state.db"
+    _make_legacy_gateway_routing_db(db_path, wal=wal)
+
+    def _boom(self, cursor, legacy_columns):
+        raise sqlite3.OperationalError("database is locked")
+
+    with patch.object(
+        hermes_state_schema.SessionSchemaMixin,
+        "_merge_gateway_routing_legacy",
+        _boom,
+    ):
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            SessionDB(db_path=db_path)
+
+    # Fully rolled back: no leftover table, original rows and original PK.
+    canonical, legacy_present, _ = _routing_state(db_path)
+    assert legacy_present is False, "the RENAME was not rolled back"
+    assert canonical == 3
+    conn = sqlite3.connect(str(db_path))
+    try:
+        pk = [
+            r[1] for r in sorted(
+                (r for r in conn.execute('PRAGMA table_info("gateway_routing")')
+                 if r[5]),
+                key=lambda r: r[5],
+            )
+        ]
+    finally:
+        conn.close()
+    assert pk == ["session_key"], "original legacy table was not preserved"
+
+    # And a clean open still performs the real migration afterwards.
+    SessionDB(db_path=db_path).close()
+    assert _routing_state(db_path) == (3, False, 0)
+
+
+def test_malformed_leftover_table_fails_closed(tmp_path):
+    """A leftover we cannot merge must not be dropped or ignored."""
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE gateway_routing_legacy_pk "
+            "(session_key TEXT, junk TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO gateway_routing_legacy_pk VALUES ('k', 'v')"
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.DatabaseError, match="missing column"):
+        SessionDB(db_path=db_path)
+
+    # Nothing dropped, nothing emptied.
+    _canonical, legacy_present, legacy_rows = _routing_state(db_path)
+    assert (legacy_present, legacy_rows) == (True, 1)
+
+
+def test_ambiguous_double_legacy_shape_fails_closed(tmp_path):
+    """Leftover next to a still-legacy canonical table is not guessable."""
+    db_path = tmp_path / "state.db"
+    _make_legacy_gateway_routing_db(db_path)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE gateway_routing_legacy_pk ("
+            " session_key TEXT PRIMARY KEY,"
+            " entry_json TEXT NOT NULL,"
+            " updated_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO gateway_routing_legacy_pk VALUES ('x', '{}', 1.0)"
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.DatabaseError, match="ambiguous"):
+        SessionDB(db_path=db_path)
+
+    assert _routing_state(db_path) == (3, True, 1)
 
 
 # ---------------------------------------------------------------------------
-# 4. The normal write path is untouched
+# 5. busy_timeout restoration semantics
+# ---------------------------------------------------------------------------
+
+
+def _break_busy_timeout_restore(db):
+    """Make only ``PRAGMA busy_timeout = N`` fail on this connection."""
+    original = db._conn.execute
+
+    def _execute(sql, *args, **kwargs):
+        if isinstance(sql, str) and sql.startswith("PRAGMA busy_timeout ="):
+            raise sqlite3.OperationalError("pragma refused")
+        return original(sql, *args, **kwargs)
+
+    db._conn.execute = _execute
+
+
+def test_restore_failure_after_successful_init_fails_construction(tmp_path):
+    """Never hand back a connection still carrying the widened handler."""
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+
+    real_init = SessionDB._init_schema
+    ran = {"init": False}
+
+    def _init_then_break_restore(self):
+        real_init(self)
+        ran["init"] = True
+        _break_busy_timeout_restore(self)
+
+    with patch.object(SessionDB, "_init_schema", _init_then_break_restore):
+        with pytest.raises(
+            sqlite3.OperationalError, match="busy_timeout could not be restored"
+        ):
+            SessionDB(db_path=db_path)
+
+    assert ran["init"] is True, "the failure must come from the restore, not init"
+
+
+def test_restore_failure_after_failed_init_preserves_original_error(tmp_path):
+    """The actionable error is the schema failure, not the restore failure."""
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+
+    def _init_fails_and_breaks_restore(self):
+        _break_busy_timeout_restore(self)
+        raise sqlite3.OperationalError("ORIGINAL schema failure")
+
+    with patch.object(SessionDB, "_init_schema", _init_fails_and_breaks_restore):
+        with pytest.raises(
+            sqlite3.OperationalError, match="ORIGINAL schema failure"
+        ):
+            SessionDB(db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# 6. The normal write path is untouched
 # ---------------------------------------------------------------------------
 
 
