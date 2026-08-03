@@ -717,28 +717,6 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
-def is_lock_contention_error(exc: BaseException) -> bool:
-    """True if *exc* is SQLite's transient "another writer holds the lock".
-
-    ``SQLITE_BUSY`` / ``SQLITE_LOCKED`` both surface through
-    :class:`sqlite3.OperationalError` with ``database is locked`` /
-    ``database table is locked`` / ``database is busy`` text.  Unlike every
-    other SQLite error class this one means "nothing was written, try again" —
-    the transaction that hit it did no work — so it is the only class the
-    write layer is allowed to retry.
-
-    Single definition on purpose: ``_execute_write`` and the schema-init
-    retry must agree on exactly which failures are retryable, otherwise the
-    two paths drift into different durability guarantees (that drift is what
-    left ``SessionDB()`` construction with ~2 s of patience while every other
-    write had ~16 s).
-    """
-    if not isinstance(exc, sqlite3.OperationalError):
-        return False
-    msg = str(exc).lower()
-    return "locked" in msg or "busy" in msg
-
-
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
 
@@ -1595,6 +1573,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    # Lock patience for the one-shot schema-init pass, which cannot use the
+    # application-level retry above (see
+    # _run_init_schema_with_wide_busy_timeout: replaying a partially applied
+    # multi-statement migration strands rows in its legacy table). Derived
+    # from the same budget as a normal write — _WRITE_MAX_RETRIES attempts
+    # against the 1 s connection busy_timeout — so both write paths tolerate
+    # the same contention window; SQLite just does the waiting inside the
+    # contended statement instead. Bounds each contended statement, not the
+    # whole pass. Deliberately a derived invariant, not a tunable knob: no
+    # env var, no config key.
+    _SCHEMA_INIT_BUSY_TIMEOUT_MS = _WRITE_MAX_RETRIES * 1000
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -1748,7 +1737,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema_with_lock_retry()
+                self._run_init_schema_with_wide_busy_timeout()
 
             try:
                 _connect_and_init()
@@ -2109,57 +2098,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
-    def _init_schema_with_lock_retry(self) -> None:
-        """Run ``_init_schema`` with the same lock patience as a normal write.
+    def _run_init_schema_with_wide_busy_timeout(self) -> None:
+        """Run ``_init_schema`` ONCE, letting SQLite wait out writer contention.
 
         ``_init_schema`` writes (``executescript(SCHEMA_SQL)``, the deferred
-        index DDL, the ``active IS NULL`` heal, ``set_meta``, the
-        ``schema_version`` bump) execute directly on the connection and
-        bypass :meth:`_execute_write` entirely, so their only contention
-        tolerance was the connection's 1 s ``busy_timeout``.  Every other
-        write in this class routes through :meth:`_execute_write`, which
-        retries the lock-contention class 15 times with jitter — measured
-        ~16 s of patience.
-
-        Measured effect of that asymmetry: with a competing writer holding
-        the SQLite write lock, ``SessionDB()`` construction raised
+        index DDL, the reconciler's ``ALTER``s, the multi-statement table
+        rebuilds, ``set_meta``, the ``schema_version`` bump) execute directly
+        on the connection and bypass :meth:`_execute_write` entirely, so their
+        only contention tolerance was the connection's 1 s ``busy_timeout``.
+        Measured against a competing ``BEGIN IMMEDIATE``: construction raised
         ``database is locked`` after ~2 s, while an ``append_message`` on an
-        already-open handle survived the same contention for ~16 s.  A short
-        contention window could therefore fail construction outright, and
-        callers that treat a construction failure as "session store
-        unavailable" lose the features backed by it.  This retry closes the
-        gap so both paths share one budget.
+        already-open handle rode out the same contention for ~16 s.
 
-        Retrying is safe because ``_init_schema`` is idempotently rerunnable:
-        DDL is ``IF NOT EXISTS``, the column reconciler re-diffs live
-        columns, meta writes are UPSERTs, and the heal/version statements are
-        ``UPDATE ... WHERE`` guarded, so re-running after a partially applied
-        pass converges rather than duplicating.  Non-lock errors (including
-        the malformed-schema class that ``__init__`` repairs) propagate on
-        the first attempt, unchanged.
+        The pass must NOT be retried to close that gap.  Several migrations
+        are multi-statement rebuild sequences —
+        ``_heal_gateway_routing_pk`` and the v22 ``session_model_usage``
+        rebuild both do ``RENAME`` → ``CREATE`` → ``INSERT..SELECT`` →
+        ``DROP`` — whose intermediate state is durable and self-describing.
+        Re-entering ``_init_schema`` after a lock error landed mid-sequence
+        finds a canonical table that already has the new shape, skips the
+        copy as "already migrated", and reports success while the rows sit
+        stranded in the legacy table.
+
+        So instead of replaying anything, widen SQLite's own busy handler for
+        exactly one pass: a contended statement waits INSIDE the statement
+        and then proceeds, so no migration is ever partially replayed.  Any
+        error that still surfaces — lock or otherwise — propagates unchanged,
+        failing construction closed and leaving the interrupted migration's
+        legacy table in place for diagnosis and recovery.
+
+        The previous timeout is restored in ``finally`` so the normal write
+        path keeps its short 1 s timeout plus application-level jitter retry
+        (which is what avoids the convoy effect under sustained load).
+        Schema init runs once per construction, not per write, so the wider
+        handler is not a convoy risk.
         """
-        for attempt in range(self._WRITE_MAX_RETRIES):
-            try:
-                self._init_schema()
-                return
-            except sqlite3.OperationalError as exc:
-                if (
-                    not is_lock_contention_error(exc)
-                    or attempt == self._WRITE_MAX_RETRIES - 1
-                ):
-                    raise
-                # Best-effort: drop anything the failed pass may have left
-                # open (e.g. a partially applied savepoint block in the
-                # legacy FTS repair) so it cannot leak into the retry.
-                try:
-                    self._conn.rollback()
-                except Exception:
-                    pass
-                time.sleep(
-                    random.uniform(
-                        self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S
-                    )
+        previous_ms: Optional[int] = None
+        try:
+            row = self._conn.execute("PRAGMA busy_timeout").fetchone()
+            # Only widen when the prior value is known: without it the
+            # ``finally`` below could not put the connection back, and a
+            # connection left on the wide handler would silently change the
+            # normal write path's contention behaviour for its whole life.
+            if row is not None and row[0] is not None:
+                previous_ms = int(row[0])
+                self._conn.execute(
+                    f"PRAGMA busy_timeout = {int(self._SCHEMA_INIT_BUSY_TIMEOUT_MS)}"
                 )
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            # Never let the tuning step itself break construction — fall back
+            # to the connection's configured timeout.
+            logger.debug("Could not widen busy_timeout for schema init: %s", exc)
+            previous_ms = None
+
+        try:
+            self._init_schema()
+        finally:
+            if previous_ms is not None:
+                try:
+                    self._conn.execute(f"PRAGMA busy_timeout = {previous_ms}")
+                except sqlite3.Error as exc:
+                    # Restoration is best effort and must never mask the
+                    # in-flight exception.
+                    logger.debug(
+                        "Could not restore busy_timeout after schema init: %s", exc
+                    )
 
     def _execute_write(
         self,
@@ -2201,7 +2204,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._try_incremental_merge_fts()
                 return result
             except sqlite3.OperationalError as exc:
-                if is_lock_contention_error(exc):
+                err_msg = str(exc).lower()
+                if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
                     if attempt < self._WRITE_MAX_RETRIES - 1:
                         jitter = random.uniform(
