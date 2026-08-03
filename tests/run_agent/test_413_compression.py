@@ -16,7 +16,12 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    COMPACTION_ABORTED_STATUS,
+    COMPACTION_DONE_STATUS,
+    COMPACTION_SKIPPED_STATUS,
+    COMPACTION_STATUS,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -623,7 +628,11 @@ class TestPreflightCompression:
         assert compressed is messages
         assert prompt == "You are helpful."
         assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        # The phase still closes with kind="compacted" (that is what retires the
+        # desktop/TUI "Summarizing…" indicator), but a contended lock ran no
+        # compaction at all — so the text must not claim one completed.
+        assert events[-1] == ("compacted", COMPACTION_SKIPPED_STATUS)
+        assert COMPACTION_DONE_STATUS not in [text for _event, text in events]
 
     def test_compress_context_emits_one_terminal_status_after_an_abort(self, agent):
         """An aborted summary must retire the started desktop compaction phase."""
@@ -643,7 +652,10 @@ class TestPreflightCompression:
         assert compressed is messages
         assert prompt == "You are helpful."
         assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        # Same contract as the contended-lock case: the phase closes, but an
+        # aborted summary rewrote nothing and must not report success.
+        assert events[-1] == ("compacted", COMPACTION_ABORTED_STATUS)
+        assert COMPACTION_DONE_STATUS not in [text for _event, text in events]
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
         """A memory reload without new injected text must keep the cache prefix."""

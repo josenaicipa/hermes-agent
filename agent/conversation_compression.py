@@ -62,14 +62,45 @@ COMPACTION_STATUS = (
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
+# Truthful terminal edges for compaction phases that OPENED (COMPACTION_STATUS
+# was emitted) but never committed a boundary. They all keep ``kind="compacted"``
+# because that kind is what retires the desktop/TUI "Summarizing…" indicator
+# (apps/desktop/.../gateway-event.ts, tui_gateway/server.py::_status_update) —
+# only the TEXT differs, so no driver needs to learn a new kind. Claiming
+# "compaction complete" for a pass that never rewrote the transcript is what
+# made the 2026-08-03 vpsclone lock-contention incident unreadable in the
+# Discord scrollback (two "✓ complete" lines for two aborted attempts).
+COMPACTION_SKIPPED_STATUS = (
+    "⏭️ Context compaction skipped — continuing with the full transcript..."
+)
+COMPACTION_CANCELLED_STATUS = (
+    "⏹️ Context compaction cancelled — continuing with the full transcript..."
+)
+COMPACTION_ABORTED_STATUS = (
+    "⚠️ Context compaction did not complete — continuing with the full transcript..."
+)
 
-def _emit_compaction_done(agent: Any) -> None:
-    """Emit the structured terminal edge for a started compaction."""
+# outcome -> terminal status text. ``committed`` is the only success edge.
+COMPACTION_TERMINAL_STATUSES = {
+    "committed": COMPACTION_DONE_STATUS,
+    "skipped": COMPACTION_SKIPPED_STATUS,
+    "cancelled": COMPACTION_CANCELLED_STATUS,
+    "aborted": COMPACTION_ABORTED_STATUS,
+}
+
+
+def _emit_compaction_done(agent: Any, outcome: str = "committed") -> None:
+    """Emit the structured terminal edge for a started compaction.
+
+    ``outcome`` selects the truthful wording; the status *kind* stays
+    ``"compacted"`` for every outcome so a phase that opened always closes.
+    """
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
         return
+    status = COMPACTION_TERMINAL_STATUSES.get(outcome, COMPACTION_DONE_STATUS)
     try:
-        status_callback("compacted", COMPACTION_DONE_STATUS)
+        status_callback("compacted", status)
     except Exception:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 
@@ -227,6 +258,87 @@ class CompressionCommitFence:
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
+        # ── Lease handoff (2026-08-03 vpsclone incident) ────────────────────
+        # The worker owns a durable per-session compression lease for the whole
+        # (possibly minutes-long) summary call. Cancelling before the commit
+        # boundary means the worker can NEVER mutate the session again, so its
+        # lease is dead weight that blocks the very turn that cancelled it
+        # (SessionDB.append_message fails closed on a foreign live holder).
+        # The worker registers its release callback here so a winning
+        # cancellation can drop that lease immediately. Guarded by a SEPARATE
+        # lock: ``_lock`` is held for the entire commit boundary
+        # (begin_commit → finish_commit), and the worker unbinds from inside
+        # that boundary, so reusing ``_lock`` here would self-deadlock.
+        self._lease_lock = threading.Lock()
+        self._lease_release: Optional[Any] = None
+        self._lease_holder: Optional[str] = None
+        self._pending_lease_release: Optional[Any] = None
+
+    # ── Lease handoff ───────────────────────────────────────────────────────
+
+    def bind_lease(self, release: Any, *, holder: str) -> bool:
+        """Register the live compression lease and its idempotent release.
+
+        Returns ``False`` when cancellation already won — the caller has given
+        up on this compression, so the worker must release its lease and abort
+        instead of holding it for a result nobody will consume. ``_cancelled``
+        is only ever set to True (never reset) and is written under ``_lock``
+        before the canceller touches ``_lease_lock``, so both interleavings are
+        safe: either this bind publishes the lease and the canceller finds it,
+        or the canceller ran first and this bind is refused.
+        """
+        with self._lease_lock:
+            if self._cancelled:
+                return False
+            self._lease_release = release
+            self._lease_holder = holder
+            return True
+
+    def unbind_lease(self, holder: str) -> None:
+        """Drop a lease the worker released itself. Idempotent, holder-scoped.
+
+        A stale holder string (a newer acquire already rebound the fence) is
+        ignored so a late worker cannot detach somebody else's lease.
+        """
+        with self._lease_lock:
+            if self._lease_holder == holder:
+                self._lease_release = None
+                self._lease_holder = None
+                self._pending_lease_release = None
+
+    def _capture_cancelled_lease(self) -> Optional[Any]:
+        """Move the bound lease into the pending-release slot (cancel path)."""
+        with self._lease_lock:
+            release = self._lease_release
+            self._lease_release = None
+            self._lease_holder = None
+            if release is not None:
+                self._pending_lease_release = release
+            return release
+
+    def release_cancelled_lease(self) -> bool:
+        """Release the lease of a worker that lost the cancellation race.
+
+        Safe and idempotent: a no-op unless cancellation actually won before
+        the commit boundary, and the underlying release is holder-qualified so
+        it can never evict a newer holder. Blocks on a small SQLite write —
+        event-loop callers should run it in an executor.
+
+        Returns True when a pending release was executed by this call.
+        """
+        with self._lease_lock:
+            release = self._pending_lease_release
+            self._pending_lease_release = None
+        if release is None:
+            return False
+        try:
+            release()
+        except Exception:
+            logger.warning(
+                "cancelled compression lease release failed", exc_info=True
+            )
+            return False
+        return True
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -247,18 +359,31 @@ class CompressionCommitFence:
         Returns ``True`` when cancellation won before the commit boundary.
         Returns ``False`` when the worker had already entered the boundary; in
         that case acquiring this lock waits until all session mutation finishes.
+
+        On a winning cancellation the worker's compression lease is released
+        inline (this variant already blocks by contract — callers are worker
+        threads, not event loops). Event-loop callers use
+        :meth:`try_cancel_before_commit` plus :meth:`release_cancelled_lease`.
         """
         with self._lock:
             if self._commit_started:
                 return False
             self._cancelled = True
-            return True
+        self._capture_cancelled_lease()
+        self.release_cancelled_lease()
+        return True
 
     def try_cancel_before_commit(self) -> Optional[bool]:
         """Non-blocking form of :meth:`cancel_before_commit`.
 
         Returns ``None`` while an active commit owns the fence, allowing an
         async caller to yield instead of blocking its event loop.
+
+        A winning cancellation only ARMS the lease release (no SQLite write on
+        the caller's thread). The caller MUST then run
+        :meth:`release_cancelled_lease` — off-loop for async callers — before
+        it resumes writing to the session, otherwise the cancelled worker's
+        lease keeps failing its own turn's ``append_message`` closed.
         """
         if not self._lock.acquire(blocking=False):
             return None
@@ -266,9 +391,10 @@ class CompressionCommitFence:
             if self._commit_started:
                 return False
             self._cancelled = True
-            return True
         finally:
             self._lock.release()
+        self._capture_cancelled_lease()
+        return True
 
     def begin_commit(self) -> bool:
         """Enter the commit boundary unless cancellation already won."""
@@ -1431,7 +1557,7 @@ def compress_context(
         agent._emit_status(_compaction_status)
     _compaction_done_emitted = False
 
-    def _complete_compaction_lifecycle() -> None:
+    def _complete_compaction_lifecycle(outcome: str = "committed") -> None:
         nonlocal _compaction_done_emitted
         if _compaction_done_emitted:
             return
@@ -1440,7 +1566,7 @@ def compress_context(
         # compaction phase — emit no terminal edge either. Failure warnings
         # go through agent._emit_warning and are never suppressed here.
         if _compaction_status_emitted:
-            _emit_compaction_done(agent)
+            _emit_compaction_done(agent, outcome)
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -1601,22 +1727,43 @@ def compress_context(
                 split_status="aborted",
                 failure_class="lock_contended",
             )
-            _complete_compaction_lifecycle()
+            # NOT a completed compaction: the transcript is returned verbatim.
+            # Close the phase truthfully so the desktop indicator still retires.
+            _complete_compaction_lifecycle("skipped")
             return messages, _existing_sp
     _lock_released = False
+    # Serialises the two threads that can now drop this lease: the compression
+    # worker itself, and a commit-fence canceller that won the race before the
+    # commit boundary (gateway session hygiene). Exactly one of them issues the
+    # DELETE; the loser is a no-op.
+    _lock_release_guard = threading.Lock()
 
-    def _release_lock() -> None:
-        """Release the lock keyed on the OLD session_id (before rotation)."""
+    def _release_lock_lease() -> None:
+        """Drop the lease keyed on the OLD session_id. Idempotent, status-free.
+
+        Safe to call from a canceller thread: it only ever runs once the worker
+        can no longer mutate the session (fence cancelled) or once the worker
+        itself is done, and ``release_compression_lock`` is holder-qualified —
+        a newer holder's row can never be evicted by this call. Deliberately
+        emits NO user-visible status: the compaction lifecycle edge belongs to
+        the worker, which knows the real outcome.
+        """
         nonlocal _lock_released
-        _complete_compaction_lifecycle()
-        if _lock_released:
-            return
-        _lock_released = True
+        with _lock_release_guard:
+            if _lock_released:
+                return
+            _lock_released = True
+            refresher = _lock_refresher
         if getattr(agent, "_active_compression_lock_holder", None) == _lock_holder:
             agent._active_compression_lock_holder = None
-        if _lock_refresher is not None:
+        # Stop the refresher FIRST so it cannot re-extend the row we are about
+        # to delete. A straggler refresh that lands after the DELETE is still
+        # harmless: refresh_compression_lock is an UPDATE, so it matches zero
+        # rows and can never recreate a released lease (nor adopt a new one —
+        # it is qualified on this holder).
+        if refresher is not None:
             try:
-                _lock_refresher.stop()
+                refresher.stop()
             except Exception as _stop_err:
                 logger.debug("compression lock refresher stop failed: %s", _stop_err)
         if _lock_db is not None and _lock_sid and _lock_holder:
@@ -1624,9 +1771,43 @@ def compress_context(
                 _lock_db.release_compression_lock(_lock_sid, _lock_holder)
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
+        if commit_fence is not None and _lock_holder:
+            commit_fence.unbind_lease(_lock_holder)
+
+    def _release_lock(outcome: str = "committed") -> None:
+        """Close the compaction phase truthfully and release the lease."""
+        _complete_compaction_lifecycle(outcome)
+        _release_lock_lease()
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
+
+    # Hand the live lease to the commit fence. A caller that later cancels
+    # before the commit boundary (gateway session hygiene inactivity timeout)
+    # can then drop this lease immediately instead of leaving the turn that
+    # cancelled it blocked behind a worker which — by the fence contract — can
+    # never mutate the session again. A refused bind means the caller ALREADY
+    # gave up: hold nothing and abort now.
+    if commit_fence is not None and _lock_holder is not None:
+        if not commit_fence.bind_lease(_release_lock_lease, holder=_lock_holder):
+            logger.info(
+                "Compression cancelled before the lease could be used "
+                "(session=%s) — releasing it immediately.",
+                _lock_sid or "none",
+            )
+            agent._last_compaction_in_place = False
+            _release_lock("cancelled")
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="commit_fence_cancelled",
+            )
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
 
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does
@@ -1644,7 +1825,7 @@ def compress_context(
                 type(_session_err).__name__,
                 _session_err,
             )
-            _release_lock()
+            _release_lock("skipped")
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
@@ -1653,7 +1834,12 @@ def compress_context(
             recovered_messages = _adopt_live_compression_child(
                 agent, _lock_db, _lock_sid
             )
-            _release_lock()
+            # Adopting a live child means a compaction really did land (another
+            # path committed it), so "complete" is truthful. Failing to adopt
+            # leaves the transcript verbatim — that is a skip, not a success.
+            _release_lock(
+                "committed" if recovered_messages is not None else "skipped"
+            )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
@@ -1684,7 +1870,8 @@ def compress_context(
             None,
         )
         if callable(blocked) and blocked(compressor):
-            _release_lock()
+            # Compression never ran — do not claim a completed compaction.
+            _release_lock("skipped")
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -1692,15 +1879,24 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
+        # Never start (or restart) a refresher for a lease that has already
+        # been released — a fence canceller can drop the lease in this window.
+        # The refresher must not be able to resurrect or prolong it.
         if _lock_holder is not None:
-            _lock_refresher = _CompressionLockLeaseRefresher(
-                _lock_db,
-                _lock_sid,
-                _lock_holder,
-                _lock_ttl,
-                _lock_refresh_interval,
-            )
-            _lock_refresher.start()
+            with _lock_release_guard:
+                if not _lock_released:
+                    _lock_refresher = _CompressionLockLeaseRefresher(
+                        _lock_db,
+                        _lock_sid,
+                        _lock_holder,
+                        _lock_ttl,
+                        _lock_refresh_interval,
+                    )
+            if _lock_refresher is not None:
+                # A release that lands between the guard and start() sets the
+                # refresher's stop event, and _run() checks it before its first
+                # refresh — so the thread exits without touching the lease.
+                _lock_refresher.start()
 
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the
@@ -1813,7 +2009,9 @@ def compress_context(
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")
             _activity_heartbeat = None
-        _release_lock()
+        # The attempt raised before any commit — close the phase as aborted so
+        # the failure is not reported to the user as a completed compaction.
+        _release_lock("aborted")
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
@@ -1869,7 +2067,9 @@ def compress_context(
                 )
                 return messages, _existing_sp
             finally:
-                _release_lock()
+                # The summary never produced a usable transcript — the phase
+                # closes as aborted, not "compaction complete".
+                _release_lock("aborted")
 
         # Compare against the pre-dispatch semantic state, not object identity:
         # legacy/plugin engines may return an equal copy for a no-op, or mutate
@@ -1892,7 +2092,10 @@ def compress_context(
                 split_status="aborted",
                 failure_class="no_progress",
             )
-            _release_lock()
+            # The boundary rewrite was skipped and the transcript is returned
+            # verbatim — closing this as "complete" is the same lie the
+            # vpsclone scrollback made unreadable.
+            _release_lock("skipped")
             return messages, _existing_sp
 
         if not compressed:
@@ -1911,7 +2114,9 @@ def compress_context(
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
-            _release_lock()
+            # No split was performed and a warning was surfaced — close the
+            # phase as aborted rather than claiming a completed compaction.
+            _release_lock("aborted")
             return messages, _existing_sp
 
         if commit_fence is not None:
@@ -1933,7 +2138,11 @@ def compress_context(
                     split_status="aborted",
                     failure_class="commit_fence_cancelled",
                 )
-                _release_lock()
+                # The caller timed out and moved on: the transcript is
+                # unchanged, so never report a completed compaction. (The lease
+                # is normally already gone — the canceller released it — and
+                # this call is the idempotent late cleanup.)
+                _release_lock("cancelled")
                 return messages, _existing_sp
 
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)

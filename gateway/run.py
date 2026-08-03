@@ -14819,6 +14819,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # successful compaction as a timeout.
                                             _compressed, _ = await _hyg_future
                                         else:
+                                            # Cancellation won irrevocably, so
+                                            # the worker can never mutate this
+                                            # session again — but it still owns
+                                            # the durable compression lease for
+                                            # the rest of its synchronous aux
+                                            # call (78s/203s observed). Left in
+                                            # place it fails THIS turn's
+                                            # append_message closed ("being
+                                            # compressed by another writer").
+                                            # Drop it holder-qualified, off-loop
+                                            # so the SQLite write never blocks
+                                            # the gateway; the late worker's own
+                                            # release is then a no-op and can
+                                            # never evict a newer holder.
+                                            try:
+                                                await loop.run_in_executor(
+                                                    None,
+                                                    _hyg_commit_fence.release_cancelled_lease,
+                                                )
+                                            except Exception as _lease_err:
+                                                logger.warning(
+                                                    "Session hygiene could not release the "
+                                                    "cancelled compression lease for session "
+                                                    "%s: %s",
+                                                    session_entry.session_id,
+                                                    _lease_err,
+                                                )
                                             self._defer_agent_cleanup_until_future_done(
                                                 _hyg_future,
                                                 _hyg_agent,

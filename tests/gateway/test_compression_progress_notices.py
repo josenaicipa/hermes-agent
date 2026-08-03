@@ -17,7 +17,10 @@ import pytest
 
 import gateway.run as gateway_run
 from agent.conversation_compression import (
+    COMPACTION_ABORTED_STATUS,
+    COMPACTION_CANCELLED_STATUS,
     COMPACTION_DONE_STATUS,
+    COMPACTION_SKIPPED_STATUS,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
 from gateway.run import _prepare_gateway_status_message
@@ -132,6 +135,38 @@ def test_compaction_completion_notice_reaches_chat(monkeypatch, platform, enable
         _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
         == COMPACTION_DONE_STATUS
     )
+
+
+def test_non_committed_terminal_notices_reach_chat(monkeypatch):
+    """Truthful non-success terminal edges must be as deliverable as ✓.
+
+    The 2026-08-03 vpsclone incident was diagnosed from a Discord scrollback
+    that showed "✓ compaction complete" for two attempts that never rewrote
+    anything. The replacements only help if they actually REACH chat, so pin
+    that they are not swallowed by the noise filter in either gate mode —
+    exactly the contract COMPACTION_DONE_STATUS already has.
+    """
+    for enabled in (True, False):
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            # Bind per-iteration explicitly — a late-binding closure would
+            # silently test the same mode twice.
+            lambda _enabled=enabled: {
+                "compression": {"progress_notices": _enabled}
+            },
+        )
+        for platform in CHAT_PLATFORMS:
+            for status in (
+                COMPACTION_DONE_STATUS,
+                COMPACTION_SKIPPED_STATUS,
+                COMPACTION_CANCELLED_STATUS,
+                COMPACTION_ABORTED_STATUS,
+            ):
+                assert (
+                    _prepare_gateway_status_message(platform, "compacted", status)
+                    == status
+                ), f"{status!r} was swallowed on {platform} (enabled={enabled})"
 
 
 def test_config_read_errors_fail_closed(monkeypatch):

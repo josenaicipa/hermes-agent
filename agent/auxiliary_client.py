@@ -3562,6 +3562,60 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES
 
 
+def _has_configured_fallback_chain(task: Optional[str]) -> bool:
+    """Whether ``auxiliary.<task>.fallback_chain`` declares a usable candidate.
+
+    A cheap, side-effect-free precondition for "failing over is available
+    right now" — it does NOT build clients (that stays with
+    :func:`_try_configured_fallback_chain`, which may still find every entry
+    unresolvable and fall through to the ordinary chain).
+
+    Used to order recovery for ``task="compression"``: compaction runs under a
+    caller-side inactivity budget (gateway session hygiene), and a
+    same-provider retry against a SYNCHRONOUS/non-streaming aux model reports
+    no forward progress at all, so the retry burns that budget and the caller
+    cancels before any fallback is reached. Best-effort: an unreadable config
+    means "no configured fallback", which preserves the retry behaviour.
+    """
+    if not task:
+        return False
+    try:
+        chain = _get_auxiliary_task_config(task).get("fallback_chain")
+    except Exception:
+        return False
+    if not isinstance(chain, list):
+        return False
+    return any(
+        isinstance(entry, dict) and str(entry.get("provider", "")).strip()
+        for entry in chain
+    )
+
+
+def _compression_prefers_immediate_failover(task: Optional[str], exc: Exception) -> bool:
+    """Whether a compression transient error should skip the same-provider retry.
+
+    Two cases, both scoped to ``task="compression"`` so every other auxiliary
+    task keeps its ordinary transient-retry behaviour:
+
+    * a full-budget timeout — retrying doubles an already user-visible stall
+      (issue #54465, unchanged here);
+    * any other transient transport blip (AGY 5xx / UNAVAILABLE / streaming
+      close) **when a configured fallback chain exists**. Retrying the same
+      synchronous provider consumes the caller's no-progress window; if the
+      retry then succeeds late, the outer commit has already been cancelled
+      and the configured fallback was never used (``fallback_used=false``)
+      despite being healthy and available.
+
+    Without a configured fallback there is nothing better to switch to, so the
+    same-provider retry remains the only recovery and is preserved.
+    """
+    if task != "compression":
+        return False
+    if _is_timeout_error(exc):
+        return True
+    return _has_configured_fallback_chain(task)
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -8206,14 +8260,18 @@ def call_llm(
             # continue or resume an oversized session until it compacts. A
             # same-provider retry on a timeout means another full ``timeout``-
             # long wall-clock block before the except-chain below can fall
-            # back — doubling the user-visible stall (issue #54465). Skip the
-            # same-provider retry for compression on a full-budget timeout and
-            # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            # back — doubling the user-visible stall (issue #54465).
+            # A transient 5xx/UNAVAILABLE is cheap to retry in isolation, but
+            # on a SYNCHRONOUS (non-streaming) aux model the retry reports no
+            # forward progress to the caller's inactivity budget either, so it
+            # can consume the whole no-progress window and get cancelled before
+            # a healthy CONFIGURED fallback is ever tried. When such a fallback
+            # exists, prefer it immediately; with no configured fallback the
+            # same-provider retry is still the only recovery and is kept.
+            if _compression_prefers_immediate_failover(task, transient_err):
                 logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s",
+                    "Auxiliary compression: transient error on the critical "
+                    "path; skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
                 raise
@@ -8876,13 +8934,16 @@ async def async_call_llm(
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
-            # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            # See call_llm(): compression is on the critical preflight path, so
+            # skip the same-provider retry on a full-budget timeout (#54465) —
+            # and on any transient blip when a configured fallback exists, so
+            # the retry cannot consume the caller's no-progress window while a
+            # healthy failover target sits unused.
+            if _compression_prefers_immediate_failover(task, transient_err):
                 logger.info(
-                    "Auxiliary compression (async): timeout on the critical "
-                    "path; skipping same-provider retry and falling back: %s",
+                    "Auxiliary compression (async): transient error on the "
+                    "critical path; skipping same-provider retry and falling "
+                    "back: %s",
                     transient_err,
                 )
                 raise
