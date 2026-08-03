@@ -269,6 +269,32 @@ def test_widened_budget_is_restored_after_failure(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _journal_mode(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+    finally:
+        conn.close()
+
+
+@pytest.fixture(params=["delete", "wal"])
+def forced_journal_mode(request, monkeypatch):
+    """Force and report the effective journal-mode branch for an E2E flow.
+
+    A fresh database normally becomes WAL on fixed SQLite versions, so merely
+    omitting WAL pre-creation does not exercise DELETE.  Force the production
+    WAL-reset safety gate for DELETE and its fixed-runtime branch for WAL;
+    callers still assert the on-disk mode after ``SessionDB`` opens it.
+    """
+    mode = request.param
+    monkeypatch.setattr(
+        hermes_state,
+        "is_sqlite_wal_reset_vulnerable",
+        lambda: mode == "delete",
+    )
+    return mode
+
+
 def _make_legacy_gateway_routing_db(db_path, *, wal: bool = False):
     """A DB whose ``gateway_routing`` still carries the pre-scope PK.
 
@@ -453,11 +479,15 @@ def _routing_entries(db_path):
         conn.close()
 
 
-@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
-def test_second_open_recovers_stranded_rows_without_manual_sql(tmp_path, wal):
+def test_second_open_recovers_stranded_rows_without_manual_sql(
+    tmp_path, forced_journal_mode
+):
     """THE requirement: plain second ``SessionDB()``, zero operator SQL."""
     db_path = tmp_path / "state.db"
-    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _make_legacy_gateway_routing_db(
+        db_path, wal=forced_journal_mode == "wal"
+    )
+    assert _journal_mode(db_path) == forced_journal_mode
     _damage_with_partial_rebuild(db_path)
 
     # No recovery SQL of any kind — just open the database.
@@ -471,10 +501,12 @@ def test_second_open_recovers_stranded_rows_without_manual_sql(tmp_path, wal):
     }
 
 
-@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
-def test_recovery_is_idempotent_across_repeat_opens(tmp_path, wal):
+def test_recovery_is_idempotent_across_repeat_opens(tmp_path, forced_journal_mode):
     db_path = tmp_path / "state.db"
-    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _make_legacy_gateway_routing_db(
+        db_path, wal=forced_journal_mode == "wal"
+    )
+    assert _journal_mode(db_path) == forced_journal_mode
     _damage_with_partial_rebuild(db_path)
 
     for _ in range(3):
@@ -482,11 +514,15 @@ def test_recovery_is_idempotent_across_repeat_opens(tmp_path, wal):
         assert _routing_state(db_path) == (3, False, 0)
 
 
-@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
-def test_recovery_never_clobbers_a_newer_canonical_row(tmp_path, wal):
+def test_recovery_never_clobbers_a_newer_canonical_row(
+    tmp_path, forced_journal_mode
+):
     """Newest ``updated_at`` wins; an exact tie keeps the canonical row."""
     db_path = tmp_path / "state.db"
-    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _make_legacy_gateway_routing_db(
+        db_path, wal=forced_journal_mode == "wal"
+    )
+    assert _journal_mode(db_path) == forced_journal_mode
     _damage_with_partial_rebuild(db_path)
 
     # A live gateway kept writing routing entries into the new table while the
@@ -516,11 +552,15 @@ def test_recovery_never_clobbers_a_newer_canonical_row(tmp_path, wal):
     assert entries["key-0"] == '{"session_id": "S0"}'
 
 
-@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
-def test_recovers_when_interruption_landed_before_the_create(tmp_path, wal):
+def test_recovers_when_interruption_landed_before_the_create(
+    tmp_path, forced_journal_mode
+):
     """RENAME committed but CREATE did not: canonical missing entirely."""
     db_path = tmp_path / "state.db"
-    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _make_legacy_gateway_routing_db(
+        db_path, wal=forced_journal_mode == "wal"
+    )
+    assert _journal_mode(db_path) == forced_journal_mode
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     try:
         conn.execute(
@@ -533,8 +573,7 @@ def test_recovers_when_interruption_landed_before_the_create(tmp_path, wal):
     assert _routing_state(db_path) == (3, False, 0)
 
 
-@pytest.mark.parametrize("wal", [False, True], ids=["delete", "wal"])
-def test_shipped_rebuild_is_atomic_on_failure(tmp_path, wal):
+def test_shipped_rebuild_is_atomic_on_failure(tmp_path, forced_journal_mode):
     """A failure inside the shipped rebuild rolls back to the original table.
 
     This is what stops a NEW interruption from ever producing the stranded
@@ -542,7 +581,10 @@ def test_shipped_rebuild_is_atomic_on_failure(tmp_path, wal):
     RENAME/CREATE/COPY/DROP sequence runs in one savepoint.
     """
     db_path = tmp_path / "state.db"
-    _make_legacy_gateway_routing_db(db_path, wal=wal)
+    _make_legacy_gateway_routing_db(
+        db_path, wal=forced_journal_mode == "wal"
+    )
+    assert _journal_mode(db_path) == forced_journal_mode
 
     def _boom(self, cursor, legacy_columns):
         raise sqlite3.OperationalError("database is locked")
