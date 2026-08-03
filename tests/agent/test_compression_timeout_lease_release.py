@@ -190,6 +190,30 @@ def _terminal_status(agent: _FakeAgent):
     return edges[0] if edges else None
 
 
+class _CountingFence(CompressionCommitFence):
+    """Real fence that records how often the commit boundary is entered/left.
+
+    Used to prove that a commit which fails midway still leaves the boundary
+    exactly once — ``finish_commit()`` runs even on the failure path, so the
+    fence lock is never leaked to the next caller.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.begins = 0
+        self.finishes = 0
+
+    def begin_commit(self) -> bool:
+        entered = super().begin_commit()
+        if entered:
+            self.begins += 1
+        return entered
+
+    def finish_commit(self) -> None:
+        self.finishes += 1
+        super().finish_commit()
+
+
 class _Worker:
     """Runs compress_context on a thread, like the gateway's executor."""
 
@@ -681,6 +705,136 @@ def test_empty_transcript_emits_no_false_success_status(tmp_path: Path):
     # The parent stays resumable and unlocked.
     assert db.get_compression_lock_holder(sid) is None
     assert [m["content"] for m in db.get_messages_as_conversation(sid)] == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# 5b. Failure INSIDE the commit boundary
+# ---------------------------------------------------------------------------
+#
+# Every edge above is decided BEFORE ``begin_commit()``. The window this
+# section pins is the one after it: once the fence is entered, the cleanup in
+# ``compress_context``'s ``finally`` closed the phase with a hardcoded default
+# of ``outcome="committed"``. So a durable mutation that blew up inside the
+# boundary — ``archive_and_compact`` in place, ``publish_compression_child`` on
+# rotation — still emitted COMPACTION_DONE_STATUS. That is the vpsclone lie in
+# its worst form: "✓ Context compaction complete" for a pass whose transcript
+# was never persisted at all. ``committed`` must be reachable only once the
+# durable mutation has actually settled.
+
+
+def test_durable_commit_failure_emits_no_false_success_status(tmp_path: Path):
+    """In-place: ``archive_and_compact`` raising is an abort, not a success."""
+    sid = "COMMIT_BOUNDARY_FAILURE"
+    db = _new_db(tmp_path, sid)
+    compressor = _FakeCompressor()
+    agent = _FakeAgent(db, sid, compressor)
+    fence = _CountingFence()
+
+    archived: list[str] = []
+
+    def _failing_archive(session_id, compacted):
+        archived.append(session_id)
+        raise RuntimeError("disk I/O error")
+
+    db.archive_and_compact = _failing_archive
+
+    messages = _messages()
+    compressed, prompt = compress_context(
+        agent, messages, "system",
+        approx_tokens=120_000, force=True, commit_fence=fence,
+    )
+
+    # The failure really happened after the boundary was entered...
+    assert archived == [sid]
+    assert (fence.begins, fence.finishes) == (1, 1)
+    # ...and ``finish_commit()`` still ran: a later poll answers "commit already
+    # started" instead of blocking forever on a leaked fence lock.
+    assert fence.try_cancel_before_commit() is False
+
+    # A phase opened, so exactly one edge must close it — truthfully.
+    assert COMPACTION_STATUS in agent.statuses
+    assert _terminal_status(agent) == COMPACTION_ABORTED_STATUS
+    assert COMPACTION_DONE_STATUS not in [text for _kind, text in agent.status_events]
+
+    # Fail-closed persistence: the compacted set was never published, so the
+    # pre-compaction transcript is still the live one under the same id.
+    assert prompt == "cached prompt"
+    assert agent.session_id == sid
+    assert agent._last_compaction_in_place is False, (
+        "a failed commit must not tell the gateway to re-baseline the transcript"
+    )
+    assert [m["content"] for m in db.get_messages_as_conversation(sid)] == ["hello"]
+
+    # The holder-qualified lease is released, so the turn keeps writing (the
+    # fail-closed append is what the vpsclone incident actually broke).
+    assert db.get_compression_lock_holder(sid) is None
+    assert agent._active_compression_lock_holder is None
+    assert isinstance(db.append_message(sid, "assistant", "reply"), int)
+
+
+def test_rotation_commit_failure_emits_no_false_success_status(tmp_path: Path):
+    """Rotation: a failed publish rolls back to the parent and says so."""
+    sid = "ROTATION_COMMIT_FAILURE"
+    db = _new_db(tmp_path, sid)
+    compressor = _FakeCompressor()
+    agent = _FakeAgent(db, sid, compressor)
+    agent.compression_in_place = False  # legacy rotate-and-fork path
+    fence = _CountingFence()
+
+    published: list[str] = []
+
+    def _failing_publish(**kwargs):
+        published.append(kwargs["parent_session_id"])
+        raise RuntimeError("database is locked")
+
+    db.publish_compression_child = _failing_publish
+
+    messages = _messages()
+    before = [dict(m) for m in messages]
+    compressed, prompt = compress_context(
+        agent, messages, "system",
+        approx_tokens=120_000, force=True, commit_fence=fence,
+    )
+
+    assert published == [sid]
+    assert (fence.begins, fence.finishes) == (1, 1)
+    assert fence.try_cancel_before_commit() is False
+    assert _terminal_status(agent) == COMPACTION_ABORTED_STATUS
+    assert COMPACTION_DONE_STATUS not in [text for _kind, text in agent.status_events]
+
+    # Rolled back onto the still-indexed parent: no rotation, no orphan child,
+    # and the caller gets the verbatim transcript back.
+    assert prompt == "cached prompt"
+    assert agent.session_id == sid
+    assert compressed == before
+    assert db.get_compression_lock_holder(sid) is None
+    assert [m["content"] for m in db.get_messages_as_conversation(sid)] == ["hello"]
+    assert isinstance(db.append_message(sid, "assistant", "reply"), int)
+
+
+def test_committed_boundary_still_reports_a_single_completed_edge(tmp_path: Path):
+    """Control: the fix must not relabel or double-emit a real commit."""
+    sid = "COMMIT_BOUNDARY_SUCCESS"
+    db = _new_db(tmp_path, sid)
+    compressor = _FakeCompressor()
+    agent = _FakeAgent(db, sid, compressor)
+    fence = _CountingFence()
+
+    compressed, _prompt = compress_context(
+        agent, _messages(), "system",
+        approx_tokens=120_000, force=True, commit_fence=fence,
+    )
+
+    assert [m["content"] for m in compressed][:1] == [SUMMARY]
+    assert (fence.begins, fence.finishes) == (1, 1)
+    # _terminal_status asserts at most one edge; a committed pass keeps "done".
+    assert _terminal_status(agent) == COMPACTION_DONE_STATUS
+    assert agent._last_compaction_in_place is True
+    assert db.get_compression_lock_holder(sid) is None
+    assert [m["content"] for m in db.get_messages_as_conversation(sid)] == [
+        SUMMARY,
+        "tail",
+    ]
 
 
 # ---------------------------------------------------------------------------

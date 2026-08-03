@@ -2025,6 +2025,15 @@ def compress_context(
             _activity_heartbeat.stop("context compression completed")
 
     _commit_fence_entered = False
+    # Terminal edge for the compaction phase, consumed by the cleanup in the
+    # ``finally`` below. It starts NON-success on purpose: everything from here
+    # to the durable session mutation can raise — including code that runs
+    # INSIDE the commit boundary after ``begin_commit()`` succeeded (e.g.
+    # ``archive_and_compact``/``publish_compression_child`` failing) — and such
+    # an attempt must close the phase truthfully instead of emitting
+    # COMPACTION_DONE_STATUS for a compaction that never persisted. Only a
+    # settled durable mutation upgrades this to "committed" (see below).
+    _commit_status = "aborted"
     try:
         # Capture boundary quality before session-rotation callbacks run. Built-in
         # and plugin lifecycle hooks may reset per-session compressor fields while
@@ -2445,6 +2454,21 @@ def compress_context(
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
+        # Resolve the commit outcome the instant the durable mutation settles,
+        # before any post-boundary bookkeeping runs. Resolving it HERE (rather
+        # than just before the telemetry call further down) buys both halves of
+        # the invariant: a commit that really landed can never be relabelled by
+        # a later bookkeeping failure, and a failure inside the commit boundary
+        # can never reach the cleanup still claiming "committed". Without a
+        # session DB there is no durable layer to fail — the in-memory rewrite
+        # IS the whole compaction — so "not_applicable" stays a success edge.
+        _commit_status = (
+            "committed"
+            if split_status
+            in {"not_applicable", "in_place_committed", "rotated_committed"}
+            else "aborted"
+        )
+
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
         # is the id the boundary notifications attribute the prior state to: the old
@@ -2575,7 +2599,6 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
-        _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
@@ -2594,8 +2617,16 @@ def compress_context(
         # file dedup) ran. A concurrent path that wakes up the moment we
         # release will see the NEW session_id in state.db / SessionEntry and
         # acquire on that — no race against our just-finished work.
+        #
+        # The outcome is passed explicitly: a default of "committed" here made
+        # every exception raised inside the commit boundary close the phase with
+        # COMPACTION_DONE_STATUS even though nothing was persisted. Paths that
+        # already closed the phase (the truthful early returns above) leave
+        # ``_complete_compaction_lifecycle`` latched, so this call cannot
+        # double-emit or relabel them — it only fixes the paths that reach
+        # cleanup without having closed the phase themselves.
         try:
-            _release_lock()
+            _release_lock(_commit_status)
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
