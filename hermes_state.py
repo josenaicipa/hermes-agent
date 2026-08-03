@@ -717,6 +717,28 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
+def is_lock_contention_error(exc: BaseException) -> bool:
+    """True if *exc* is SQLite's transient "another writer holds the lock".
+
+    ``SQLITE_BUSY`` / ``SQLITE_LOCKED`` both surface through
+    :class:`sqlite3.OperationalError` with ``database is locked`` /
+    ``database table is locked`` / ``database is busy`` text.  Unlike every
+    other SQLite error class this one means "nothing was written, try again" —
+    the transaction that hit it did no work — so it is the only class the
+    write layer is allowed to retry.
+
+    Single definition on purpose: ``_execute_write`` and the schema-init
+    retry must agree on exactly which failures are retryable, otherwise the
+    two paths drift into different durability guarantees (that drift is what
+    left ``SessionDB()`` construction with ~2 s of patience while every other
+    write had ~16 s).
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
 
@@ -1726,7 +1748,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                self._init_schema_with_lock_retry()
 
             try:
                 _connect_and_init()
@@ -2087,6 +2109,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _init_schema_with_lock_retry(self) -> None:
+        """Run ``_init_schema`` with the same lock patience as a normal write.
+
+        ``_init_schema`` writes (``executescript(SCHEMA_SQL)``, the deferred
+        index DDL, the ``active IS NULL`` heal, ``set_meta``, the
+        ``schema_version`` bump) execute directly on the connection and
+        bypass :meth:`_execute_write` entirely, so their only contention
+        tolerance was the connection's 1 s ``busy_timeout``.  Every other
+        write in this class routes through :meth:`_execute_write`, which
+        retries the lock-contention class 15 times with jitter — measured
+        ~16 s of patience.
+
+        Measured effect of that asymmetry: with a competing writer holding
+        the SQLite write lock, ``SessionDB()`` construction raised
+        ``database is locked`` after ~2 s, while an ``append_message`` on an
+        already-open handle survived the same contention for ~16 s.  A short
+        contention window could therefore fail construction outright, and
+        callers that treat a construction failure as "session store
+        unavailable" lose the features backed by it.  This retry closes the
+        gap so both paths share one budget.
+
+        Retrying is safe because ``_init_schema`` is idempotently rerunnable:
+        DDL is ``IF NOT EXISTS``, the column reconciler re-diffs live
+        columns, meta writes are UPSERTs, and the heal/version statements are
+        ``UPDATE ... WHERE`` guarded, so re-running after a partially applied
+        pass converges rather than duplicating.  Non-lock errors (including
+        the malformed-schema class that ``__init__`` repairs) propagate on
+        the first attempt, unchanged.
+        """
+        for attempt in range(self._WRITE_MAX_RETRIES):
+            try:
+                self._init_schema()
+                return
+            except sqlite3.OperationalError as exc:
+                if (
+                    not is_lock_contention_error(exc)
+                    or attempt == self._WRITE_MAX_RETRIES - 1
+                ):
+                    raise
+                # Best-effort: drop anything the failed pass may have left
+                # open (e.g. a partially applied savepoint block in the
+                # legacy FTS repair) so it cannot leak into the retry.
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                time.sleep(
+                    random.uniform(
+                        self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S
+                    )
+                )
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -2127,8 +2201,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._try_incremental_merge_fts()
                 return result
             except sqlite3.OperationalError as exc:
-                err_msg = str(exc).lower()
-                if "locked" in err_msg or "busy" in err_msg:
+                if is_lock_contention_error(exc):
                     last_err = exc
                     if attempt < self._WRITE_MAX_RETRIES - 1:
                         jitter = random.uniform(
