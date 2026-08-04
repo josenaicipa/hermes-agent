@@ -37,7 +37,7 @@ fallback_providers:
     model: anthropic/claude-sonnet-4
 ```
 
-Each entry requires both `provider` and `model`. Entries missing either field are ignored.
+Each entry requires both `provider` and `model`. Entries missing either field are ignored. To switch endpoint/provider while keeping the model you requested, see [Keeping the Requested Model](#keeping-the-requested-model-preserve_requested_model).
 
 :::note `fallback_model` vs `fallback_providers`
 `fallback_providers` (plural, list) is the current config shape and supports multiple fallbacks tried in order. `fallback_model` (singular) is the legacy single-fallback key — Hermes still honors it for back-compat, but `hermes fallback` writes the current `fallback_providers` key and migrates legacy config on write. When both are set, `fallback_providers` takes priority.
@@ -163,6 +163,51 @@ fallback_providers:
   - provider: openai-codex
     model: gpt-5.3-codex
 ```
+
+### Keeping the Requested Model (`preserve_requested_model`)
+
+Normally a fallback entry declares its own `model`, and activating it switches
+**both** provider and model. When the fallback is a *second endpoint for the
+same model* (a sibling bridge, a mirror deployment, another account on the same
+vendor), switching the model is wrong: the request silently answers with a
+different — often weaker — model.
+
+Add `preserve_requested_model: true` to keep the model you actually asked for
+and change only the provider / endpoint / credentials:
+
+```yaml
+model:
+  provider: my-bridge-a
+  default: claude-opus-5
+  base_url: http://127.0.0.1:4318/v1
+
+fallback_providers:
+  - provider: my-bridge-b
+    model: claude-opus-5          # kept for readability; not what pins the route
+    base_url: http://127.0.0.1:4319/v1
+    preserve_requested_model: true
+```
+
+Behavior:
+
+- The model requested on the fallback is the **primary route's** model, so a
+  chain that walks several hops still lands on the original request (not on the
+  previous hop's model). An explicit `/model` switch moves that anchor with it.
+- Opt-in only. Entries without the key — and entries with
+  `preserve_requested_model: false` — keep using their configured `model`
+  exactly as before.
+- **Fails closed.** If the target provider cannot serve the preserved model
+  (unknown model, or a provider/normalizer that would answer with a different
+  one), the entry is skipped and the chain continues. Hermes never substitutes
+  a different model behind your request. Reformatting the same model
+  (`claude-opus-5` → `anthropic/claude-opus-5`) is not a substitution.
+- A malformed value (anything other than a boolean / `true`/`false`/`yes`/`no`/
+  `on`/`off`/`1`/`0`) skips the entry with an error in the log rather than
+  quietly downgrading the model.
+- Same-backend loop prevention still applies: an entry that resolves to the
+  provider/endpoint that just failed is skipped, preserved model or not.
+- Auxiliary tasks that reuse the main chain (see below) intentionally ignore
+  this key — they have no caller-requested main model to preserve.
 
 ### Where Fallback Works
 

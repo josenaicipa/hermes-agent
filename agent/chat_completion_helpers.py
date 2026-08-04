@@ -27,6 +27,12 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
+from hermes_cli.fallback_config import (
+    FallbackModelPolicyError,
+    effective_fallback_entry,
+    require_preserved_model,
+    resolve_fallback_model,
+)
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
@@ -1663,11 +1669,37 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
 
 
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
+    """Session-scoped identity of one chain entry (skip/cooldown memo key).
+
+    Always call this with the *effective* entry from
+    ``effective_fallback_entry`` so the memo records the model that was
+    actually requested — an entry preserving the requested model is a
+    different route from the same entry's configured model.
+    """
     return (
         str(fb.get("provider") or "").strip().lower(),
         str(fb.get("model") or "").strip(),
         str(fb.get("base_url") or "").strip().rstrip("/"),
     )
+
+
+def _requested_model_anchor(agent) -> str:
+    """The model the caller actually asked for on this route.
+
+    Entries opting into ``preserve_requested_model`` must pin to the PRIMARY
+    route's model, not to whatever fallback happens to be active: walking two
+    hops (primary → A → B) must still land B on the original request instead
+    of inheriting hop A's model.  ``_primary_runtime`` is the snapshot
+    ``switch_model`` keeps current, so an explicit ``/model`` switch moves the
+    anchor with it.  Bare agents without a snapshot fall back to the live
+    model.
+    """
+    primary = getattr(agent, "_primary_runtime", None)
+    if isinstance(primary, dict):
+        anchor = str(primary.get("model") or "").strip()
+        if anchor:
+            return anchor
+    return str(getattr(agent, "model", "") or "").strip()
 
 
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
@@ -1729,20 +1761,50 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
         return False
-    fb = agent._fallback_chain[agent._fallback_index]
+    fb_source = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
-    fb_key = _fallback_entry_key(fb)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
     if unavailable is None:
         unavailable = set()
         agent._unavailable_fallback_keys = unavailable
+    fb_provider = (fb_source.get("provider") or "").strip().lower()
+    # WHICH model this entry requests is decided first, before any other
+    # decision, so the skip/cooldown memo key, the local availability check,
+    # backend identity, the provider router, model normalization and the
+    # status lines all describe the same model.  Entries that do not opt into
+    # ``preserve_requested_model`` resolve to their configured model, exactly
+    # as before.  hermes_cli.fallback_config owns the policy — do not read
+    # ``entry["model"]`` directly here.
+    try:
+        fb_decision = resolve_fallback_model(
+            fb_source, requested_model=_requested_model_anchor(agent)
+        )
+    except FallbackModelPolicyError as policy_err:
+        # Fail closed: an entry whose model policy cannot be honored is
+        # skipped, never downgraded to its configured model.
+        logger.error(
+            "Fallback skip: chain entry for %s has an unusable model policy "
+            "(%s); refusing to request a different model",
+            fb_provider or "<no provider>", policy_err,
+        )
+        return agent._try_activate_fallback(reason)
+    fb_model = fb_decision.model
+    # From here on ``fb`` is the effective entry (a copy carrying the model
+    # that will actually be requested).  The chain entry itself is never
+    # mutated — delegate children share those dicts.
+    fb = effective_fallback_entry(fb_source, fb_decision)
+    fb_key = _fallback_entry_key(fb)
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return agent._try_activate_fallback(reason)
-    fb_provider = (fb.get("provider") or "").strip().lower()
-    fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
+    if fb_decision.preserved:
+        logger.info(
+            "Fallback entry %s preserves the requested model %s "
+            "(configured model %r is not requested)",
+            fb_provider, fb_model, fb_decision.configured_model or None,
+        )
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1820,6 +1882,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Could not normalize fallback model %r for provider %r: %s",
                 fb_model, fb_provider, _norm_err,
             )
+
+        # A preserved model must survive the router AND the per-provider
+        # normalizer.  Reformatting the same slug is fine; landing on another
+        # model is a substitution, so fail closed here — before any agent
+        # state is swapped — and let the chain continue.  Suppress the entry
+        # for the session: an incompatible model is not a transient error.
+        for _actual_model, _policy_source in (
+            (_resolved_fb_model, f"{fb_provider} provider router"),
+            (fb_model, f"{fb_provider} model normalization"),
+        ):
+            if not _actual_model:
+                continue
+            try:
+                require_preserved_model(
+                    fb_decision, _actual_model, source=_policy_source,
+                )
+            except FallbackModelPolicyError as policy_err:
+                unavailable.add(fb_key)
+                logger.error("Fallback skip: %s", policy_err)
+                return agent._try_activate_fallback(reason)
 
         # Determine api_mode from provider / base URL / model
         fb_api_mode = "chat_completions"
@@ -2037,9 +2119,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
+        # Preserved-model hops change provider only; say so explicitly, or an
+        # operator reading "model: X → model: X" assumes nothing happened.
+        _preserved_note = " (model preserved)" if fb_decision.preserved else ""
         agent._buffer_status(
             f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
+            f"{fb_model} via {fb_provider}{_preserved_note}"
         )
         # The buffered line above is dropped on successful recovery, but a
         # provider/model switch is a durable state change operators must see
@@ -2049,7 +2134,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # buffered line is flushed instead.  See fallback-observability fix.
         agent._pending_fallback_notice = (
             f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
+            f"→ {fb_model} via {fb_provider}{_preserved_note}"
         )
         logger.info(
             "Fallback activated: %s → %s (%s)",

@@ -1469,7 +1469,18 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    #
+    # Entries are copied, not shared: a chain entry carries per-entry policy
+    # (e.g. ``preserve_requested_model``, resolved against each agent's OWN
+    # requested model) and both agents walk the chain independently.  Handing
+    # over the parent's dicts would let one agent's routing state leak into
+    # the other's.  Non-dict junk is dropped here so the child never inherits
+    # an entry AIAgent would silently discard anyway.
+    parent_fallback = [
+        dict(entry)
+        for entry in (getattr(parent_agent, "_fallback_chain", None) or [])
+        if isinstance(entry, dict)
+    ] or None
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing

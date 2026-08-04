@@ -3737,6 +3737,87 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
 
+    def test_child_chain_entries_are_copies(self):
+        """The child must not share entry dicts with the parent's chain.
+
+        Chain entries carry per-entry policy (e.g. preserve_requested_model)
+        that the activation path resolves per agent. Sharing the dicts would
+        let a child's activation mutate the parent's routing policy.
+        """
+        parent = _make_mock_parent(depth=0)
+        fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini"}
+        parent._fallback_chain = [fallback_entry]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test chain copy",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        inherited = kwargs["fallback_model"]
+        self.assertEqual(inherited, [fallback_entry])
+        self.assertIsNot(inherited[0], fallback_entry)
+        inherited[0]["model"] = "mutated"
+        self.assertEqual(fallback_entry["model"], "gpt-4o-mini")
+
+    def test_child_inherits_preserve_requested_model_opt_in(self):
+        """The opt-in key must survive inheritance, not just provider/model."""
+        from hermes_cli.fallback_config import PRESERVE_REQUESTED_MODEL_KEY
+
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [
+            {
+                "provider": "claude-sdk-team-local",
+                "model": "claude-sonnet-5",
+                "base_url": "http://127.0.0.1:4319/v1",
+                PRESERVE_REQUESTED_MODEL_KEY: True,
+            }
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test opt-in inheritance",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIs(kwargs["fallback_model"][0][PRESERVE_REQUESTED_MODEL_KEY], True)
+
+    def test_non_dict_chain_entries_are_dropped(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = ["not-a-dict", {"provider": "zai", "model": "glm-4.7"}]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test non-dict entries",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], [{"provider": "zai", "model": "glm-4.7"}])
+
 
 if __name__ == "__main__":
     unittest.main()

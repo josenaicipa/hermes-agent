@@ -4822,6 +4822,14 @@ def _try_main_fallback_chain(
     chain. The top-level chain is read through ``get_fallback_chain`` so
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
+
+    Model policy note: entries here always use their CONFIGURED ``model``,
+    including entries that declare ``preserve_requested_model``.  That key
+    preserves *the caller's requested model*, and an auxiliary task
+    (title/compression/etc.) has no caller-requested main model — it picks a
+    task-appropriate model on purpose, and its candidates are additionally
+    context-window filtered below.  Preserving the main model here would
+    silently upgrade auxiliary traffic onto the main route's model.
     """
     try:
         from hermes_cli.config import load_config
