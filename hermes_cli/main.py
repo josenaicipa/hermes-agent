@@ -10698,14 +10698,18 @@ def cmd_tools(args):
 
 def cmd_insights(args):
     try:
-        from hermes_state import SessionDB
-        from agent.insights import InsightsEngine
+        from agent.insights import InsightsEngine, open_insights_db
 
-        db = SessionDB()
-        engine = InsightsEngine(db)
-        report = engine.generate(days=args.days, source=args.source)
-        print(engine.format_terminal(report))
-        db.close()
+        # Read-only: reporting must never take state.db's write lock.
+        db = open_insights_db()
+        # try/finally: a failure mid-report used to leak the handle (and its
+        # tracked fd) until GC.
+        try:
+            engine = InsightsEngine(db)
+            report = engine.generate(days=args.days, source=args.source)
+            print(engine.format_terminal(report))
+        finally:
+            db.close()
     except Exception as e:
         print(f"Error generating insights: {e}")
 

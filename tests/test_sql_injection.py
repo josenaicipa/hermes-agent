@@ -41,3 +41,23 @@ def test_session_col_names_are_safe_identifiers():
         assert safe_identifier.match(col), (
             f"Column name {col!r} is not a safe SQL identifier"
         )
+
+
+def test_reduced_schema_fallback_only_builds_from_literal_identifiers():
+    """The pre-migration fallback interpolates column names, so they must be
+    literals from this source tree — never anything caller-supplied.
+
+    ``_get_sessions_reduced`` builds its SELECT from
+    ``_SESSION_COL_NAMES`` intersected with the columns SQLite itself reports,
+    so both inputs are non-caller data; this pins the literal half.
+    """
+    safe_identifier = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+    names = InsightsEngine._SESSION_COL_NAMES
+    assert isinstance(names, tuple) and names
+    for col in names:
+        assert safe_identifier.match(col), (
+            f"Column name {col!r} is not a safe SQL identifier"
+        )
+    # The flat string used by the pre-built queries is derived from the tuple,
+    # so the two can never drift apart.
+    assert InsightsEngine._SESSION_COLS == ", ".join(names)

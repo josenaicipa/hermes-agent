@@ -11034,14 +11034,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 i += 1
 
         try:
-            from hermes_state import SessionDB
-            from agent.insights import InsightsEngine
+            from agent.insights import InsightsEngine, open_insights_db
 
-            db = SessionDB()
-            engine = InsightsEngine(db)
-            report = engine.generate(days=days, source=source)
-            print(engine.format_terminal(report))
-            db.close()
+            # Read-only: reporting must never take state.db's write lock.
+            db = open_insights_db()
+            # try/finally: a failure mid-report used to leak the handle (and
+            # its tracked fd) until GC, which on a read-only WAL attach also
+            # leaves the -shm mapping alive.
+            try:
+                engine = InsightsEngine(db)
+                report = engine.generate(days=days, source=source)
+                print(engine.format_terminal(report))
+            finally:
+                db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
 
@@ -16951,6 +16956,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # never arm its own watchdog — leaving a "dead" CLI alive for
             # minutes (#65998 class).  Never raises.
             _arm_exit_watchdog_on_shutdown_signal()
+            # Same reason, for state.db: a critical write (transcript append)
+            # keeps waiting while the lock is merely contended, so shutdown
+            # must be able to stop it extending that patience.  This does NOT
+            # abandon the write — it collapses it back to the ordinary bounded
+            # retry budget, so the final persist still gets its normal chance.
+            # Two global assignments, no locks: safe in a signal handler.
+            try:
+                import hermes_state_writer as _writer
+
+                _writer.request_write_cancellation(f"signal-{signum}")
+            except Exception:
+                pass  # never let this raise from a signal handler
             try:
                 if getattr(self, "agent", None) and getattr(self, "_agent_running", False):
                     self.agent.interrupt(f"received signal {signum}")
@@ -17559,6 +17576,16 @@ def main(
         # covers wedges in the unwind below that would otherwise leave the
         # process alive with no watchdog (#65998 class). Never raises.
         _arm_exit_watchdog_on_shutdown_signal()
+        # Stop state.db's critical writes from extending their patience past
+        # the ordinary retry budget: this path can end in os._exit(0), so a
+        # write waiting on a contended lock would be killed mid-wait anyway.
+        # Two global assignments, no locks: safe in a signal handler.
+        try:
+            import hermes_state_writer as _writer
+
+            _writer.request_write_cancellation(f"signal-{signum}")
+        except Exception:
+            pass  # never block signal handling
         try:
             _agent = getattr(cli, "agent", None)
             if _agent is not None:

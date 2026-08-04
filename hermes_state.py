@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,7 +41,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BASE_FTS_TRIGGERS,
@@ -73,6 +74,22 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_writer import (
+    STOP_BUDGET,
+    STOP_CANCELLED,
+    STOP_WATCHDOG,
+    WRITE_BEST_EFFORT,
+    WRITE_CRITICAL,
+    WRITE_NORMAL,
+    describe_op,
+    gate_for as _writer_gate_for,
+    note_busy_retry,
+    note_conn_lock_timeout,
+    note_long_wait,
+    priority_of,
+    record_outcome,
+    write_cancellation_requested,
+)
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -1365,6 +1382,27 @@ class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
 
+def read_only_db_uri(db_path) -> str:
+    """Build a ``file:...?mode=ro`` URI that survives special characters.
+
+    SQLite parses a URI filename: everything after an unescaped ``?`` is a
+    query parameter and everything after ``#`` is a fragment, and ``%NN`` is
+    percent-decoded.  A raw f-string interpolation therefore mis-parses any
+    ``HERMES_HOME`` (or explicit ``db_path``) containing ``?``, ``#`` or ``%``
+    — silently opening a DIFFERENT path, or failing with an opaque "unable to
+    open database file".  Percent-encoding the path component fixes all three;
+    ``/`` and ``:`` stay literal so POSIX paths and Windows drive letters are
+    unchanged (so the common case produces byte-identical URIs to before).
+
+    ``mode=ro`` is what makes the handle safe on a live database: SQLite
+    refuses writes on it, so it can neither take nor wait for the single write
+    lock, and it cannot create the file either — a caller that needs "does not
+    exist" to be visible gets an error instead of an empty new database.
+    """
+    quoted = urllib.parse.quote(str(db_path), safe="/:")
+    return f"file:{quoted}?mode=ro"
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -1573,6 +1611,94 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    # The connection-level busy handler each attempt sits in (see the
+    # ``timeout=1.0`` passed to sqlite3.connect below).  Named so the derived
+    # wall-clock bound below cannot drift away from the actual connection.
+    _WRITE_BUSY_TIMEOUT_S = 1.0
+    # ── Baseline patience: unchanged, and now expressed as a wall clock ──
+    #
+    # The pre-existing contract is "_WRITE_MAX_RETRIES BEGIN IMMEDIATE
+    # attempts, each able to sit in SQLite's busy handler for
+    # _WRITE_BUSY_TIMEOUT_S, separated by <= _WRITE_RETRY_MAX_S of jitter",
+    # i.e. ~17 s worst case.  _baseline_write_budget_s() states exactly that
+    # and nothing more, so a non-critical write's total wall clock -- INCLUDING
+    # any time spent queueing for in-process admission -- stays where it has
+    # always been instead of stacking a second budget on top of the first.
+    #
+    # ── Critical-write patience: progress-based, not a wall-clock guess ──
+    #
+    # Twice on 2026-08-03 a writer held state.db's single write lock for longer
+    # than the baseline, and the transcript append that lost the race reported
+    # failure: the turn ended ``session_persistence_failed`` and the user got a
+    # fail-closed reply while the database itself was healthy (a post-incident
+    # BEGIN IMMEDIATE probe took 0.05 ms).  The holder was never identified, so
+    # ANY fixed number chosen to "cover" it would be incident-shaped folklore:
+    # a legitimate holder can be arbitrarily long (a multi-GB VACUUM in another
+    # process is minutes), and the next holder is not obliged to resemble the
+    # last one.
+    #
+    # So a critical write does not carry a patience budget at all.  It keeps
+    # re-probing while contention stays HEALTHY -- every failure is
+    # SQLITE_BUSY/LOCKED, which means the file is reachable and the lock
+    # manager is answering -- and it stops only on:
+    #   1. explicit cancellation, which collapses its patience back to the
+    #      baseline above so a shutdown can never wait longer than an ordinary
+    #      write would have.  Three callers set it: the SIGTERM/SIGHUP handlers
+    #      (-> writer.request_write_cancellation()), this instance's close(),
+    #      and interpreter shutdown -- see hermes_state_writer's exit hook,
+    #      which is registered ahead of concurrent.futures' pool-worker join
+    #      because a shutdown that never receives a signal must be bounded too;
+    #   2. a classified permanent failure (non-lock OperationalError, corrupt
+    #      database, closed connection) -- these propagate unchanged; or
+    #   3. the anti-hang watchdog below.
+    # While it waits it emits a throttled, content-free heartbeat, so an
+    # extended wait is visible in logs instead of looking like a hang.
+    #
+    # The watchdog is a SAFETY NET, not a patience knob, and it is explicitly
+    # NOT derived from any incident.  It is bounded from BOTH sides, because a
+    # waiting critical write costs more than time:
+    #
+    #   * From below -- it must stay well past _baseline_write_budget_s(), or
+    #     "keeps waiting while contention is healthy" is theatre and the
+    #     incident shape (a healthy holder outlasting an append) returns.
+    #   * From above -- the wait occupies the calling THREAD, and the gateway
+    #     reaches state.db through asyncio.to_thread, i.e. the event loop's
+    #     default executor: a small pool shared with every other offloaded
+    #     call.  This constant is therefore also the worst-case occupancy of
+    #     one pooled thread (per queued append) and the worst-case delay of an
+    #     interpreter exit, which joins those workers on the way out.
+    #
+    # 60 s satisfies both: ~3.5x the baseline, so a healthy holder that
+    # outlasts an ordinary write is still survived (the durability goal), while
+    # a permanently wedged holder -- a peer process stopped mid-transaction,
+    # say -- costs a bounded minute instead of the quarter hour an earlier
+    # revision allowed.  That earlier 900 s hedged against a *hypothetical*
+    # long legitimate holder by guaranteeing a much more concrete stall.
+    # Operators can lower it; nothing in the durability contract depends on the
+    # exact value, because the intended way an extended wait ends early is
+    # still cancellation.
+    _CRITICAL_WRITE_WATCHDOG_S = 60.0
+    # Patience for ONE in-process wait -- either for admission (see
+    # hermes_state_writer.WriterGate) or, once admitted, for this object's own
+    # self._lock.  A polling SLICE, not a budget: it bounds how long we sit in a
+    # single wait before re-checking cancellation and deadlines.  Neither wait
+    # costs a SQLite attempt (a writer that never got the connection never
+    # touched SQLite), but both consume wall clock, which is what keeps a
+    # non-critical write inside its baseline bound.
+    #
+    # The self._lock half exists because that lock is ALSO taken by paths that
+    # hold no admission at all -- _try_wal_checkpoint, close, vacuum,
+    # optimize_fts, rebuild_fts, the FTS trash-teardown probe, every get_*/set_*
+    # helper -- and the long ones are outside the gate on purpose (holding a
+    # non-preemptible admission across a minutes-long VACUUM would put every
+    # later writer behind it).  Waiting for self._lock without a bound while
+    # holding the gate would therefore hand the whole FILE's admission to one
+    # connection's maintenance run: every other SessionDB refused, a transcript
+    # append among them, and the waiter itself unable to re-check cancellation,
+    # the watchdog or its deadline.  Slicing the wait fixes that without
+    # touching lock ORDER, which must stay gate -> self._lock (the reverse
+    # deadlocks against _merge_fts_one_command).
+    _WRITE_GATE_WAIT_S = 1.0
     # Lock patience for the one-shot schema-init pass, which cannot use the
     # application-level retry above (see
     # _run_init_schema_with_wide_busy_timeout: replaying a partially applied
@@ -1616,6 +1742,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # Process-wide writer admission for this database FILE, shared by every
+        # SessionDB pointing at it.  self._lock only serializes THIS object's
+        # connection; a Hermes process holds many SessionDB instances against
+        # one state.db (gateway runner, gateway session store, mirror, every
+        # agent, cron, slash commands, the token-accounting thread), and before
+        # this gate they contended purely at the SQLite layer — where the busy
+        # handler is not a queue, so one writer could lose every probe until
+        # its budget ran out while others kept committing.  Lock ordering is
+        # always gate -> self._lock, never the reverse.
+        #
+        # The gate covers writes that go through _execute_write.  Schema
+        # init/migration, VACUUM, the opt-in FTS storage optimize, offline
+        # malformed-schema repair and the checkpoint in close() deliberately do
+        # NOT take it (they either predate any connection being usable, or hold
+        # SQLite's write lock for minutes, where a non-preemptible admission
+        # would make queued writers WORSE off, not better).  Those paths remain
+        # ordinary SQLite contention for everyone else -- which a critical write
+        # now waits through instead of failing after a fixed budget.
+        self._writer_gate = _writer_gate_for(self.db_path)
+        # Set to stop extending critical-write patience on THIS instance --
+        # close() sets it so a write blocked on the lock cannot outlive the
+        # connection it was going to commit on.  Plain bool, deliberately not
+        # an Event: it is read on the write path and set from shutdown paths,
+        # and a bare assignment/read is atomic in CPython.
+        self._write_cancelled = False
+        self._write_cancel_reason = ""
         # Read-path split (WAL only): recall/browse queries run on per-thread
         # read-only connections so they never queue behind writer flushes on
         # self._lock. See _read_ctx().
@@ -1661,16 +1813,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_busy = False
         try:
             if read_only:
-                # Read-only attach for cross-profile aggregation: SELECT-only,
-                # so we skip schema init entirely (no DDL, no FTS probe, no
-                # column reconcile). Crucially this takes NO write lock, so
-                # polling another profile's live DB on every sidebar refresh
-                # never contends with that profile's running backend. The DB
-                # must already exist + be initialised (callers guard on
-                # db_path.exists()); a SELECT against an empty file raises and
-                # the caller degrades per-profile.
+                # Read-only attach (cross-profile aggregation, `hermes
+                # insights`): SELECT-only, so we skip schema init entirely (no
+                # DDL, no FTS probe, no column reconcile). Crucially this takes
+                # NO write lock, so polling a live DB never contends with a
+                # running backend.
+                #
+                # It also means MIGRATIONS DO NOT RUN here, so a database last
+                # opened by an older Hermes keeps its old columns. Read-only
+                # consumers must degrade on `no such column` /
+                # `no such table` rather than assume the current schema (see
+                # agent/insights.py). Opening a non-existent or unreadable file
+                # raises, and the caller degrades — the failure is NOT silently
+                # upgraded to a writable open.
                 self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
+                    read_only_db_uri(self.db_path),
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
@@ -1812,7 +1969,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         try:
             conn = _connect_tracked_db(
-                f"file:{self.db_path}?mode=ro",
+                read_only_db_uri(self.db_path),
                 tracking_path=self.db_path,
                 uri=True,
                 timeout=5.0,
@@ -2189,9 +2346,165 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "widened schema-init handler"
                 ) from exc
 
+    @contextmanager
+    def _writer_admission(self, *, priority: int, timeout: float):
+        """Yield an :class:`hermes_state_writer.Admission` for this thread.
+
+        Wraps :class:`hermes_state_writer.WriterGate` so every writer in this
+        process takes admission the same way and always releases it, including
+        on exceptions.  ``admitted=False`` means the caller has NOT touched
+        SQLite and must treat it as contention, not as a failed write.
+
+        Two cleanup rules, both about interruption:
+
+        * If ``acquire_admission`` itself unwinds (``KeyboardInterrupt`` /
+          ``SystemExit`` from this repo's signal handlers can land on ANY
+          bytecode boundary, including between claiming the gate and returning
+          the admission), we release ownership this call acquired before
+          re-raising.  Without that, ownership could be stranded with no thread
+          able to release it and every later writer on this path would fail — a
+          worse outage than the one the gate exists to prevent.  ``owned_before``
+          keeps that cleanup from touching an OUTER level of a re-entrant write
+          that is still unwinding through its own ``finally``.
+        * Cleanup uses ``release_if_owner()``, never a bare ``release()``: it
+          must never raise from a ``finally`` (that would replace the caller's
+          real exception), and it must never release an admission this thread
+          does not own.
+        """
+        owned_before = self._writer_gate.owns()
+        try:
+            admission = self._writer_gate.acquire_admission(
+                priority=priority, timeout=timeout
+            )
+        except BaseException:
+            if not owned_before and self._writer_gate.release_if_owner():
+                logger.debug(
+                    "state.db writer admission released while unwinding an "
+                    "interrupted acquire"
+                )
+            raise
+        try:
+            yield admission
+        finally:
+            if admission.admitted and not self._writer_gate.release_if_owner():
+                # Only reachable if the gate state was reset underneath us
+                # (post-fork reset). Never a hard failure: the admission we
+                # were tracking no longer exists to release.
+                logger.debug(
+                    "state.db writer admission vanished before release "
+                    "(gate reset?); nothing to release"
+                )
+
+    class _ConnectionLock(NamedTuple):
+        """Outcome of one bounded attempt to take this object's connection lock.
+
+        ``queued`` mirrors ``hermes_state_writer.Admission.queued`` and exists
+        for the same reason: taking a FREE lock still costs a measurable number
+        of microseconds, and attributing those to contention would report every
+        single write as contended.  Only a lock that was actually busy counts.
+        """
+
+        locked: bool
+        queued: bool
+
+    @contextmanager
+    def _write_connection_lock(self, timeout: float):
+        """Yield a :class:`_ConnectionLock` for this object's connection lock.
+
+        ``self._lock`` serializes THIS object's connection only, and plenty of
+        paths take it while holding no writer admission: ``_try_wal_checkpoint``,
+        ``close``, ``vacuum``, ``optimize_fts``, ``rebuild_fts``, the FTS
+        trash-teardown probe, every ``get_*``/``set_*`` helper.  The long ones
+        are outside the gate deliberately (see ``vacuum``), so a writer holding
+        admission can legitimately find this lock busy for minutes.
+
+        Blocking indefinitely there is what this wrapper exists to prevent: the
+        gate is per database FILE, so one connection's maintenance would deny
+        admission to every other ``SessionDB`` — a transcript append among
+        them — while the waiter, parked on a plain ``threading.Lock``, could not
+        re-check cancellation, the watchdog or its own deadline.  Bounding the
+        wait keeps the required lock ORDER (gate -> ``self._lock``; the reverse
+        deadlocks against ``_merge_fts_one_command``) and makes both waits
+        interruptible at slice boundaries instead.
+
+        A non-positive *timeout* is clamped to a non-blocking poll rather than
+        rejected: the slice is capped by the write's remaining deadline, which is
+        exactly zero on the last iteration, and ``Lock.acquire`` raises
+        ``ValueError`` on a negative timeout.  Yielding ``locked=False`` (rather
+        than raising) is what lets the caller treat it as contention and hand
+        admission back without consuming a SQLite attempt.
+
+        Acquiring happens INSIDE the ``try`` for the same reason
+        ``WriterGate.acquire_admission`` registers its ticket there: an interrupt
+        (this repo's signal handlers raise ``KeyboardInterrupt`` /
+        ``SystemExit``, which can land on any bytecode boundary) must still reach
+        the ``finally``.  A connection lock stranded by an interrupt would wedge
+        every later write on this object AND its ``close()``, for the life of the
+        process.
+        """
+        acquired = False
+        queued = False
+        try:
+            # Uncontended fast path first, so a free lock is never reported as a
+            # wait; only then the bounded one.
+            acquired = self._lock.acquire(blocking=False)
+            queued = not acquired
+            if queued:
+                acquired = self._lock.acquire(timeout=max(0.0, timeout))
+            yield self._ConnectionLock(acquired, queued)
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def request_write_cancellation(self, reason: str = "caller") -> None:
+        """Stop extending critical-write patience on this SessionDB.
+
+        A critical write has no fixed patience while contention stays healthy
+        (see the class constants), so it needs an off switch that real code
+        sets.  ``close()`` is that caller: a write blocked on the lock must not
+        outlive the connection it was going to commit on.  Process-wide
+        shutdown has its own switch
+        (``hermes_state_writer.request_write_cancellation``), set by the
+        SIGTERM/SIGHUP handlers and — for exits that never involve a signal —
+        by that module's interpreter-exit hook.
+
+        Cancellation collapses the extended patience back to the ordinary
+        baseline budget rather than abandoning the write, so cancelling can
+        never make a transcript row *less* likely to land than it was before
+        write classes existed.
+        """
+        self._write_cancel_reason = reason
+        self._write_cancelled = True
+
+    def _write_cancellation_reason(self) -> Optional[str]:
+        """Reason a write should stop extending its patience, or None."""
+        if self._write_cancelled:
+            return self._write_cancel_reason or "instance"
+        if write_cancellation_requested():
+            return "process"
+        return None
+
+    @classmethod
+    def _baseline_write_budget_s(cls) -> float:
+        """Wall clock for the pre-existing (non-critical) retry contract.
+
+        ``_WRITE_MAX_RETRIES`` attempts, each able to sit in SQLite's busy
+        handler for ``_WRITE_BUSY_TIMEOUT_S``, separated by at most
+        ``_WRITE_RETRY_MAX_S`` of jitter.  Derived from the constants that
+        actually govern the loop so the two cannot drift, and computed as a
+        method so a test (or an operator) that lowers the retry count lowers
+        the wall clock with it.
+        """
+        return float(cls._WRITE_MAX_RETRIES) * (
+            float(cls._WRITE_BUSY_TIMEOUT_S) + float(cls._WRITE_RETRY_MAX_S)
+        )
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
+        *,
+        op: Optional[str] = None,
+        write_class: str = WRITE_NORMAL,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2205,58 +2518,345 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
+        Two layers of contention handling, covering different halves of the
+        problem (see ``hermes_state_writer`` for the incident history):
+
+        * **In-process ordering.** Every attempt first takes admission from
+          the per-database-path writer gate, so at most one writer of this
+          process attempts BEGIN IMMEDIATE at a time and a ``critical`` write
+          is admitted ahead of queued ``normal`` / ``best_effort`` work.  This
+          is what stops a transcript append from losing races to routine
+          accounting and maintenance inside the same process.  Being refused
+          admission consumes no SQLite attempt (a queued writer never touched
+          SQLite) but it does consume wall clock, so a non-critical write's
+          total patience stays exactly where it was before the gate existed
+          instead of stacking a second budget on top of the first.
+
+          The gate covers ``_execute_write`` only.  Schema init/migration,
+          ``VACUUM``, ``optimize_fts_storage``, offline repair and the
+          checkpoint in ``close()`` write outside it *on purpose* (they either
+          run before a usable connection exists, or hold SQLite's write lock
+          for minutes, where holding a non-preemptible admission would put a
+          later transcript append behind them rather than ahead).  So "every
+          writer is coordinated" is NOT a claim this makes: those paths stay
+          ordinary SQLite contention, which a critical write now waits through.
+
+          Because those paths hold ``self._lock`` without admission, the wait
+          for ``self._lock`` here is BOUNDED by one slice
+          (``_WRITE_GATE_WAIT_S``) and admission is handed back on timeout.
+          Blocking there instead would give one connection's maintenance the
+          whole file's gate — refusing every other ``SessionDB``, a transcript
+          append among them — and would park this thread where cancellation,
+          the watchdog and the deadline are all unreachable.  A bounced attempt
+          costs no SQLite attempt, exactly like a refused admission.
+
+        * **Cross-process patience.** The gate cannot order other processes'
+          writers, and no fixed number can describe how long a legitimate
+          foreign holder takes.  ``write_class=critical`` therefore drops the
+          fixed budget entirely and keeps re-probing while contention stays
+          HEALTHY (every failure is SQLITE_BUSY/LOCKED, i.e. the database is
+          reachable and answering).  It stops on explicit cancellation, on a
+          classified permanent failure, or on ``_CRITICAL_WRITE_WATCHDOG_S``
+          (an anti-hang net that also caps how long one write may occupy the
+          thread it runs on — not patience tuning).  While waiting it emits a
+          throttled content-free heartbeat so an extended wait is visible.
+
+        *write_class* is a durability contract, not a hint:
+
+        ``critical``
+            The caller cannot proceed correctly without this row being
+            durable (transcript appends and the session row they depend on).
+        ``normal``
+            Default.  Retry budget and wall-clock bound identical to before.
+        ``best_effort``
+            The caller already logs-and-continues on failure (async token
+            accounting, WAL checkpoint, FTS merge).  Always yields.
+
+        Fail-closed is preserved end to end.  A non-lock SQLite error, a
+        closed connection, an interpreter shutdown / cancellation
+        (``BaseException``), or an exhausted budget all raise — this method
+        never returns normally without a committed transaction, so a caller
+        can never mistake contention for durability.
+
         Returns whatever *fn* returns.
         """
+        priority = priority_of(write_class)
+        op_name = describe_op(fn, op)
+        baseline_budget = self._baseline_write_budget_s()
+        critical = write_class == WRITE_CRITICAL
+
+        started = time.monotonic()
+        if critical:
+            # No patience budget while contention is healthy; see the class
+            # constants for why a fixed number would be folklore.
+            max_attempts: Optional[int] = None
+            deadline: Optional[float] = None
+            watchdog: Optional[float] = started + self._CRITICAL_WRITE_WATCHDOG_S
+            budget_s: Optional[float] = None
+        else:
+            max_attempts = self._WRITE_MAX_RETRIES
+            deadline = started + baseline_budget
+            watchdog = None
+            budget_s = baseline_budget
+
+        gate_waited = 0.0
+        # Time spent waiting for THIS object's connection lock (behind
+        # maintenance or another helper that holds no admission).  Reported
+        # together with gate_waited as in-process contention: both are waits
+        # behind a writer of this process, and calling a multi-second one
+        # "contention=none" is exactly the misattribution that made the
+        # 2026-08-03 incidents unresolvable.  Kept as its own accumulator so the
+        # sub-cause stays visible via conn_lock_timeouts.
+        lock_waited = 0.0
+        busy_retries = 0
+        gate_timeouts = 0
+        lock_timeouts = 0
+        attempts = 0
         last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
-            try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+        stop_reason: Optional[str] = STOP_BUDGET
+        cancelled_reason: Optional[str] = None
+
+        def _report(succeeded: bool) -> None:
+            record_outcome(
+                op=op_name,
+                write_class=write_class,
+                succeeded=succeeded,
+                waited_s=time.monotonic() - started,
+                gate_waited_s=gate_waited + lock_waited,
+                attempts=attempts,
+                sqlite_busy_retries=busy_retries,
+                gate_timeouts=gate_timeouts,
+                conn_lock_timeouts=lock_timeouts,
+                budget_s=budget_s,
+                stop_reason=None if succeeded else stop_reason,
+            )
+
+        while True:
+            now = time.monotonic()
+            if critical:
+                # Cancellation collapses the extended patience to the ordinary
+                # baseline, so a shutdown or a closing connection stops the
+                # wait without making this row less likely to land than it was
+                # before write classes existed.
+                if cancelled_reason is None:
+                    cancelled_reason = self._write_cancellation_reason()
+                    if cancelled_reason is not None:
+                        deadline = started + baseline_budget
+                        logger.debug(
+                            "state.db critical write patience cancelled "
+                            "(%s): op=%s", cancelled_reason, op_name,
+                        )
+                if watchdog is not None and now >= watchdog:
+                    stop_reason = STOP_WATCHDOG
+                    break
+                if now - started >= baseline_budget:
+                    # Past the point an ordinary write would have given up:
+                    # say so, on a throttle, instead of waiting in silence.
+                    note_long_wait(
+                        op=op_name,
+                        write_class=write_class,
+                        waited_s=now - started,
+                        attempts=attempts,
+                        sqlite_busy_retries=busy_retries,
+                        gate_waited_s=gate_waited + lock_waited,
+                    )
+            if deadline is not None and now >= deadline:
+                stop_reason = (
+                    STOP_CANCELLED if cancelled_reason is not None
+                    else STOP_BUDGET
+                )
+                break
+            if max_attempts is not None and attempts >= max_attempts:
+                stop_reason = STOP_BUDGET
+                break
+
+            gate_budget = self._WRITE_GATE_WAIT_S
+            if deadline is not None:
+                gate_budget = min(gate_budget, max(0.0, deadline - now))
+            gate_started = time.monotonic()
+            retry_after_backoff = False
+            fts_repair_error: Optional[sqlite3.DatabaseError] = None
+            result = None
+            succeeded = False
+
+            with self._writer_admission(
+                priority=priority, timeout=gate_budget
+            ) as admission:
+                if admission.queued:
+                    # Only a real queue counts as in-process contention.
+                    # Acquiring a free gate still costs microseconds, and
+                    # attributing those to contention would classify every
+                    # single write as contended.
+                    gate_waited += time.monotonic() - gate_started
+                if not admission.admitted:
+                    # Another writer of this process holds the gate.  We never
+                    # touched SQLite, so no retry is consumed and no backoff is
+                    # needed (the gate wait WAS the wait).  Re-queue; the
+                    # deadline (non-critical) or the watchdog + cancellation
+                    # (critical) is what keeps this bounded.
+                    gate_timeouts += 1
+                    continue
+
+                # Bounded, and only ever inside admission (never the reverse
+                # order).  self._lock is also held by paths that take no
+                # admission -- maintenance being the long ones -- so waiting for
+                # it indefinitely here would keep the process-wide gate for the
+                # whole of somebody else's VACUUM/rebuild/checkpoint and park
+                # this thread somewhere it cannot re-check anything.
+                lock_budget = self._WRITE_GATE_WAIT_S
+                if deadline is not None:
+                    lock_budget = min(
+                        lock_budget, max(0.0, deadline - time.monotonic())
+                    )
+                lock_started = time.monotonic()
+                try:
+                    with self._write_connection_lock(lock_budget) as conn_lock:
+                        if conn_lock.queued:
+                            # Same rule as admission: only a lock that was
+                            # really busy counts as in-process contention.
+                            lock_waited += time.monotonic() - lock_started
+                        if not conn_lock.locked:
+                            # This connection is busy with work that holds no
+                            # admission.  Hand admission back through the
+                            # context manager above so every other SessionDB on
+                            # this file can proceed, and re-queue: no SQLite
+                            # attempt is consumed (we never reached BEGIN
+                            # IMMEDIATE) and no backoff is needed (the lock wait
+                            # WAS the wait).  The loop top -- cancellation, the
+                            # watchdog, the deadline, the heartbeat -- becomes
+                            # reachable again, which it is not from inside an
+                            # unbounded lock acquire.
+                            lock_timeouts += 1
+                            note_conn_lock_timeout(
+                                op=op_name, write_class=write_class
+                            )
+                            continue
+                        # Counted here, not before the wait: an attempt means an
+                        # attempt at SQLITE, and only from this point on can one
+                        # happen.
+                        attempts += 1
+                        if self._conn is None:
+                            # close() ran while we were queued or retrying.
+                            # Fail closed and say so: silently "succeeding"
+                            # here would report an unwritten transcript row as
+                            # persisted.  ProgrammingError (what sqlite3 itself
+                            # raises for a closed connection) rather than
+                            # OperationalError, so this can never be mistaken
+                            # for retryable contention by the text match below.
+                            raise sqlite3.ProgrammingError(
+                                "state.db connection is closed; refusing to "
+                                "report this write as persisted"
+                            )
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                except sqlite3.OperationalError as exc:
+                    err_msg = str(exc).lower()
+                    if "locked" not in err_msg and "busy" not in err_msg:
+                        # Non-lock error — propagate unchanged.
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                    last_err = exc
+                    busy_retries += 1
+                    note_busy_retry(op=op_name, write_class=write_class)
+                    retry_after_backoff = True
+                except sqlite3.DatabaseError as exc:
+                    # Corrupt FTS shadow tables make every write raise the
+                    # malformed/corrupt error class through the FTS sync
+                    # triggers while the canonical messages table is intact.
+                    # The gateway session store has its own retry queue for
+                    # transcript appends (#65637 salvage), but cron and CLI
+                    # writers call SessionDB directly — without this, their
+                    # writes hard-fail until the next process restart triggers
+                    # the offline repair.  Classification is pure; the repair
+                    # itself runs below, after admission is released, so a
+                    # multi-second rebuild never blocks queued writers.
+                    if not self._is_fts_write_corruption_error(exc):
+                        raise
+                    fts_repair_error = exc
+                else:
+                    succeeded = True
+
+            if succeeded:
+                # Report BEFORE maintenance: the measured wait must describe
+                # this write's contention only.  Folding a checkpoint or merge
+                # pass into it would report writes as "starved" purely because
+                # they happened to land on a maintenance boundary.
+                _report(True)
+                # Periodic best-effort maintenance runs AFTER admission is
+                # released, so it re-queues at best-effort priority behind any
+                # transcript append waiting on this database.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
-            except sqlite3.OperationalError as exc:
-                err_msg = str(exc).lower()
-                if "locked" in err_msg or "busy" in err_msg:
-                    last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
-                        jitter = random.uniform(
-                            self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
-                        )
-                        time.sleep(jitter)
-                        continue
-                # Non-lock error or retries exhausted — propagate.
-                raise
-            except sqlite3.DatabaseError as exc:
-                # Corrupt FTS shadow tables make every write raise the
-                # malformed/corrupt error class through the FTS sync triggers
-                # while the canonical messages table is intact. The gateway
-                # session store has its own retry queue for transcript
-                # appends (#65637 salvage), but cron and CLI writers call
-                # SessionDB directly — without this, their writes hard-fail
-                # until the next process restart triggers the offline repair.
+
+            if fts_repair_error is not None:
                 # Rebuild the FTS index in place (once per instance) via
                 # rebuild_fts() and retry the failed write immediately.
-                if not self._try_runtime_fts_rebuild(exc):
-                    raise
+                if not self._try_runtime_fts_rebuild(fts_repair_error):
+                    raise fts_repair_error
                 continue
-        # Retries exhausted (shouldn't normally reach here).
-        raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
+
+            if retry_after_backoff:
+                if (max_attempts is not None and attempts >= max_attempts) or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    break
+                time.sleep(
+                    random.uniform(
+                        self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S
+                    )
+                )
+
+        # Out of patience.  Fail closed with the real SQLite error so callers
+        # (and the turn's fail-closed path) see contention for what it was, and
+        # so every existing "locked"/"busy" classification keeps working.
+        _report(False)
+        if last_err is not None:
+            raise last_err
+        # No SQLite error to re-raise means we never got in: every attempt was
+        # refused admission by another writer of THIS process, or found this
+        # connection busy with maintenance that holds no admission.  Name which
+        # one — "database is locked" would send the next investigation looking
+        # for a foreign holder that does not exist, and blaming "another writer"
+        # for our own VACUUM would send it looking for the wrong writer — while
+        # keeping "locked" in the text so callers' contention classification
+        # holds.
+        waited = time.monotonic() - started
+        if gate_timeouts and lock_timeouts:
+            blocker = (
+                "another writer in this process and by maintenance holding "
+                "this connection"
+            )
+        elif lock_timeouts:
+            blocker = "maintenance holding this connection"
+        else:
+            blocker = "another writer in this process"
+        if stop_reason == STOP_WATCHDOG:
+            raise sqlite3.OperationalError(
+                f"state.db is locked by {blocker} and the anti-hang watchdog "
+                f"fired after {waited:.1f}s; refusing to report this write as "
+                "persisted"
+            )
+        if cancelled_reason is not None:
+            raise sqlite3.OperationalError(
+                f"state.db is locked by {blocker} and the wait was cancelled "
+                f"({cancelled_reason}) after {waited:.1f}s; refusing to report "
+                "this write as persisted"
+            )
+        raise sqlite3.OperationalError(
+            f"state.db is locked by {blocker} for {waited:.1f}s "
+            f"({gate_timeouts} refused admissions, {lock_timeouts} "
+            "busy-connection waits); refusing to report this write as persisted"
         )
 
     @staticmethod
@@ -2339,6 +2939,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Previous TRUNCATE strategy caused B-tree corruption on large
         databases (65K+ pages) due to the exclusive-lock I/O pressure
         from checkpointing thousands of frames at once (issue #45383).
+
+        Deliberately does **not** take writer admission.  A PASSIVE checkpoint
+        takes SQLite's CHECKPOINTER lock, not the WRITER lock, so writers on
+        other connections (including other ``SessionDB`` objects and other
+        processes) run concurrently with it — while the writer gate is
+        non-preemptible, so holding admission across a checkpoint that this
+        method's own docstring calls "minutes of I/O" would block every later
+        arrival, including a transcript append, for its whole duration.  That
+        would be a NEW way to produce ``session_persistence_failed``.  A
+        concurrent maintenance operation must stay concurrent.
         """
         try:
             with self._lock:
@@ -2361,7 +2971,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         web-server paths, so close() is not necessarily a process shutdown
         boundary — use PASSIVE here; exclusive TRUNCATE remains reserved for
         controlled maintenance such as pre-VACUUM while writers are quiesced.
+
+        Cancels this instance's extended critical-write patience FIRST. A
+        critical write keeps waiting while contention stays healthy, and the
+        connection it intends to commit on is about to be closed underneath
+        it — so waiting longer could only end in the closed-connection
+        failure. Cancelling reduces it to the ordinary baseline patience (it is
+        not abandoned: a row that can still land in that window does land).
+
+        The checkpoint below runs outside writer admission on purpose, for the
+        same reason as ``_try_wal_checkpoint``: PASSIVE does not block other
+        writers, and taking a non-preemptible admission here would.
         """
+        self.request_write_cancellation("close")
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
         # method); without unregistering, every closed SessionDB stays
@@ -2482,8 +3104,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cwd: str = None,
         profile_name: str = None,
         git_repo_root: str = None,
+        write_class: str = WRITE_CRITICAL,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
+
+        *write_class* defaults to ``critical`` because that is the durability
+        contract of the path this row was written for: ``create_session`` (and
+        the append precondition it establishes — ``messages`` carries the
+        session FK and ``_ensure_db_session`` swallows the failure, so losing
+        this row surfaces later as a failed transcript append).
+
+        It is a PARAMETER, not a constant, because this helper is also the
+        cheap FK guard on paths whose own contract is weaker:
+        ``update_token_counts`` and ``record_auxiliary_usage`` call it on every
+        token delta and must stay ``best_effort`` (they already
+        log-and-continue, so at priority 0 they would queue FIFO alongside real
+        transcript appends and halve an append's attempt rate — the exact
+        inversion the write classes exist to remove), and ``ensure_session``
+        is ordinary ``normal`` state.
 
         The gateway's ``get_or_create_session`` creates a bare row (source +
         user_id) *before* the agent exists; the agent's later
@@ -2616,7 +3254,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
-        self._execute_write(_do)
+        # One op name for one statement, whatever the caller's class: the
+        # telemetry axis that matters is "which SQL waited", and the class is
+        # reported alongside it.
+        self._execute_write(_do, op="create_session", write_class=write_class)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -4043,7 +4684,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
         # INSERT OR IGNORE is cheap and idempotent.
-        self._insert_session_row(session_id, "unknown", model=model)
+        #
+        # best_effort, matching this method's own contract below: it runs once
+        # per API call on the async accounting thread, so escalating this FK
+        # guard to the transcript's priority would put accounting in the same
+        # queue as appends on every single token delta.
+        self._insert_session_row(
+            session_id, "unknown", model=model, write_class=WRITE_BEST_EFFORT
+        )
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -4177,7 +4825,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cost_source=cost_source,
                     api_call_count=api_call_count,
                 )
-        self._execute_write(_do)
+        # Best effort by contract: every caller (the async writer in
+        # ``_apply_token_batch`` and the inline fallback) already logs a
+        # failure and continues — accounting loss is never raised into a turn.
+        # It must therefore yield to transcript writes rather than race them,
+        # which is exactly what lost the 23:04:29 probe in the incident.
+        self._execute_write(
+            _do, op="update_token_counts", write_class=WRITE_BEST_EFFORT
+        )
 
     def _record_model_usage(
         self,
@@ -4288,7 +4943,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model: str = None,
         **kwargs,
     ) -> str:
-        """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
+        """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs.
+
+        ``normal``, not ``critical``: callers use this to make a row exist
+        before ordinary bookkeeping, and every one of them reports a failure
+        rather than depending on the row for a turn's durability. Callers that
+        DO have that dependency use ``create_session``.
+        """
+        kwargs.setdefault("write_class", WRITE_NORMAL)
         self._insert_session_row(session_id, source, model=model, **kwargs)
         return session_id
 
@@ -4327,7 +4989,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # FK on session_model_usage.session_id → sessions.id: ensure the row
         # exists (same INSERT OR IGNORE guard update_token_counts uses — the
         # initial create_session() can fail under concurrent SQLite locking).
-        self._insert_session_row(session_id, "unknown")
+        # best_effort, matching the "never fail an aux call for accounting"
+        # contract in this docstring.
+        self._insert_session_row(
+            session_id, "unknown", write_class=WRITE_BEST_EFFORT
+        )
 
         def _do(conn):
             self._record_model_usage(
@@ -4349,7 +5015,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 api_call_count=1,
                 task=task,
             )
-        self._execute_write(_do)
+        # Same contract as the FK guard above: accounting must yield to
+        # transcript writes, never race them.
+        self._execute_write(
+            _do, op="record_auxiliary_usage", write_class=WRITE_BEST_EFFORT
+        )
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
@@ -5493,7 +6163,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return msg_id
 
-        return self._execute_write(_do)
+        # Critical: this row IS the turn's durability boundary.  When it does
+        # not commit, the conversation loop exits
+        # ``session_persistence_failed`` and the user gets a fail-closed reply
+        # instead of the assistant's answer, so it must outlast a long
+        # legitimate lock holder rather than give up after ~16 s.
+        return self._execute_write(
+            _do, op="append_message", write_class=WRITE_CRITICAL
+        )
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
@@ -7968,6 +8645,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         FTS5 segments are merged first via :meth:`optimize_fts` so the
         subsequent VACUUM reclaims the pages freed by the merge. This is a
         layout-only optimization — search results are unchanged.
+
+        Deliberately takes NO writer admission, and that is a real limitation,
+        not an oversight: VACUUM holds SQLite's write lock for as long as it
+        takes to rewrite the file (minutes on a multi-GB database). Holding a
+        non-preemptible admission for that long would put every later
+        writer — including a transcript append — behind it instead of leaving
+        them to SQLite, which is strictly worse. So a concurrent critical
+        write does not get *ordered* here; it gets *patience*: it keeps
+        re-probing while the lock is merely busy rather than failing after a
+        fixed budget. Callers that can quiesce writers should still do so
+        (``maybe_auto_prune_and_vacuum`` runs this at startup for that reason),
+        and a non-critical write concurrent with a long VACUUM still fails
+        closed inside its baseline budget exactly as it did before.
 
         Returns the number of FTS indexes that were optimized (0 if the
         merge step failed or no FTS tables exist).

@@ -25130,6 +25130,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
+        # state.db: stop critical writes from extending their patience beyond
+        # the ordinary retry budget. A transcript append waits while the write
+        # lock is merely contended (see SessionDB._execute_write), and this
+        # process is going away — so waiting minutes for a foreign holder would
+        # only delay teardown past the service manager's own kill timeout.
+        # It does NOT abandon the write: patience collapses to the same bounded
+        # budget it had before write classes existed, so a row that can still
+        # land during shutdown still lands.
+        try:
+            import hermes_state_writer as _state_writer
+
+            _state_writer.request_write_cancellation(
+                f"signal-{int(received_signal)}" if received_signal else "shutdown"
+            )
+        except Exception as _e:
+            logger.debug("state.db write cancellation request failed: %s", _e)
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
         # before sending SIGTERM. If present, treat the signal as a

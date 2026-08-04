@@ -1,13 +1,16 @@
 """Tests for agent/insights.py — InsightsEngine analytics and reporting."""
 
+import sqlite3
 import time
 import pytest
 
+import hermes_state
 from hermes_state import SessionDB
 from agent.insights import (
     InsightsEngine,
     _estimate_cost,
     _bar_chart,
+    open_insights_db,
 )
 from agent.usage_pricing import (
     format_duration_compact as _format_duration,
@@ -800,3 +803,218 @@ class TestEdgeCases:
         # Depending on timing, might catch the session if created <1s ago
         # Just verify it doesn't crash
         assert "empty" in report
+
+
+# =========================================================================
+# Reporting must not become a writer
+# =========================================================================
+
+class TestInsightsDoesNotTakeTheWriteLock:
+    """``hermes insights`` runs SELECTs and must open ``state.db`` read-only.
+
+    Context (vpsclone, 2026-08-03 23:03:59): ``hermes insights --days 30`` was
+    the last tool launched before every writer on a 14.5 GB ``state.db`` began
+    failing with ``database is locked``; it ran until the terminal timed out at
+    23:05:59.  The exact lock-holding statement was never proven, but a
+    reporting command has no business opening a writable handle at all: a
+    writable ``SessionDB()`` runs the schema-init pass (which writes, with a
+    deliberately widened busy handler) and checkpoints the WAL on ``close()``.
+    Removing that removes a whole class of suspect without changing any report.
+    """
+
+    def test_existing_database_is_opened_read_only(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state.db"
+        SessionDB(db_path=db_path).close()
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        db = open_insights_db()
+        try:
+            assert db.read_only is True
+            # Not merely a flag: the handle genuinely cannot write, so it can
+            # neither take nor wait for the single write lock.
+            with pytest.raises(sqlite3.OperationalError):
+                db._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES ('probe', '1')"
+                )
+            # And it still reads, which is the whole job.
+            assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        finally:
+            db.close()
+
+    def test_report_still_generates_over_the_read_only_handle(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: a real report over a real read-only attach."""
+        db_path = tmp_path / "state.db"
+        seed = SessionDB(db_path=db_path)
+        seed.create_session(session_id="s1", source="cli", model="test-model")
+        seed.update_token_counts("s1", input_tokens=100, output_tokens=50)
+        seed.close()
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        db = open_insights_db()
+        try:
+            report = InsightsEngine(db).generate(days=30)
+            assert report["empty"] is False
+            assert report["overview"]["total_tokens"] == 150
+        finally:
+            db.close()
+
+    def test_first_run_reports_without_creating_a_database(
+        self, tmp_path, monkeypatch
+    ):
+        """Read-only even on the FIRST run: no file, no writes, still a report.
+
+        The earlier shape of this change opened a writable ``SessionDB()`` when
+        the file was missing, guarded by ``db_path.exists()``.  Two problems:
+        the guard is a TOCTOU window (another process can create the file in
+        between, at which point insights becomes exactly the writer this change
+        removes), and creating + migrating a database is a strange thing for a
+        reporting command to do.  An in-memory empty stand-in gives the same
+        user-visible result with no writer and no file.
+        """
+        db_path = tmp_path / "fresh" / "state.db"
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        db = open_insights_db()
+        try:
+            assert db.read_only is True
+            assert not db_path.exists(), "reporting must not create state.db"
+            report = InsightsEngine(db).generate(days=30)
+            assert report["empty"] is True
+        finally:
+            db.close()
+        # Not even the directory: reporting performs no filesystem writes.
+        assert not db_path.parent.exists()
+
+    def test_unopenable_existing_path_is_an_error_not_a_writable_open(
+        self, tmp_path, monkeypatch
+    ):
+        """A path that exists but cannot be opened read-only must NOT be upgraded.
+
+        Silently falling back to a writable open would reintroduce the writer;
+        silently reporting "no data" would lie about a database that has data.
+        """
+        db_path = tmp_path / "state.db"
+        db_path.mkdir()  # exists, and can never be opened as a database
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        with pytest.raises(RuntimeError, match="never opens state.db for writing"):
+            open_insights_db()
+        # Untouched: no schema init, no migration, no quarantine, no new file.
+        assert db_path.is_dir()
+        assert list(db_path.iterdir()) == []
+
+    def test_cold_wal_database_opens_read_only_without_a_live_shm(
+        self, tmp_path, monkeypatch
+    ):
+        """The common CLI case: nothing else has the database open.
+
+        A cleanly closed WAL database has no ``-wal``/``-shm`` sidecars, so a
+        read-only open has to establish the WAL index itself.  This is the
+        single most likely way the read-only switch could break ``hermes
+        insights`` for everyone, so it is asserted rather than assumed.
+        """
+        db_path = tmp_path / "state.db"
+        seed = SessionDB(db_path=db_path)
+        seed.create_session(session_id="cold", source="cli", model="m")
+        seed.append_message(session_id="cold", role="user", content="hi")
+        seed.close()
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+        # Cold start premise: a clean close removes the WAL sidecars, so the
+        # read-only open below has to establish the WAL index itself. If a
+        # platform keeps them, the premise does not hold and the test would be
+        # vacuous rather than wrong.
+        if (tmp_path / "state.db-shm").exists():
+            pytest.skip("platform kept the -shm sidecar after close")
+
+        db = open_insights_db()
+        try:
+            assert db.read_only is True
+            report = InsightsEngine(db).generate(days=30)
+            assert report["empty"] is False
+            assert report["overview"]["total_sessions"] == 1
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        "dirname", ["has?question", "has#hash", "has%20literal", "has space"]
+    )
+    def test_uri_special_characters_in_the_path_are_escaped(
+        self, tmp_path, monkeypatch, dirname
+    ):
+        """``file:{path}?mode=ro`` is a URI, so the path must be escaped.
+
+        Unescaped, a ``HERMES_HOME`` containing ``?``, ``#`` or ``%NN`` either
+        opens a DIFFERENT database or fails with an opaque "unable to open
+        database file" — and this change makes every ``hermes insights``
+        invocation depend on that parsing.
+        """
+        home = tmp_path / dirname
+        home.mkdir()
+        db_path = home / "state.db"
+        seed = SessionDB(db_path=db_path)
+        seed.create_session(session_id="s-special", source="cli", model="m")
+        seed.close()
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        db = open_insights_db()
+        try:
+            assert db.read_only is True
+            # The RIGHT database: the session we seeded is visible.
+            rows = db._conn.execute("SELECT id FROM sessions").fetchall()
+            assert [r[0] for r in rows] == ["s-special"]
+        finally:
+            db.close()
+
+    def test_report_degrades_on_a_pre_migration_schema(self, tmp_path, monkeypatch):
+        """An older database must still produce a report, not an error.
+
+        A read-only open deliberately does not run migrations, so the first
+        command after an update — plausibly ``hermes insights`` — can meet a
+        ``sessions`` table without the newer cost/billing columns.  Before the
+        degradation guard that raised ``no such column`` straight into "Error
+        generating insights".
+        """
+        db_path = tmp_path / "state.db"
+        # Build a deliberately OLD sessions table: identity + a couple of
+        # counters, none of the columns later migrations added.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, "
+                "model TEXT, started_at REAL, ended_at REAL, "
+                "message_count INTEGER, input_tokens INTEGER, "
+                "output_tokens INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO sessions (id, source, model, started_at, "
+                "message_count, input_tokens, output_tokens) "
+                "VALUES ('old', 'cli', 'legacy-model', ?, 4, 100, 50)",
+                (time.time(),),
+            )
+            conn.execute(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, "
+                "role TEXT, content TEXT, timestamp REAL, tool_name TEXT, "
+                "tool_calls TEXT)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+
+        db = open_insights_db()
+        try:
+            engine = InsightsEngine(db)
+            report = engine.generate(days=30)
+            assert report["empty"] is False
+            assert report["degraded"] is True
+            # The columns that exist are still summarised correctly...
+            assert report["overview"]["total_sessions"] == 1
+            assert report["overview"]["total_tokens"] == 150
+            # ...and the missing ones are named for the operator.
+            assert "cost_status" in report["missing_session_columns"]
+            # Formatting must not blow up on the reduced row either.
+            assert "Sessions" in engine.format_terminal(report)
+        finally:
+            db.close()

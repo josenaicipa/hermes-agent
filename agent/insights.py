@@ -17,6 +17,7 @@ Usage:
 """
 
 import json
+import logging
 import sqlite3
 import time
 from collections import Counter, defaultdict
@@ -29,6 +30,8 @@ from agent.usage_pricing import (
     format_duration_compact,
     has_known_pricing,
 )
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -74,6 +77,83 @@ def _estimate_cost(
 
 
 
+class _EmptyInsightsDB:
+    """Stand-in for "there is no state.db yet": an in-memory, tableless DB.
+
+    ``hermes insights`` on a machine that has never run anything else must
+    still print a report, and it must NOT create or write ``state.db`` to do
+    it — reporting is a read-only activity even on the first run.  An
+    in-memory database with no tables gives exactly that: every query raises
+    ``no such table``, the engine's degradation path turns that into "no
+    data", and the report comes out empty and truthful.
+
+    Deliberately NOT a ``SessionDB``: constructing one would create the file,
+    run migrations and register an atexit drain — all writes, for a report.
+    """
+
+    read_only = True
+
+    def __init__(self):
+        self._conn = sqlite3.connect(":memory:")
+        self._conn.row_factory = sqlite3.Row
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+def open_insights_db():
+    """Open ``state.db`` for report generation without becoming a writer.
+
+    ``InsightsEngine`` only issues SELECTs, but every call site used to open a
+    plain writable ``SessionDB()``.  That is not free: a writable open runs the
+    full schema-init pass, which writes on the connection with a deliberately
+    widened busy handler, and ``close()`` attempts a WAL checkpoint.  On a
+    multi-GB production database shared with a live gateway that turns a
+    read-only report into a writer competing for the single write lock.
+
+    Suspect removal, NOT a proven root cause: ``hermes insights --days 30``
+    was the last command started before the 2026-08-03 23:04 lock window, and
+    that is a correlation.  The holder was never identified.  What is
+    defensible without proof is that a reporting command should not hold a
+    writable handle at all.
+
+    ``read_only=True`` skips schema init entirely and takes NO write lock (see
+    ``SessionDB.__init__``), so ``hermes insights`` can never contend with a
+    transcript append.
+
+    No ``exists()`` pre-check: that was a TOCTOU window in which another
+    process could create the file between the check and the open, at which
+    point insights became the very writer this change removes.  Instead we
+    just try the read-only open — it cannot create a database — and degrade to
+    an empty in-memory one if it fails because there is nothing there.  A file
+    that exists but cannot be opened read-only is reported as an error rather
+    than silently downgraded to "no data" or upgraded to a writable open.
+    """
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+
+    db_path = DEFAULT_DB_PATH
+    try:
+        return SessionDB(db_path=db_path, read_only=True)
+    except Exception as exc:
+        # Classify AFTER the failed open, so the check is only used to pick a
+        # message — never to decide whether to open something writable.
+        try:
+            exists = db_path.exists()
+        except OSError:
+            exists = False
+        if exists:
+            raise RuntimeError(
+                f"cannot read {db_path} for reporting ({exc}). Insights never "
+                "opens state.db for writing; run another hermes command (or "
+                "check file permissions) and retry."
+            ) from exc
+        logger.debug("no state.db at %s; reporting over an empty DB", db_path)
+        return _EmptyInsightsDB()
+
+
 def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
     """Create simple horizontal bar chart strings from values."""
     peak = max(values) if values else 1
@@ -99,6 +179,11 @@ class InsightsEngine:
         """
         self.db = db
         self._conn = db._conn
+        # Set when a query had to fall back because the database's schema is
+        # older than this code (reporting opens read-only, so migrations do not
+        # run — see open_insights_db) or because a table is missing entirely.
+        self.degraded = False
+        self.missing_session_columns: List[str] = []
 
     def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
         """
@@ -120,17 +205,19 @@ class InsightsEngine:
         if callable(flush):
             flush()
 
-        # Gather raw data
+        # Gather raw data.  Sessions FIRST and short-circuit on empty: every
+        # other query joins ``sessions``, so with no sessions in the window
+        # they can only return empty — and skipping them keeps the report
+        # working on a database that has no ``messages`` table at all (a
+        # never-initialised install reporting over the in-memory empty DB).
         sessions = self._get_sessions(cutoff, source)
-        tool_usage = self._get_tool_usage(cutoff, source)
-        skill_usage = self._get_skill_usage(cutoff, source)
-        message_stats = self._get_message_stats(cutoff, source)
 
         if not sessions:
             return {
                 "days": days,
                 "source_filter": source,
                 "empty": True,
+                "degraded": self.degraded,
                 "overview": {},
                 "models": [],
                 "platforms": [],
@@ -148,6 +235,10 @@ class InsightsEngine:
                 "top_sessions": [],
             }
 
+        tool_usage = self._get_tool_usage(cutoff, source)
+        skill_usage = self._get_skill_usage(cutoff, source)
+        message_stats = self._get_message_stats(cutoff, source)
+
         # Compute insights
         models = self._compute_model_breakdown(sessions, cutoff, source)
         overview = self._compute_overview(sessions, message_stats, models)
@@ -161,6 +252,10 @@ class InsightsEngine:
             "days": days,
             "source_filter": source,
             "empty": False,
+            # True when the schema was older than this code and some columns
+            # were reported as absent rather than crashing the command.
+            "degraded": self.degraded,
+            "missing_session_columns": list(self.missing_session_columns),
             "generated_at": time.time(),
             "overview": overview,
             "models": models,
@@ -175,12 +270,19 @@ class InsightsEngine:
     # Data gathering (SQL queries)
     # =========================================================================
 
-    # Columns we actually need (skip system_prompt, model_config blobs)
-    _SESSION_COLS = ("id, source, model, started_at, ended_at, "
-                     "message_count, tool_call_count, input_tokens, output_tokens, "
-                     "cache_read_tokens, cache_write_tokens, billing_provider, "
-                     "billing_base_url, billing_mode, estimated_cost_usd, "
-                     "actual_cost_usd, cost_status, cost_source, api_call_count")
+    # Columns we actually need (skip system_prompt, model_config blobs).
+    # Kept as a tuple of identifiers (the flat string below is derived from it)
+    # so the pre-migration fallback can intersect it with the columns a
+    # database actually has. Every name is a literal from this source file —
+    # nothing user-controlled ever reaches the query text.
+    _SESSION_COL_NAMES = (
+        "id", "source", "model", "started_at", "ended_at",
+        "message_count", "tool_call_count", "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_write_tokens", "billing_provider",
+        "billing_base_url", "billing_mode", "estimated_cost_usd",
+        "actual_cost_usd", "cost_status", "cost_source", "api_call_count",
+    )
+    _SESSION_COLS = ", ".join(_SESSION_COL_NAMES)
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
@@ -196,12 +298,95 @@ class InsightsEngine:
     )
 
     def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
-        """Fetch sessions within the time window."""
+        """Fetch sessions within the time window.
+
+        Degrades instead of raising on an unmigrated schema.  Reporting now
+        opens ``state.db`` read-only, and a read-only open deliberately does
+        not run migrations — so on a database last touched by an older Hermes
+        (the first command after an update is very plausibly ``hermes
+        insights``) some of ``_SESSION_COL_NAMES`` may not exist yet.  Before
+        this guard the ``OperationalError`` was swallowed by the call sites
+        into "Error generating insights: no such column: ...", i.e. the command
+        just broke.  Now the missing columns are reported as absent (``None``)
+        and everything else is still summarised, mirroring the degradation
+        ``_get_model_usage`` already does for a missing table.
+        """
+        try:
+            if source:
+                cursor = self._conn.execute(
+                    self._GET_SESSIONS_WITH_SOURCE, (cutoff, source)
+                )
+            else:
+                cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
+            return [dict(row) for row in cursor.fetchall()]
+        except sqlite3.OperationalError as exc:
+            return self._get_sessions_reduced(cutoff, source, exc)
+
+    def _available_session_columns(self) -> List[str]:
+        """Intersection of the columns we want and the columns that exist."""
+        try:
+            present = {
+                row[1] for row in self._conn.execute(
+                    "PRAGMA table_info(sessions)"
+                ).fetchall()
+            }
+        except sqlite3.OperationalError:
+            return []
+        return [c for c in self._SESSION_COL_NAMES if c in present]
+
+    def _get_sessions_reduced(
+        self, cutoff: float, source: Optional[str], exc: Exception
+    ) -> List[Dict]:
+        """Re-run the session query with only the columns this DB has."""
+        usable = self._available_session_columns()
+        if "id" not in usable or "started_at" not in usable:
+            # No sessions table at all (fresh/empty DB), or a schema so old it
+            # has no recognisable session identity: report "no data" rather
+            # than guess.
+            self.degraded = True
+            logger.debug("insights: sessions unavailable (%s)", exc)
+            return []
+        missing = [c for c in self._SESSION_COL_NAMES if c not in usable]
+        self.degraded = True
+        self.missing_session_columns = missing
+        logger.warning(
+            "insights: state.db predates %d session column(s) (%s); reporting "
+            "without them. Run any other hermes command once to migrate.",
+            len(missing), ", ".join(missing),
+        )
+        if source and "source" not in usable:
+            # Never silently drop a filter the caller asked for: a report that
+            # says "all platforms" while claiming to be filtered is worse than
+            # an empty one.
+            logger.warning(
+                "insights: state.db has no sessions.source column, so "
+                "--source cannot be honoured; reporting no data."
+            )
+            return []
+        # Column names come from _SESSION_COL_NAMES, filtered by the columns
+        # SQLite itself reports — never from caller input.
+        cols = ", ".join(usable)
         if source:
-            cursor = self._conn.execute(self._GET_SESSIONS_WITH_SOURCE, (cutoff, source))
+            sql = (
+                f"SELECT {cols} FROM sessions"
+                " WHERE started_at >= ? AND source = ?"
+                " ORDER BY started_at DESC"
+            )
+            params: tuple = (cutoff, source)
         else:
-            cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
-        return [dict(row) for row in cursor.fetchall()]
+            sql = (
+                f"SELECT {cols} FROM sessions"
+                " WHERE started_at >= ?"
+                " ORDER BY started_at DESC"
+            )
+            params = (cutoff,)
+        rows = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+        # Absent columns are reported as absent, so every downstream
+        # ``session.get(...) or 0`` keeps working instead of KeyError-ing.
+        for row in rows:
+            for name in missing:
+                row.setdefault(name, None)
+        return rows
 
     def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
         """Get tool call counts from messages.

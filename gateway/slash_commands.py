@@ -4944,18 +4944,22 @@ class GatewaySlashCommandsMixin:
                     i += 1
 
         try:
-            from hermes_state import SessionDB
-            from agent.insights import InsightsEngine
+            from agent.insights import InsightsEngine, open_insights_db
 
             loop = asyncio.get_running_loop()
 
             def _run_insights():
-                db = SessionDB()
-                engine = InsightsEngine(db)
-                report = engine.generate(days=days, source=source)
-                result = engine.format_gateway(report)
-                db.close()
-                return result
+                # Read-only: reporting must never take state.db's write lock.
+                db = open_insights_db()
+                # try/finally: this runs in an executor thread, so a failure
+                # mid-report used to leak the handle (and its tracked fd) for
+                # the life of the gateway.
+                try:
+                    engine = InsightsEngine(db)
+                    report = engine.generate(days=days, source=source)
+                    return engine.format_gateway(report)
+                finally:
+                    db.close()
 
             return await loop.run_in_executor(None, _run_insights)
         except Exception as e:

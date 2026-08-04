@@ -26,6 +26,7 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
 )
+from hermes_state_writer import WRITE_BEST_EFFORT, priority_of
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
@@ -452,6 +453,14 @@ class SessionSearchMixin:
 
         The trigram tokenizer being unavailable is not fatal — the base index
         is still rebuilt (CJK falls back to LIKE), mirroring normal startup.
+
+        Writer coordination: the chunked backfill/teardown steps go through
+        ``_execute_write`` and therefore through writer admission, but the
+        foreground ``VACUUM`` in phase 3 deliberately does not (see
+        ``SessionDB.vacuum`` for why holding a non-preemptible admission across
+        a minutes-long exclusive operation is worse than leaving it to SQLite).
+        This is an explicit, operator-invoked maintenance command; run it when
+        writers can be quiesced.
         """
         if not self._fts_enabled:
             return {"ok": False, "reason": "fts5_unavailable"}
@@ -1867,6 +1876,20 @@ class SessionSearchMixin:
         these tables while writers keep running) and are skipped, mirroring
         ``optimize_fts``. Other SQLite errors propagate to the caller.
 
+        Takes best-effort writer admission **per command**, never once per
+        pass. Two reasons, both about not becoming the starver:
+
+        * The writer gate is non-preemptible, so admission held across a whole
+          pass blocks every writer that arrives mid-pass — including a
+          transcript append — for the rest of it. The write lock is already
+          released between commands (above), so appends could interleave
+          BEFORE any gate existed; holding admission across the pass would have
+          taken that away.
+        * Between commands the pass checks ``higher_priority_waiting()`` and
+          stops early when a ``critical`` or ``normal`` writer is queued.
+          Stopping is free — the cadence comes back on the next boundary — and
+          the returned count stays truthful about the work that happened.
+
         Returns the number of merge commands executed.
         """
         if isinstance(max_pages, bool) or not isinstance(max_pages, int):
@@ -1880,28 +1903,108 @@ class SessionSearchMixin:
         if max_commands <= 0:
             raise ValueError("max_commands must be greater than zero")
 
+        priority = priority_of(WRITE_BEST_EFFORT)
         executed = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
+        for tbl in self._FTS_TABLES:
+            # Probe under self._lock: the pass no longer holds the connection
+            # for its whole duration, so every statement it issues must still
+            # take the per-connection lock like any other.
+            with self._lock:
                 if not self._fts_table_exists(tbl):
                     continue
+            for command_index in range(max_commands):
+                if self._writer_gate.higher_priority_waiting(priority):
+                    logger.debug(
+                        "FTS incremental merge yielding: a higher-priority "
+                        "writer is queued on state.db"
+                    )
+                    return executed
+                # The usermerge floor is per index and persisted, so it goes
+                # with this index's FIRST command of the pass only.
+                progressed = self._merge_fts_one_command(
+                    tbl,
+                    max_pages,
+                    priority,
+                    apply_usermerge_floor=(
+                        command_index == 0
+                        and not getattr(
+                            self, "_fts_usermerge_floor_applied", False
+                        )
+                    ),
+                )
+                if progressed is None:
+                    # Nothing ran: admission was refused, or this connection
+                    # was still busy with work that holds no admission.
+                    # Skipping is free; the cadence comes back.
+                    logger.debug(
+                        "FTS incremental merge skipped: state.db (or this "
+                        "connection) is busy; retrying on the next cadence"
+                    )
+                    return executed
+                executed += 1
+                if not progressed:
+                    break
+        self._fts_usermerge_floor_applied = True
+        return executed
+
+    def _merge_fts_one_command(
+        self,
+        tbl: str,
+        max_pages: int,
+        priority: int,
+        *,
+        apply_usermerge_floor: bool = False,
+    ) -> Optional[bool]:
+        """Run ONE bounded merge command under its own admission.
+
+        Returns True when the command did real merge work, False on the
+        documented no-progress signal, and None when nothing ran — either
+        admission was refused, or this connection's lock was still held by work
+        that takes no admission (``vacuum``, ``rebuild_fts``, a checkpoint,
+        ``close``). Both mean "somebody else is using it"; the caller treats
+        either as a skip, which is free because the merge cadence returns.
+
+        The wait for ``self._lock`` is bounded for the same reason as in
+        ``_execute_write``: this method holds process-wide admission while it
+        waits, so blocking there would hand the whole file's gate to a
+        best-effort maintenance command for the duration of an unrelated
+        minutes-long operation on the same object — with any transcript append
+        on any other ``SessionDB`` queued behind it. Order stays
+        admission -> ``self._lock``; only the patience is capped.
+
+        No-progress is a ``total_changes`` delta < 2: the command's own INSERT
+        accounts for 1 change, so >= 2 means real merge work happened.
+        ``total_changes`` is connection-wide, so a concurrent write on THIS
+        connection between the two reads can inflate the delta and buy one
+        extra merge command — bounded by the caller's per-index command cap,
+        and a deliberate trade for not holding the connection across a pass.
+        """
+        with self._writer_admission(
+            priority=priority, timeout=self._WRITE_GATE_WAIT_S,
+        ) as admission:
+            if not admission.admitted:
+                return None
+            with self._write_connection_lock(
+                self._WRITE_GATE_WAIT_S
+            ) as conn_lock:
+                if not conn_lock.locked:
+                    logger.debug(
+                        "FTS merge command skipped: this connection is busy "
+                        "with work that holds no admission"
+                    )
+                    return None
                 # One-time (per instance) usermerge floor; the value is
                 # persisted in the index's config shadow table so future
                 # connections inherit it. Setting config is a metadata-only
                 # write — it never touches segment data.
-                if not getattr(self, "_fts_usermerge_floor_applied", False):
+                if apply_usermerge_floor:
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}, rank) "
                         "VALUES('usermerge', 2)"
                     )
-                for _ in range(max_commands):
-                    before = self._conn.total_changes
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
-                        (max_pages,),
-                    )
-                    executed += 1
-                    if self._conn.total_changes - before < 2:
-                        break
-            self._fts_usermerge_floor_applied = True
-        return executed
+                before = self._conn.total_changes
+                self._conn.execute(
+                    f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
+                    (max_pages,),
+                )
+                return (self._conn.total_changes - before) >= 2
