@@ -2860,6 +2860,7 @@ class TestAuxiliaryFallbackLayering:
             "nvidia",
             reason="invalid provider response",
             failed_model="minimaxai/minimax-m3",
+            requested_model="minimaxai/minimax-m3",
         )
         mock_main.assert_not_called()
 
@@ -2894,6 +2895,7 @@ class TestAuxiliaryFallbackLayering:
             "nvidia",
             reason="invalid provider response",
             failed_model="minimaxai/minimax-m3",
+            requested_model="minimaxai/minimax-m3",
         )
 
     def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):
@@ -2926,7 +2928,8 @@ class TestAuxiliaryFallbackLayering:
         # that was running solely as the preserve_requested_model anchor.
         mock_task_chain.assert_called_once_with(
             "title_generation", "auto", reason="payment error",
-            failed_model=None)
+            failed_model=None,
+            requested_model="qwen/qwen3.5-122b-a10b")
         mock_main_chain.assert_called_once_with(
             "title_generation", "auto", reason="payment error",
             failed_model="qwen/qwen3.5-122b-a10b")

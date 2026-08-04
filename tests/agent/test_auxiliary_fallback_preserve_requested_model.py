@@ -23,7 +23,7 @@ config said the model must be preserved.  Fixed here, with three hard bounds:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -33,6 +33,7 @@ MAIN_MODEL = "claude-opus-5"
 MAIN_PROVIDER = "claude-sdk-local"
 TEAM_PROVIDER = "claude-sdk-team-local"
 TEAM_URL = "http://127.0.0.1:4319/v1"
+AUX_MODEL = "claude-haiku-5"
 
 
 def _team_entry(**overrides):
@@ -452,3 +453,92 @@ class TestTaskChainPreservesTheRequestedModel:
 
         assert (client, model, label) == (None, None, "")
         assert resolver.entries == []
+
+
+class _PaymentError(Exception):
+    status_code = 402
+
+
+class TestProviderWideFailureKeepsTheAuxiliaryAnchor:
+    """401/402 skip a credential surface but must not erase model identity."""
+
+    @staticmethod
+    def _payment_error():
+        return _PaymentError("Payment Required")
+
+    def test_sync_402_preserves_aux_model_not_main_model(self, monkeypatch, main_route):
+        from agent.auxiliary_client import call_llm
+
+        _task_chain(
+            monkeypatch,
+            [_team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: True})],
+            task="title_generation",
+        )
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._payment_error()
+        fallback = MagicMock()
+        fallback.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="mirrored"))]
+        )
+        resolver = _Resolver(client=fallback)
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, AUX_MODEL),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry", resolver,
+        ), patch("agent.auxiliary_client._try_main_fallback_chain") as main_chain:
+            response = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert response.choices[0].message.content == "mirrored"
+        assert resolver.models == [AUX_MODEL]
+        main_chain.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_402_preserves_aux_model_not_main_model(
+        self, monkeypatch, main_route
+    ):
+        from agent.auxiliary_client import async_call_llm
+
+        _task_chain(
+            monkeypatch,
+            [_team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: True})],
+            task="compression",
+        )
+        primary = MagicMock()
+        primary.chat.completions.create = AsyncMock(side_effect=self._payment_error())
+        sync_fallback = MagicMock()
+        async_fallback = MagicMock()
+        async_fallback.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="mirrored async"))]
+            )
+        )
+        resolver = _Resolver(client=sync_fallback)
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary, AUX_MODEL),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry", resolver,
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback, AUX_MODEL),
+        ), patch("agent.auxiliary_client._try_main_fallback_chain") as main_chain:
+            response = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert response.choices[0].message.content == "mirrored async"
+        assert resolver.models == [AUX_MODEL]
+        main_chain.assert_not_called()

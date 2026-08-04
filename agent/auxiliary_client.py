@@ -4715,6 +4715,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    requested_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -4746,6 +4747,11 @@ def _try_configured_fallback_chain(
       provider skipped — the shared credentials/account behind every model
       on that provider are broken, so a sibling can't help and the
       main-agent-model safety net should be reached instead.
+
+    ``requested_model`` is independent of that failure scope: it is always the
+    exact model the auxiliary call requested and therefore the only valid
+    anchor for a preserving mirror. Older direct callers that omit it retain
+    the historical ``failed_model``/main-model fallback for compatibility.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -4779,7 +4785,9 @@ def _try_configured_fallback_chain(
     tried = []
     min_ctx = _task_minimum_context_length(task)
     anchor_model = (
-        _preserved_model_anchor(failed_model)
+        _preserved_model_anchor(
+            requested_model if requested_model is not None else failed_model
+        )
         if _chain_declares_preserve(chain) else ""
     )
 
@@ -8828,7 +8836,8 @@ def call_llm(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    requested_model=final_model)
                 if fb_client is None:
                     # ``final_model`` (not _chain_failed_model) is the anchor a
                     # preserve_requested_model entry must keep: which model was
@@ -8843,7 +8852,8 @@ def call_llm(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    requested_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
@@ -9432,7 +9442,8 @@ async def async_call_llm(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    requested_model=final_model)
                 if fb_client is None:
                     # See the sync path: the anchor for a preserved model is
                     # the model that was running, not the failure scope.
@@ -9445,7 +9456,8 @@ async def async_call_llm(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    requested_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
