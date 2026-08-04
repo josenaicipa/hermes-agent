@@ -2921,14 +2921,15 @@ class TestAuxiliaryFallbackLayering:
             )
 
         assert main_chain_client.chat.completions.create.called
-        # Payment errors are provider-wide, so the configured chain is
-        # asked to skip the whole provider (failed_model=None), not just
-        # the failed model — a sibling model can't recover from a 402.
+        # Payment errors remain provider-wide: ``failed_provider`` still skips
+        # the whole provider.  The main-chain additionally receives the model
+        # that was running solely as the preserve_requested_model anchor.
         mock_task_chain.assert_called_once_with(
             "title_generation", "auto", reason="payment error",
             failed_model=None)
         mock_main_chain.assert_called_once_with(
-            "title_generation", "auto", reason="payment error")
+            "title_generation", "auto", reason="payment error",
+            failed_model="qwen/qwen3.5-122b-a10b")
         mock_builtin_chain.assert_not_called()
 
     def test_explicit_provider_uses_configured_chain_first(self, monkeypatch, caplog):

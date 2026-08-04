@@ -68,15 +68,26 @@ class TestOptInParsing:
         entry = _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: False})
         assert entry_preserves_requested_model(entry) is False
 
-    def test_yaml_string_truths_opt_in(self):
-        for raw in ("true", "TRUE", "yes", "on", "1", "enabled"):
-            entry = _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: raw})
-            assert entry_preserves_requested_model(entry) is True, raw
+    def test_quoted_boolean_strings_fail_closed(self):
+        """Strings never decide a routing-safety flag.
 
-    def test_yaml_string_falsehoods_stay_opt_out(self):
-        for raw in ("false", "no", "off", "0", "disabled"):
+        This used to coerce ``"yes"``/``"1"``/``"on"`` to ``True`` (and
+        ``"no"``/``"0"`` to ``False``).  Quoting the value — or rendering the
+        config from a template that stringifies scalars — silently changed
+        which model a request ran on, so only real YAML booleans count now.
+        Unquoted ``true``/``yes``/``on`` still work: YAML 1.1 resolves those to
+        booleans before Hermes ever sees them (see
+        ``test_fallback_preserve_model_strict_config.py``).
+        """
+        for raw in ("true", "TRUE", "yes", "on", "1", "enabled",
+                    "false", "no", "off", "0", "disabled"):
             entry = _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: raw})
-            assert entry_preserves_requested_model(entry) is False, raw
+            _raises(FallbackModelPolicyError, entry_preserves_requested_model, entry)
+
+    def test_numeric_and_null_values_fail_closed(self):
+        for raw in (1, 0, 2, 1.0, None):
+            entry = _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: raw})
+            _raises(FallbackModelPolicyError, entry_preserves_requested_model, entry)
 
     def test_unrecognized_value_fails_closed(self):
         entry = _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: "maybe"})
@@ -315,6 +326,18 @@ class TestOptInSurvivesConfigLoading:
         assert chain[0][PRESERVE_REQUESTED_MODEL_KEY] is True
 
     def test_legacy_fallback_model_key_keeps_the_opt_in_key(self):
+        config = {
+            "fallback_model": _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: True})
+        }
+        chain = get_fallback_chain(config)
+        assert chain[0][PRESERVE_REQUESTED_MODEL_KEY] is True
+
+    def test_loading_passes_an_invalid_value_through_verbatim(self):
+        """Loading must not repair or drop it — the operator has to SEE it.
+
+        ``hermes fallback list`` and ``hermes doctor`` read the chain to explain
+        the problem; failing closed happens at activation, not at load.
+        """
         config = {
             "fallback_model": _team_entry(**{PRESERVE_REQUESTED_MODEL_KEY: "yes"})
         }

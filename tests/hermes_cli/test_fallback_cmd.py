@@ -22,6 +22,11 @@ def isolated_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+#: Sentinel for "the key is absent" — ``None`` is itself an invalid opt-in
+#: value that must be rendered as such, so it cannot double as "unset".
+_UNSET = object()
+
+
 def _write_config(home: Path, data: dict) -> None:
     config_path = home / ".hermes" / "config.yaml"
     config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -185,6 +190,58 @@ class TestListCommand:
         out = capsys.readouterr().out
         assert "1 entry" in out
         assert "gpt-5.4" in out
+
+
+# ---------------------------------------------------------------------------
+# preserve_requested_model must be visible in the listing
+#
+# The model column is a lie for a preserving entry (it requests the model you
+# asked for, not the one declared), and a malformed opt-in makes the runtime
+# skip the entry entirely.  `hermes fallback list` is exactly where an operator
+# looks after "my fallback didn't do what the file says", so both states are
+# rendered instead of silently misreporting the route.
+# ---------------------------------------------------------------------------
+
+class TestListShowsModelPolicy:
+    def _entry(self, value):
+        entry = {
+            "provider": "claude-sdk-team-local",
+            "model": "claude-sonnet-5",
+            "base_url": "http://127.0.0.1:4319/v1",
+        }
+        if value is not _UNSET:
+            entry["preserve_requested_model"] = value
+        return entry
+
+    def test_plain_entry_has_no_policy_marker(self):
+        from hermes_cli.fallback_cmd import _format_entry
+        rendered = _format_entry(self._entry(_UNSET))
+        assert "keeps the requested model" not in rendered
+        assert "invalid" not in rendered
+
+    def test_preserving_entry_is_marked(self):
+        from hermes_cli.fallback_cmd import _format_entry
+        assert "keeps the requested model" in _format_entry(self._entry(True))
+
+    def test_explicit_false_is_not_marked(self):
+        from hermes_cli.fallback_cmd import _format_entry
+        assert "keeps the requested model" not in _format_entry(self._entry(False))
+
+    def test_malformed_opt_in_is_flagged_as_skipped(self):
+        from hermes_cli.fallback_cmd import _format_entry
+        for bad in ("yes", "true", 1, 2, None, [], {}):
+            rendered = _format_entry(self._entry(bad))
+            assert "invalid preserve_requested_model" in rendered, bad
+            assert "skipped" in rendered, bad
+
+    def test_listing_renders_the_marker(self, isolated_home, capsys):
+        _write_config(isolated_home, {
+            "model": {"provider": "claude-sdk-local", "default": "claude-opus-5"},
+            "fallback_providers": [self._entry(True)],
+        })
+        from hermes_cli.fallback_cmd import cmd_fallback_list
+        cmd_fallback_list(types.SimpleNamespace())
+        assert "keeps the requested model" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

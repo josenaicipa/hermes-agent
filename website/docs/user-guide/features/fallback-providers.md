@@ -201,13 +201,42 @@ Behavior:
   one), the entry is skipped and the chain continues. Hermes never substitutes
   a different model behind your request. Reformatting the same model
   (`claude-opus-5` → `anthropic/claude-opus-5`) is not a substitution.
-- A malformed value (anything other than a boolean / `true`/`false`/`yes`/`no`/
-  `on`/`off`/`1`/`0`) skips the entry with an error in the log rather than
-  quietly downgrading the model.
+- **Never preserves across model families.** The entry has to look like a
+  mirror of what you requested: if it declares a model from another family
+  (`model: openai/gpt-5.4` while you request `claude-opus-5`), or lists
+  `models:` that do not include the requested one, the entry is skipped instead
+  of aiming a Claude request at a GPT deployment. `hermes doctor` reports such
+  an entry, since it can only ever be skipped.
 - Same-backend loop prevention still applies: an entry that resolves to the
   provider/endpoint that just failed is skipped, preserved model or not.
-- Auxiliary tasks that reuse the main chain (see below) intentionally ignore
-  this key — they have no caller-requested main model to preserve.
+- Auxiliary tasks (title generation, compression, …) walk these same chains, so
+  the flag applies there too: a mirrored endpoint keeps the model the auxiliary
+  call was already running, under the same fail-closed rules. It can only ever
+  keep a model, never pick a different one.
+
+#### It must be a real YAML boolean
+
+The flag decides *which model your request runs on*, so it is never coerced:
+
+```yaml
+preserve_requested_model: true        # ✅ boolean
+preserve_requested_model: yes         # ✅ boolean (YAML spells this true)
+preserve_requested_model: "true"      # ❌ quoted string → entry skipped
+preserve_requested_model: 'yes'       # ❌ quoted string → entry skipped
+preserve_requested_model: 1           # ❌ number       → entry skipped
+preserve_requested_model:             # ❌ empty value  → entry skipped
+```
+
+Anything that is not `true` or `false` skips the entry with an error in the log
+and is reported by `hermes doctor` / the startup config check — it never quietly
+falls back to the entry's own model.
+
+The key is also only read **inside a fallback chain entry**
+(`fallback_providers[i]`, `fallback_model`, or
+`auxiliary.<task>.fallback_chain[i]`). One indentation level off — at the config
+root, under `model:`, or inside a `providers:` / `custom_providers:` entry — it
+does nothing at all, so config validation reports that placement as an error
+instead of letting the mirror entry silently downgrade your model.
 
 ### Where Fallback Works
 

@@ -21,7 +21,12 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import (
+    PRESERVE_REQUESTED_MODEL_KEY,
+    FallbackModelPolicyError,
+    entry_preserves_requested_model,
+    get_fallback_chain,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +53,23 @@ def _write_chain(config: Dict[str, Any], chain: List[Dict[str, Any]]) -> None:
 
 
 def _format_entry(entry: Dict[str, Any]) -> str:
-    """One-line human-readable rendering of a fallback entry."""
+    """One-line human-readable rendering of a fallback entry.
+
+    The model column is a lie for an entry that opts into
+    ``preserve_requested_model`` — that entry requests the model you asked for,
+    not the one printed — so the policy is spelled out.  A malformed opt-in is
+    flagged here too: ``hermes fallback list`` is where an operator looks after
+    a fallback did not behave as configured, and the runtime skips such entries.
+    """
     provider = entry.get("provider", "?")
     model = entry.get("model", "?")
     base = entry.get("base_url")
     suffix = f"  [{base}]" if base else ""
+    try:
+        if entry_preserves_requested_model(entry):
+            suffix += "  (keeps the requested model)"
+    except FallbackModelPolicyError:
+        suffix += f"  (⚠ invalid {PRESERVE_REQUESTED_MODEL_KEY} — entry is skipped)"
     return f"{model}  (via {provider}){suffix}"
 
 

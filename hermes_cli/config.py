@@ -1968,6 +1968,20 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                     "Add: model: anthropic/claude-sonnet-4 (or another model)",
                 ))
 
+    # ── preserve_requested_model: value, placement and use ───────────────
+    # This flag decides WHICH MODEL a fallback entry requests, so every way of
+    # getting it wrong used to be silent: a quoted "yes" or a stray indentation
+    # level left the mirrored endpoint quietly answering with its own (often
+    # cheaper) model.  hermes_cli.fallback_config owns the policy — including
+    # which locations actually read the key — so this stays a thin adapter.
+    # Imported here rather than at module scope: config.py is imported very
+    # early by nearly everything, while validation only runs on the
+    # startup-banner / `hermes doctor` paths.
+    from hermes_cli.fallback_config import preserve_requested_model_issues
+
+    for policy_issue in preserve_requested_model_issues(config):
+        issues.append(ConfigIssue("error", policy_issue.message, policy_issue.hint))
+
     # ── Check for fallback_model accidentally nested inside custom_providers ──
     if isinstance(cp, dict) and "fallback_model" not in config and "fallback_model" in (cp or {}):
         issues.append(ConfigIssue(

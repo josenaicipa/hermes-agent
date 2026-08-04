@@ -109,6 +109,14 @@ OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
+from hermes_cli.fallback_config import (
+    PRESERVE_REQUESTED_MODEL_KEY,
+    FallbackModelDecision,
+    FallbackModelPolicyError,
+    effective_fallback_entry,
+    require_preserved_model,
+    resolve_fallback_model,
+)
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
@@ -4640,6 +4648,68 @@ def _candidate_context_window(
     return None
 
 
+# ── Per-entry model policy for auxiliary fallback ────────────────────────
+#
+# A fallback entry may declare ``preserve_requested_model: true`` to mean
+# "switch provider/endpoint, keep the model that was being requested" — the
+# mirrored-bridge case (two endpoints serving the same model).  Auxiliary
+# traffic hits exactly the same chains as the main agent, so ignoring the flag
+# here reproduced the incident on aux tasks: 4318 exhausted its credits and
+# title generation / compression silently answered from the mirror's cheaper
+# configured model.
+#
+# hermes_cli.fallback_config owns the policy (strict boolean parsing, family /
+# supported-model eligibility, substitution refusal).  These two helpers only
+# supply the aux-specific inputs.
+
+
+def _chain_declares_preserve(chain: Any) -> bool:
+    """True when some entry in ``chain`` declares the opt-in key at all.
+
+    Used to keep the anchor lookup off the legacy path: resolving the anchor
+    costs a config read, and a chain with no opt-in anywhere never consults it.
+    Malformed values count as "declares" — they must still be seen and skipped,
+    not silently ignored.
+    """
+    return any(
+        isinstance(entry, dict) and PRESERVE_REQUESTED_MODEL_KEY in entry
+        for entry in (chain or [])
+    )
+
+
+def _preserved_model_anchor(failed_model: Optional[str] = None) -> str:
+    """The model an opted-in auxiliary fallback entry must keep.
+
+    An auxiliary call has no "caller-requested model" in the main-agent sense;
+    what matters is the model this call was actually running when it failed.
+    ``failed_model`` is that model whenever the caller knows it.  Otherwise the
+    aux route is the main runtime model (``provider: auto`` resolves aux traffic
+    onto it), so the main model — MoA presets unwrapped to their aggregator —
+    is the anchor.  Empty means "unknown", and an opt-in with no anchor fails
+    closed rather than guessing.
+    """
+    current = str(failed_model or "").strip()
+    if current:
+        return current
+    return str(_read_main_model_for_aux() or "").strip()
+
+
+def _effective_aux_entry(
+    entry: Dict[str, Any], decision: FallbackModelDecision
+) -> Dict[str, Any]:
+    """The entry to resolve: a model-rewritten copy only when preserving.
+
+    Opted-out entries are handed to the resolver as the *same object* the chain
+    holds, so the legacy path is byte-for-byte unchanged (no copy, no key
+    normalization, no chance of dropping a provider-specific field).  Preserved
+    entries get a copy — chains are shared with delegate children, so the
+    source must never be mutated.
+    """
+    if not decision.preserved:
+        return entry
+    return effective_fallback_entry(entry, decision)
+
+
 def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
@@ -4651,6 +4721,12 @@ def _try_configured_fallback_chain(
     Reads auxiliary.<task>.fallback_chain from config.yaml and tries each
     entry in order.  Each entry must have at least ``provider``; ``model``,
     ``base_url``, and ``api_key`` are optional.
+
+    Model policy: an entry that opts into ``preserve_requested_model`` requests
+    the model this aux call was running (see ``_preserved_model_anchor``)
+    instead of its own ``model``, and is skipped outright if that model cannot
+    be preserved exactly.  Entries without the opt-in keep using their
+    configured model, unchanged.
 
     ``failed_model`` narrows the skip check to the exact (provider, model)
     pair that just failed, rather than the whole provider. Without it every
@@ -4702,6 +4778,10 @@ def _try_configured_fallback_chain(
     )
     tried = []
     min_ctx = _task_minimum_context_length(task)
+    anchor_model = (
+        _preserved_model_anchor(failed_model)
+        if _chain_declares_preserve(chain) else ""
+    )
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
@@ -4709,7 +4789,22 @@ def _try_configured_fallback_chain(
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
-        fb_model_raw = str(entry.get("model", "")).strip()
+        label = f"fallback_chain[{i}]({fb_provider})"
+        # WHICH model this entry requests is decided first so the identity
+        # check, the context-window screen, the router call and the logs all
+        # describe the same model.  Entries without the opt-in resolve to their
+        # configured model exactly as before.
+        try:
+            fb_decision = resolve_fallback_model(entry, requested_model=anchor_model)
+        except FallbackModelPolicyError as policy_err:
+            logger.error(
+                "Auxiliary %s: skipping %s — %s",
+                task, label, policy_err,
+            )
+            tried.append(f"{label} (model policy)")
+            continue
+        fb_entry = _effective_aux_entry(entry, fb_decision)
+        fb_model_raw = fb_decision.model
         if should_skip_candidate(
             BackendIdentity.build(
                 provider=fb_provider,
@@ -4721,15 +4816,31 @@ def _try_configured_fallback_chain(
         ):
             continue
         fb_model = fb_model_raw or None
-
-        label = f"fallback_chain[{i}]({fb_provider})"
+        if fb_decision.preserved:
+            logger.info(
+                "Auxiliary %s: %s preserves the requested model %s "
+                "(configured model %r is not requested)",
+                task, label, fb_model, fb_decision.configured_model or None,
+            )
 
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(fb_entry)
         except Exception:
             fb_client, resolved_model = None, None
 
         if fb_client is not None:
+            # A preserved model must survive the provider router. Reformatting
+            # the slug is fine; landing on another model is a substitution, so
+            # skip the entry instead of quietly running the wrong model.
+            try:
+                require_preserved_model(
+                    fb_decision, resolved_model or fb_model,
+                    source=f"{fb_provider} provider router",
+                )
+            except FallbackModelPolicyError as policy_err:
+                logger.error("Auxiliary %s: skipping %s — %s", task, label, policy_err)
+                tried.append(f"{label} (model substituted)")
+                continue
             if min_ctx is not None and resolved_model:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -4814,6 +4925,7 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    failed_model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -4823,13 +4935,15 @@ def _try_main_fallback_chain(
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
 
-    Model policy note: entries here always use their CONFIGURED ``model``,
-    including entries that declare ``preserve_requested_model``.  That key
-    preserves *the caller's requested model*, and an auxiliary task
-    (title/compression/etc.) has no caller-requested main model — it picks a
-    task-appropriate model on purpose, and its candidates are additionally
-    context-window filtered below.  Preserving the main model here would
-    silently upgrade auxiliary traffic onto the main route's model.
+    Model policy: this is the *same* chain the main agent walks, so a mirrored
+    endpoint that declares ``preserve_requested_model`` is honored here too —
+    otherwise the live 4318 → 4319 incident simply reappeared on auxiliary
+    traffic (title generation / compression silently answering from the
+    mirror's cheaper configured model).  The preserved model is the one this
+    aux call was running (``_preserved_model_anchor``), never a guess: an
+    ineligible model (cross-family, unsupported, or unknown anchor) skips the
+    entry instead, and candidates are still context-window filtered below.
+    Entries without the opt-in use their CONFIGURED model exactly as before.
     """
     try:
         from hermes_cli.config import load_config
@@ -4848,13 +4962,16 @@ def _try_main_fallback_chain(
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
+    anchor_model = (
+        _preserved_model_anchor(failed_model)
+        if _chain_declares_preserve(chain) else ""
+    )
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider") or "").strip()
-        fb_model = str(entry.get("model") or "").strip()
-        if not fb_provider or not fb_model:
+        if not fb_provider:
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
@@ -4865,12 +4982,47 @@ def _try_main_fallback_chain(
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
             continue
+        # Decide the requested model before anything else reads it, so the
+        # router call, the context screen and the logs agree.
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_decision = resolve_fallback_model(entry, requested_model=anchor_model)
+        except FallbackModelPolicyError as policy_err:
+            logger.error(
+                "Auxiliary %s: skipping %s — %s", task or "call", label, policy_err,
+            )
+            tried.append(f"{label} (model policy)")
+            continue
+        fb_model = fb_decision.model
+        if not fb_model:
+            continue
+        fb_entry = _effective_aux_entry(entry, fb_decision)
+        if fb_decision.preserved:
+            logger.info(
+                "Auxiliary %s: %s preserves the requested model %s "
+                "(configured model %r is not requested)",
+                task or "call", label, fb_model,
+                fb_decision.configured_model or None,
+            )
+        try:
+            fb_client, resolved_model = _resolve_fallback_entry(fb_entry)
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
+            # Reformatting a preserved slug is fine; landing on another model is
+            # a substitution — skip the entry rather than run the wrong model.
+            try:
+                require_preserved_model(
+                    fb_decision, resolved_model or fb_model,
+                    source=f"{fb_provider} provider router",
+                )
+            except FallbackModelPolicyError as policy_err:
+                logger.error(
+                    "Auxiliary %s: skipping %s — %s",
+                    task or "call", label, policy_err,
+                )
+                tried.append(f"{label} (model substituted)")
+                continue
             if min_ctx is not None:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -8678,8 +8830,13 @@ def call_llm(
                     task, resolved_provider or "auto", reason=reason,
                     failed_model=_chain_failed_model)
                 if fb_client is None:
+                    # ``final_model`` (not _chain_failed_model) is the anchor a
+                    # preserve_requested_model entry must keep: which model was
+                    # running is a routing fact, independent of whether the
+                    # failure was model- or credential-scoped.
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
@@ -9277,8 +9434,11 @@ async def async_call_llm(
                     task, resolved_provider or "auto", reason=reason,
                     failed_model=_chain_failed_model)
                 if fb_client is None:
+                    # See the sync path: the anchor for a preserved model is
+                    # the model that was running, not the failure scope.
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
+                        task, resolved_provider or "auto", reason=reason,
+                        failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
