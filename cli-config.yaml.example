@@ -633,6 +633,99 @@ prompt_caching:
 #                           # extra_body:
 #                           #   chat_template_kwargs:
 #                           #     enable_thinking: false
+#
+#   # ---------------------------------------------------------------------
+#   # Ordered compression fallback (CLI-backed OAuth routes)
+#   # ---------------------------------------------------------------------
+#   # ``auxiliary.<task>.fallback_chain`` is tried IN DECLARATION ORDER after
+#   # the task's primary provider fails.  Each entry is attempted in turn: an
+#   # ordinary retryable provider/adapter failure (connection, timeout, 402,
+#   # 429, model-incompatible, invalid response) advances to the next entry.
+#   # A configuration/auth/permission error is NOT retryable — it surfaces
+#   # instead of silently widening routing onto another provider's account.
+#   #
+#   # Two auxiliary providers drive a locally installed, already-signed-in CLI
+#   # over its own OAuth session.  They never read an API key and never fall
+#   # back to an HTTP/API-key route:
+#   #
+#   #   google-gemini-cli   (aliases: gemini-cli, agy)  — Antigravity CLI
+#   #   kimi-code-cli       (alias:  kimi-cli)          — Kimi Code CLI
+#   #
+#   # NOTE: ``kimi-code-cli`` is a DIFFERENT provider from ``kimi-coding``
+#   # (the API-key route on api.kimi.com / api.moonshot.ai).  The aliases
+#   # ``kimi`` / ``moonshot`` still mean ``kimi-coding``; they are never
+#   # rewritten to the CLI route, and vice versa.
+#   #
+#   # Both are sync-only and text-only.  Both are *buffered*: the CLI prints
+#   # nothing until it is done, so Hermes publishes process liveness while the
+#   # child is verified alive.  Inactivity watchdogs stay quiet during a long
+#   # summary; the total ceiling (compression.hygiene_total_ceiling_seconds,
+#   # default 600s) and the per-call timeout still bound it.
+#   #
+#   # compression:
+#   #   provider: "google-gemini-cli"
+#   #   model: "gemini-3.6-flash-low"
+#   #   timeout: 300
+#   #   fallback_chain:
+#   #     - provider: "openai-codex"       # existing Codex OAuth
+#   #       model: "gpt-5.6-terra"
+#   #       timeout: 300
+#   #     - provider: "kimi-code-cli"      # existing Kimi Code OAuth
+#   #       model: "kimi-code/k3"
+#   #       timeout: 600
+#
+#   # Provider-scoped settings for the Kimi Code CLI route.
+#   #
+#   # The tool-free posture is MANDATORY and AUTOMATIC — there is nothing to
+#   # configure and no way to opt out.  For every call Hermes generates a
+#   # mode-0600 Markdown agent file inside that call's private workspace whose
+#   # frontmatter declares:
+#   #
+#   #     tools: []        # no tool is available
+#   #     subagents: []    # no delegation
+#   #
+#   # plus a self-contained, deterministic, text-only compression system
+#   # prompt that treats conversation content as untrusted data.  It is bound
+#   # with `--agent-file` on the FIRST invocation only (the flag cannot be
+#   # combined with a session resume; the bound agent persists across resumes),
+#   # and the CLI re-enforces the declaration before execution.
+#   # `KIMI_CODE_EXPERIMENTAL_FLAG=1` is set explicitly in the scrubbed child
+#   # environment because the installed build gates `--agent-file` behind it.
+#   #
+#   # Session identity is PINNED, never implied.  The prompt is delivered as
+#   # several turns, so the turns must land in one conversation.  Concurrent
+#   # compressions share the profile HOME (and therefore the CLI's session
+#   # store), so a bare `--continue` could resume the wrong conversation and
+#   # splice two contexts together.  Hermes instead captures the session id
+#   # the CLI reports on the first turn, validates it strictly, and passes it
+#   # back with the official selector (`-S, --session TEXT`) on every later
+#   # turn.  The id is never logged.  A call that cannot obtain a valid id —
+#   # or that sees a different one on a later turn — fails with a retryable
+#   # transport error so the fallback_chain above can continue; it never
+#   # degrades to `--continue`.
+#   #
+#   # Defense in depth, always on: a fresh empty working directory per call
+#   # (outside any repository), an environment allowlist that admits no
+#   # credential material (profile HOME is kept ONLY so the CLI can find its
+#   # own OAuth session — Hermes never reads it), and rejection of the whole
+#   # call if any tool activity appears in the CLI's event stream.
+#   #
+#   # kimi_code_cli:
+#   #   command: ""            # optional: executable name or absolute path.
+#   #                          # Empty = look for "kimi"/"kimi-code" on PATH,
+#   #                          # then under the active profile HOME.
+#   #   extra_args: []         # optional: benign operational flags only.
+#   #                          # Rejected at load time: anything touching
+#   #                          # agent/tool/subagent binding, --continue /
+#   #                          # --session / -S / resume, prompt or
+#   #                          # output/input format, model,
+#   #                          # permissions/approval/yolo, mcp,
+#   #                          # add-dir/cwd/exec/shell, or a bare positional
+#   #                          # value (which the CLI could read as a prompt).
+#   #                          # Short options are refused whenever their
+#   #                          # letter could alias one of those long flags
+#   #                          # (-S is the session selector), including
+#   #                          # inside a cluster such as -xS.
 
 # =============================================================================
 # Persistent Memory

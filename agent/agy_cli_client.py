@@ -26,6 +26,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from agent.aux_process_liveness import run_text_capture
+from agent.cli_prompt_chunking import CLI_PROMPT_CHUNK_BYTES, split_text_utf8
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,9 @@ _DEFAULT_MODEL = "Gemini 3.5 Flash (Medium)"
 # larger. Stay below that boundary and use a private AGY conversation for real
 # compression prompts.
 _PRINT_ARG_SOFT_LIMIT_BYTES = 96 * 1024
-_CHUNK_PAYLOAD_BYTES = 80 * 1024
+# Shared with the other CLI-backed auxiliary adapters — see
+# agent.cli_prompt_chunking for the byte-safety contract.
+_CHUNK_PAYLOAD_BYTES = CLI_PROMPT_CHUNK_BYTES
 _CONVERSATION_ID_RE = re.compile(
     r"Created conversation ([0-9a-fA-F-]{36})"
 )
@@ -310,21 +314,13 @@ def _extract_marked_output(text: str, begin_marker: str, end_marker: str) -> str
 
 
 def _split_text_utf8(text: str, max_bytes: int = _CHUNK_PAYLOAD_BYTES) -> list[str]:
-    """Split text below execve's per-argument limit without breaking UTF-8."""
-    data = text.encode("utf-8")
-    if not data:
-        return [""]
-    chunks: list[str] = []
-    start = 0
-    while start < len(data):
-        end = min(start + max_bytes, len(data))
-        while end < len(data) and end > start and data[end] & 0xC0 == 0x80:
-            end -= 1
-        if end <= start:
-            raise ValueError("unable to split UTF-8 prompt safely")
-        chunks.append(data[start:end].decode("utf-8"))
-        start = end
-    return chunks
+    """Split text below execve's per-argument limit without breaking UTF-8.
+
+    Thin alias over :func:`agent.cli_prompt_chunking.split_text_utf8` so this
+    adapter and the Kimi Code CLI adapter cannot drift apart on the one
+    property that keeps both of them off ``E2BIG``.
+    """
+    return split_text_utf8(text, max_bytes)
 
 
 def _coerce_timeout(timeout: Any) -> float:
@@ -456,16 +452,19 @@ class AgyCLIClient:
         cwd: str,
         log_path: str,
     ) -> str:
+        # agy is buffered from Hermes' point of view: it prints nothing until
+        # the turn is done. Publish PROCESS liveness while the child pid is
+        # actually alive so a caller-side token-inactivity watchdog does not
+        # cancel a healthy-but-slow summary. Without an installed progress
+        # hook this is byte-for-byte the historical ``subprocess.run`` call;
+        # total-time bounds (this timeout, the host's ceiling) are untouched.
         try:
-            completed = subprocess.run(
+            completed = run_text_capture(
                 argv,
-                capture_output=True,
-                text=True,
                 timeout=timeout_seconds,
-                shell=False,
-                cwd=cwd,
                 env=env,
-                check=False,
+                cwd=cwd,
+                label=AGY_PROVIDER,
             )
         except FileNotFoundError as exc:
             raise AgyCLITransportError(

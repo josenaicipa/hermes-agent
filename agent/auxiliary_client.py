@@ -106,6 +106,7 @@ class _OpenAIProxy:
 
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
+from agent import aux_process_liveness as _liveness
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
@@ -258,47 +259,19 @@ def aux_interrupt_protection(active: bool = True):
 
 
 # ── Forward-progress hook for streamed auxiliary calls ───────────────────
-# Long auxiliary calls (context compression is the prime case) are watched by
-# wall-clock deadlines in their hosts (gateway session hygiene). A fixed
-# deadline punishes SLOW summary models exactly as hard as HUNG ones: a
-# reasoning model happily streaming a large summary is killed mid-generation.
-# This thread-local hook lets the host observe liveness instead: the wire
-# consumers below tick it on every streamed token/SSE event, and the host
-# extends its deadline while tokens are moving (see gateway/run.py session
-# hygiene + CompressionCommitFence.touch_progress). Thread-local matches the
-# call topology — the aux call and its stream consumption run synchronously
-# on the thread that installed the hook.
-_aux_progress = threading.local()
-
-
-def _notify_aux_progress() -> None:
-    """Tick the installed forward-progress hook, if any. Never raises."""
-    hook = getattr(_aux_progress, "hook", None)
-    if hook is None:
-        return
-    try:
-        hook()
-    except Exception:
-        logger.debug("aux progress hook failed", exc_info=True)
-
-
-def _aux_progress_active() -> bool:
-    return getattr(_aux_progress, "hook", None) is not None
-
-
-@contextlib.contextmanager
-def aux_progress_hook(hook):
-    """Install *hook* as the current thread's aux forward-progress callback.
-
-    ``hook=None`` is a no-op passthrough so callers can wire it
-    unconditionally. Re-entrant-safe: restores the previous hook on exit.
-    """
-    prev = getattr(_aux_progress, "hook", None)
-    _aux_progress.hook = hook if callable(hook) else prev
-    try:
-        yield
-    finally:
-        _aux_progress.hook = prev
+# Owned by agent.aux_process_liveness — a tiny stdlib-only module so the
+# CLI-backed adapters (agy, kimi-code-cli) can publish liveness without
+# importing this module (no import cycle). Re-exported under the historical
+# private names so every existing caller, test and monkeypatch target keeps
+# working unchanged.
+_aux_progress = _liveness._progress
+_notify_aux_progress = _liveness.notify_progress
+_aux_progress_active = _liveness.progress_active
+aux_progress_hook = _liveness.progress_hook
+aux_external_process_liveness = _liveness.external_process_liveness
+_AUX_PROCESS_LIVENESS_INTERVAL_SECONDS = (
+    _liveness.DEFAULT_LIVENESS_INTERVAL_SECONDS
+)
 
 
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
@@ -343,6 +316,14 @@ _PROVIDER_ALIASES = {
     "moonshot": "kimi-coding",
     "kimi-cn": "kimi-coding-cn",
     "moonshot-cn": "kimi-coding-cn",
+    # Kimi Code CLI (OAuth, local subprocess) — auxiliary text completions via
+    # the installed, already-signed-in CLI. Canonical id is kimi-code-cli. It
+    # must NOT alias to the API-key provider "kimi-coding": different auth,
+    # different protocol, and a silent swap would spend a paid API key on a
+    # route the user configured for OAuth. Only unambiguous aliases here —
+    # "kimi"/"moonshot" stay bound to kimi-coding above.
+    "kimi-code-cli": "kimi-code-cli",
+    "kimi-cli": "kimi-code-cli",
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
     "minimax-china": "minimax-cn",
@@ -4354,6 +4335,125 @@ def _call_fallback_candidate_sync(
         return None
 
 
+def _chain_entry_index(fb_label: str) -> Optional[int]:
+    """Parse the entry index out of a ``fallback_chain[<i>](<provider>)`` label."""
+    m = re.match(r"fallback_chain\[(\d+)\]", fb_label or "")
+    return int(m.group(1)) if m else None
+
+
+def _is_retryable_chain_error(exc: Exception) -> bool:
+    """Whether a configured-chain candidate's failure may be retried elsewhere.
+
+    Reuses the canonical detectors so this cannot drift from the predicates
+    that decide whether to fail over in the first place. Deliberately narrow:
+    an auth/permission/configuration/request-shape error on one entry is NOT
+    a licence to keep walking other providers' credentials — those raise and
+    surface, exactly as before.
+    """
+    return (
+        _is_transient_transport_error(exc)
+        or _is_timeout_error(exc)
+        or _is_payment_error(exc)
+        or _is_rate_limit_error(exc)
+        or _is_model_incompatible_error(exc)
+        or _is_invalid_aux_response_error(exc)
+    )
+
+
+def _run_configured_chain_sync(
+    task: Optional[str],
+    failed_provider: str,
+    *,
+    reason: str,
+    failed_model: Optional[str],
+    requested_model: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    """Walk ``auxiliary.<task>.fallback_chain`` IN ORDER until one succeeds.
+
+    Before this, the configured chain contributed exactly one candidate per
+    failure: :func:`_try_configured_fallback_chain` returned the first entry
+    that could be *built*, and if that candidate's CALL then failed the error
+    propagated — later entries were never attempted. A three-entry compression
+    chain (Gemini CLI → Codex → Kimi Code CLI) therefore only ever exercised
+    entry 0 plus whatever the generic non-chain layers found, so an ordinary
+    retryable adapter failure on entry 0 skipped entries 1 and 2 entirely.
+
+    Here each entry is resolved and called in declaration order; a candidate
+    that fails with a retryable provider/adapter error (see
+    :func:`_is_retryable_chain_error`) advances to the next entry, and a
+    candidate quarantined for a stale credential does the same. Non-retryable
+    errors raise unchanged, so misconfiguration is never masked and routing is
+    never widened by an auth/permission failure.
+
+    Returns the first valid response, or ``None`` when the chain is exhausted
+    (the caller then continues to the remaining fallback layers and finally
+    re-raises the original error).
+    """
+    # Hard bound on the walk. The chain length is the natural limit; the
+    # constant floor keeps the loop safe when the config is unreadable or the
+    # resolver is stubbed (tests patch _try_configured_fallback_chain with a
+    # fixed return value), and `seen_labels` guarantees strict progress even
+    # if a stub ignores ``start_index`` entirely.
+    try:
+        _chain = _get_auxiliary_task_config(task or "").get("fallback_chain")
+        max_attempts = len(_chain) if isinstance(_chain, list) else 1
+    except Exception:
+        max_attempts = 1
+    max_attempts = max(1, min(max_attempts, 16))
+
+    start_index = 0
+    seen_labels: set = set()
+    for _ in range(max_attempts):
+        chain_kwargs = {
+            "reason": reason,
+            "failed_model": failed_model,
+            "requested_model": requested_model,
+        }
+        # Preserve the historical call contract on the first lookup.  Only pass
+        # the new cursor once a previously invoked candidate actually failed.
+        if start_index:
+            chain_kwargs["start_index"] = start_index
+        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            task or "", failed_provider, **chain_kwargs,
+        )
+        if fb_client is None:
+            return None
+        if fb_label in seen_labels:
+            # No forward progress — stop rather than re-attempt the same entry.
+            return None
+        seen_labels.add(fb_label)
+        entry_index = _chain_entry_index(fb_label)
+        next_index = (entry_index + 1) if entry_index is not None else start_index + 1
+        try:
+            fb_resp = _call_fallback_candidate_sync(
+                fb_client, fb_model, fb_label,
+                task=task, messages=messages,
+                temperature=temperature, max_tokens=max_tokens,
+                tools=tools, effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config)
+        except Exception as chain_err:
+            if not _is_retryable_chain_error(chain_err):
+                raise
+            logger.info(
+                "Auxiliary %s: %s failed (%s) — continuing configured "
+                "fallback_chain at entry %d",
+                task or "call", fb_label, chain_err, next_index,
+            )
+            fb_resp = None
+        if fb_resp is not None:
+            return fb_resp
+        start_index = next_index
+    return None
+
+
 async def _call_fallback_candidate_async(
     fb_client: Any,
     fb_model: Optional[str],
@@ -4716,6 +4816,7 @@ def _try_configured_fallback_chain(
     reason: str = "error",
     failed_model: Optional[str] = None,
     requested_model: Optional[str] = None,
+    start_index: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -4753,6 +4854,12 @@ def _try_configured_fallback_chain(
     anchor for a preserving mirror. Older direct callers that omit it retain
     the historical ``failed_model``/main-model fallback for compatibility.
 
+    ``start_index`` resumes the walk at that entry, so a caller that already
+    *called* earlier entries (see :func:`_run_configured_chain_sync`) can
+    advance through the chain in declaration order without re-attempting a
+    candidate that just failed. It defaults to 0, i.e. the historical
+    "first resolvable entry" behaviour.
+
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
@@ -4762,6 +4869,9 @@ def _try_configured_fallback_chain(
     task_config = _get_auxiliary_task_config(task)
     chain = task_config.get("fallback_chain")
     if not chain or not isinstance(chain, list):
+        return None, None, ""
+    start_index = max(0, int(start_index or 0))
+    if start_index >= len(chain):
         return None, None, ""
 
     skip_model = (failed_model or "").strip().lower() or None
@@ -4792,6 +4902,8 @@ def _try_configured_fallback_chain(
     )
 
     for i, entry in enumerate(chain):
+        if i < start_index:
+            continue
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -5866,6 +5978,54 @@ def resolve_provider_client(
             model or _AGY_DEFAULT_MODEL, provider
         )
         client = AgyCLIClient()
+        logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+        return client, final_model
+
+    # ── kimi-code-cli (Kimi Code CLI, OAuth via local subprocess) ─────────
+    # Auxiliary text-only path (compression). Drives the installed,
+    # already-signed-in Kimi Code CLI. Strictly distinct from the API-key
+    # provider ``kimi-coding``: this branch never reads an API key and never
+    # degrades to an HTTP endpoint. Unavailable/unconfigured returns
+    # (None, None) with an actionable log line so the configured chain
+    # continues (and raises after the last entry) instead of silently
+    # rerouting to a paid credential.
+    if provider == "kimi-code-cli":
+        if async_mode:
+            logger.debug(
+                "resolve_provider_client: kimi-code-cli is sync-only; "
+                "returning unavailable so async callers can fall back"
+            )
+            return None, None
+        try:
+            from agent.kimi_code_cli_client import (
+                DEFAULT_MODEL as _KIMI_CLI_DEFAULT_MODEL,
+                KimiCodeCLIClient,
+                KimiCodeCLIConfigurationError,
+            )
+        except ImportError:
+            logger.debug(
+                "resolve_provider_client: kimi-code-cli requested but "
+                "kimi_code_cli_client unavailable"
+            )
+            return None, None
+        try:
+            client = KimiCodeCLIClient()
+        except KimiCodeCLIConfigurationError as exc:
+            # Loud, actionable, and fail-closed: never fall through to the
+            # kimi-coding API-key route.
+            logger.warning(
+                "resolve_provider_client: kimi-code-cli is not usable — %s", exc,
+            )
+            return None, None
+        except Exception:
+            logger.debug(
+                "resolve_provider_client: kimi-code-cli client construction "
+                "failed", exc_info=True,
+            )
+            return None, None
+        final_model = _normalize_resolved_model(
+            model or _KIMI_CLI_DEFAULT_MODEL, provider
+        )
         logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
         return client, final_model
 
@@ -7176,6 +7336,7 @@ def _resolve_task_provider_model(
                 "copilot",
                 "copilot-acp",
                 "google-gemini-cli",
+                "kimi-code-cli",
                 "minimax-oauth",
                 "nous",
                 "openai-codex",
@@ -8828,36 +8989,42 @@ def call_llm(
                 None if reason in ("auth error", "payment error") else final_model
             )
             # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
+            #   1. User-configured fallback_chain (per-task) if set — walked
+            #      to exhaustion IN DECLARATION ORDER, so entry 1 and entry 2
+            #      are really attempted when entry 0 fails retryably (Gemini
+            #      CLI → Codex → Kimi Code CLI). A non-retryable failure on an
+            #      entry still raises instead of widening routing.
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
+            chain_resp = _run_configured_chain_sync(
+                task, resolved_provider or "auto", reason=reason,
+                failed_model=_chain_failed_model,
+                requested_model=final_model,
+                messages=messages,
+                temperature=temperature, max_tokens=max_tokens,
+                tools=tools, effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config)
+            if chain_resp is not None:
+                return chain_resp
+
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                # ``final_model`` (not _chain_failed_model) is the anchor a
+                # preserve_requested_model entry must keep: which model was
+                # running is a routing fact, independent of whether the
+                # failure was model- or credential-scoped.
+                fb_client, fb_model, fb_label = _try_main_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model,
-                    requested_model=final_model)
-                if fb_client is None:
-                    # ``final_model`` (not _chain_failed_model) is the anchor a
-                    # preserve_requested_model entry must keep: which model was
-                    # running is a routing fact, independent of whether the
-                    # failure was model- or credential-scoped.
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason,
-                        failed_model=final_model)
+                    failed_model=final_model)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model,
-                    requested_model=final_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    resolved_provider, task, reason=reason,
+                    failed_model=_chain_failed_model)
 
             if fb_client is not None:
                 fb_resp = _call_fallback_candidate_sync(
