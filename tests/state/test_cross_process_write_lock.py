@@ -6,14 +6,23 @@ append_message until their patience budget expires (2026-08-19 vpsclone:
 Dashboard ``_run_init_schema_with_wide_busy_timeout`` vs Gateway 60 s
 watchdog).  These tests use real child processes and a temporary database
 — never the live profile store.
+
+Every test in this module gets its own isolated private lock root under
+``tmp_path`` (see the ``_isolated_lock_root`` autouse fixture below) — never
+the real per-account root (``/tmp/hermes-state-locks-<uid>`` on POSIX) that
+any live Hermes process on the same machine, under the same OS account,
+might already be relying on.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import shutil
 import sqlite3
+import stat
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -24,6 +33,9 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_lock import (
     _lock_open_flags,
+    _lock_root,
+    _posix_lock_root,
+    _windows_lock_root,
     acquire_state_write_lock,
     canonical_db_key,
     write_lock_path,
@@ -32,11 +44,28 @@ from hermes_state_lock import (
 REPO_ROOT = str(Path(__file__).resolve().parents[2])
 
 _HAS_SYMLINK = hasattr(os, "symlink")
+_IS_WINDOWS = sys.platform == "win32"
 
 
-def _prepare_child_env(hermes_home: str) -> None:
+@pytest.fixture(autouse=True)
+def _isolated_lock_root(tmp_path, monkeypatch):
+    """Point every acquire in this test at a private root under tmp_path.
+
+    Without this, ``hermes_state_lock`` would resolve its default private
+    root — a real, shared-by-uid location — and these tests would create,
+    chmod, symlink and hardlink-swap files there. On this machine that
+    directory can be the one a live Hermes gateway process (same OS
+    account) is actively using for its own state.db admission.
+    """
+    root = tmp_path / "lock-root"
+    monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root))
+    return root
+
+
+def _prepare_child_env(hermes_home: str, lock_root: str) -> None:
     os.environ["HERMES_HOME"] = hermes_home
     os.environ["HOME"] = hermes_home
+    os.environ["HERMES_STATE_LOCK_ROOT"] = lock_root
     if REPO_ROOT not in sys.path:
         sys.path.insert(0, REPO_ROOT)
 
@@ -44,12 +73,13 @@ def _prepare_child_env(hermes_home: str) -> None:
 def _child_init_and_append(
     db_path: str,
     hermes_home: str,
+    lock_root: str,
     session_id: str,
     n: int,
     result_path: str,
     err_path: str,
 ) -> None:
-    _prepare_child_env(hermes_home)
+    _prepare_child_env(hermes_home, lock_root)
     try:
         from hermes_state import SessionDB as ChildDB
 
@@ -69,10 +99,12 @@ def _child_init_and_append(
 
 def _child_hold_flock(
     db_path: str,
+    lock_root: str,
     ready_path: str,
     release_path: str,
     err_path: str,
 ) -> None:
+    os.environ["HERMES_STATE_LOCK_ROOT"] = lock_root
     if REPO_ROOT not in sys.path:
         sys.path.insert(0, REPO_ROOT)
     try:
@@ -155,11 +187,14 @@ class TestWriteLockPrimitive:
 
 
 class TestTwoProcessWriters:
-    def test_schema_init_and_critical_append_from_two_processes(self, tmp_path):
+    def test_schema_init_and_critical_append_from_two_processes(
+        self, tmp_path, _isolated_lock_root
+    ):
         """Two real writer processes: each inits schema and appends."""
         db_path = tmp_path / "state.db"
         home = str(tmp_path / "home")
         Path(home).mkdir()
+        lock_root = str(_isolated_lock_root)
         ctx = mp.get_context("spawn")
         procs = []
         err_paths = []
@@ -171,7 +206,15 @@ class TestTwoProcessWriters:
                 _spawn(
                     ctx,
                     _child_init_and_append,
-                    (str(db_path), home, f"s{i}", 5, str(result), str(err)),
+                    (
+                        str(db_path),
+                        home,
+                        lock_root,
+                        f"s{i}",
+                        5,
+                        str(result),
+                        str(err),
+                    ),
                 )
             )
         for proc, err in zip(procs, err_paths):
@@ -186,10 +229,11 @@ class TestTwoProcessWriters:
         finally:
             db.close()
 
-    def test_bounded_load_no_starvation(self, tmp_path):
+    def test_bounded_load_no_starvation(self, tmp_path, _isolated_lock_root):
         db_path = tmp_path / "state.db"
         home = str(tmp_path / "home")
         Path(home).mkdir()
+        lock_root = str(_isolated_lock_root)
         ctx = mp.get_context("spawn")
         n_workers = 3
         n_msgs = 8
@@ -207,6 +251,7 @@ class TestTwoProcessWriters:
                     (
                         str(db_path),
                         home,
+                        lock_root,
                         f"w{i}",
                         n_msgs,
                         str(result),
@@ -227,7 +272,9 @@ class TestTwoProcessWriters:
         finally:
             db.close()
 
-    def test_waiter_proceeds_after_holder_releases(self, tmp_path):
+    def test_waiter_proceeds_after_holder_releases(
+        self, tmp_path, _isolated_lock_root
+    ):
         db_path = tmp_path / "state.db"
         home = str(tmp_path / "home")
         Path(home).mkdir()
@@ -240,7 +287,13 @@ class TestTwoProcessWriters:
         holder = _spawn(
             ctx,
             _child_hold_flock,
-            (str(db_path), str(ready), str(release), str(hold_err)),
+            (
+                str(db_path),
+                str(_isolated_lock_root),
+                str(ready),
+                str(release),
+                str(hold_err),
+            ),
         )
         try:
             deadline = time.monotonic() + 10.0
@@ -273,7 +326,9 @@ class TestTwoProcessWriters:
                 holder.kill()
                 holder.join(5.0)
 
-    def test_holder_death_releases_lock_no_orphan(self, tmp_path):
+    def test_holder_death_releases_lock_no_orphan(
+        self, tmp_path, _isolated_lock_root
+    ):
         db_path = tmp_path / "state.db"
         home = str(tmp_path / "home")
         Path(home).mkdir()
@@ -286,7 +341,13 @@ class TestTwoProcessWriters:
         holder = _spawn(
             ctx,
             _child_hold_flock,
-            (str(db_path), str(ready), str(release), str(hold_err)),
+            (
+                str(db_path),
+                str(_isolated_lock_root),
+                str(ready),
+                str(release),
+                str(hold_err),
+            ),
         )
         deadline = time.monotonic() + 10.0
         while not ready.exists():
@@ -319,7 +380,9 @@ class TestTwoProcessWriters:
         finally:
             db.close()
 
-    def test_readers_stay_concurrent_with_writer(self, tmp_path):
+    def test_readers_stay_concurrent_with_writer(
+        self, tmp_path, _isolated_lock_root
+    ):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
         db.create_session("s-read", "cli")
@@ -333,7 +396,13 @@ class TestTwoProcessWriters:
         holder = _spawn(
             ctx,
             _child_hold_flock,
-            (str(db_path), str(ready), str(release), str(hold_err)),
+            (
+                str(db_path),
+                str(_isolated_lock_root),
+                str(ready),
+                str(release),
+                str(hold_err),
+            ),
         )
         try:
             deadline = time.monotonic() + 10.0
@@ -362,7 +431,8 @@ class TestSymlinkAliasSharesLock:
     """Nemo REQUEST_CHANGES (20260820T042052Z): write_lock_path() derived the
     sidecar from the raw path while canonical_db_key() resolved symlinks, so
     ``state.db`` and ``alias.db -> state.db`` locked different sidecars and
-    two processes could hold admission on the same SQLite file at once."""
+    two processes could hold admission on the same underlying SQLite file at
+    once."""
 
     def test_write_lock_path_matches_for_symlink_alias(self, tmp_path):
         real_db = tmp_path / "state.db"
@@ -406,17 +476,88 @@ class TestSymlinkAliasSharesLock:
             assert admitted is True
 
 
+class TestLegacyColocationNoLongerMatters:
+    """Nemo REQUEST_CHANGES (20260820T115805Z): a co-tenant with write
+    access to the database's own directory could ``unlink`` the old sibling
+    sidecar (``state.db.write.lock``) and drop in a brand-new, ordinary
+    regular file under the same name between two acquires. Nothing in a
+    fresh file's metadata differs from a sidecar this module would have
+    created itself, so no ``fstat``-only check can distinguish them — a
+    holder still flock'd on the old inode and a second acquirer that locks
+    the new one would both believe they hold admission.
+
+    The fix does not try to detect that swap; it removes the shared
+    directory. These tests reproduce the exact swap against the DB's own
+    (co-tenant-writable) directory and show it has no bearing on admission
+    at all, because the real lock never lives there anymore."""
+
+    def test_unlink_and_recreate_in_the_db_directory_does_not_bypass_the_lock(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        # Where the sidecar used to live, sibling to the database.
+        legacy_sidecar = tmp_path / "state.db.write.lock"
+        started = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            with acquire_state_write_lock(db_path, timeout_s=5.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_holder)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+
+            # A co-tenant with write access to tmp_path (the DB's own
+            # directory) performs the exact bypass Nemo found: unlink
+            # whatever is at the legacy sidecar name and drop in a fresh,
+            # indistinguishable regular file under the same name — more
+            # than once, to model repeated attempts across the hold.
+            for _ in range(3):
+                if legacy_sidecar.exists():
+                    legacy_sidecar.unlink()
+                legacy_sidecar.write_bytes(b"")
+
+            # No effect: admission was never derived from this directory.
+            t0 = time.monotonic()
+            with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+    def test_write_lock_path_never_lives_next_to_the_database(
+        self, tmp_path, monkeypatch
+    ):
+        # Exercise the real default resolution, not the isolated per-test
+        # root the autouse fixture points at for every other test here.
+        monkeypatch.delenv("HERMES_STATE_LOCK_ROOT", raising=False)
+        db_path = tmp_path / "state.db"
+        lock_path = write_lock_path(db_path)
+        assert tmp_path not in lock_path.parents
+        assert lock_path.parent != db_path.parent
+
+
 @pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
 class TestSidecarSymlinkSubstitution:
-    """A sidecar swapped for a symlink (e.g. by an untrusted co-tenant of a
-    writable directory) must not be followed: the acquire should degrade to
-    admitted rather than silently flock whatever the symlink points at."""
+    """Now that the containing directory is private per-account, a co-tenant
+    can no longer reach this path to swap it — this is defense-in-depth
+    against a same-account race or bug: a sidecar swapped for a symlink must
+    not be followed, only degrade to admitted."""
 
     def test_symlinked_sidecar_is_refused_not_followed(self, tmp_path):
         db_path = tmp_path / "state.db"
         target = tmp_path / "other-process.lock"
         target.write_bytes(b"")
         lock_path = write_lock_path(db_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, lock_path)
 
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
@@ -433,18 +574,16 @@ class TestSidecarSymlinkSubstitution:
 
 @pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.link")
 class TestSidecarInodeSubstitutionBypass:
-    """Nemo REQUEST_CHANGES (20260820T114302Z): the sidecar was opened
-    without protecting its identity against unlink+recreate or a hardlink
-    swap. A co-tenant with write access to the directory could replace
-    ``state.db.write.lock`` while a holder still held the flock on the old
-    inode; a second acquirer opened the *new* inode and locked it too,
-    breaking the mutual exclusion this module exists to provide."""
+    """Now that the containing directory is private per-account, a co-tenant
+    can no longer reach this path to swap it — this is defense-in-depth
+    against a same-account race or bug (a rotation script, a retry that
+    reopens mid-hold): a hardlink swap onto the sidecar's name must still
+    not grant concurrent admission while a holder is active."""
 
     def test_hardlink_substitution_does_not_grant_concurrent_admission(
         self, tmp_path
     ):
         db_path = tmp_path / "state.db"
-        lock_path = write_lock_path(db_path)
         started = threading.Event()
         release = threading.Event()
 
@@ -458,10 +597,11 @@ class TestSidecarInodeSubstitutionBypass:
         holder.start()
         try:
             assert started.wait(2.0)
+            lock_path = write_lock_path(db_path)
 
-            # Simulate a co-tenant with write access to the directory
-            # swapping the sidecar for a hardlink to an unrelated file
-            # while the holder still owns the flock on the original inode.
+            # Simulate a same-account race swapping the sidecar for a
+            # hardlink to an unrelated file while the holder still owns the
+            # flock on the original inode.
             victim = tmp_path / "victim.lock"
             victim.write_bytes(b"")
             os.unlink(lock_path)
@@ -479,8 +619,10 @@ class TestSidecarInodeSubstitutionBypass:
             holder.join(5.0)
 
         # The module must never itself unlink the tampered sidecar (that
-        # would just be the same attack performed by trusted code); prove
-        # it left the hardlink alone.
+        # would just be the same swap performed by trusted code); prove it
+        # left the hardlink alone.
+        lock_path = write_lock_path(db_path)
+        victim = tmp_path / "victim.lock"
         assert os.path.samefile(lock_path, victim)
 
         # Once the tampering is cleaned up (an operator removing the rogue
@@ -488,6 +630,135 @@ class TestSidecarInodeSubstitutionBypass:
         os.unlink(lock_path)
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
+
+
+class TestPrivateLockRootInvariants:
+    """POSIX: the private lock root must be created 0700, owned by the
+    current account, and never a symlink — re-verified on every acquire.
+    Failing any of those is fail-closed (admitted is False), not a silent
+    degrade: an unverified root is exactly the co-tenant-writable-directory
+    condition this design exists to remove."""
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX-only invariants")
+    def test_root_created_fresh_is_0700_and_owned_by_current_user(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        root = write_lock_path(db_path).parent
+        st = os.lstat(root)
+        assert not stat.S_ISLNK(st.st_mode)
+        assert stat.S_ISDIR(st.st_mode)
+        assert stat.S_IMODE(st.st_mode) == 0o700
+        assert st.st_uid == os.getuid()
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX-only invariants")
+    def test_root_owned_by_a_different_uid_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        # Establish the root for real first, owned by us.
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+        real_getuid = os.getuid
+        monkeypatch.setattr(os, "getuid", lambda: real_getuid() + 1)
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX-only invariants")
+    def test_root_with_uncorrectable_permissions_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        root = write_lock_path(db_path).parent
+        os.chmod(root, 0o755)  # loosen it, simulating drift or tampering
+
+        real_chmod = os.chmod
+
+        def _refuse_chmod(path, mode, *a, **kw):
+            if Path(path) == root:
+                raise PermissionError("simulated: cannot tighten")
+            return real_chmod(path, mode, *a, **kw)
+
+        monkeypatch.setattr(os, "chmod", _refuse_chmod)
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX-only invariants")
+    def test_root_with_correctable_permissions_self_heals(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        root = write_lock_path(db_path).parent
+        os.chmod(root, 0o755)
+
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        st = os.lstat(root)
+        assert stat.S_IMODE(st.st_mode) == 0o700
+
+    @pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
+    def test_root_replaced_by_a_symlink_fails_closed_and_is_left_alone(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        root = write_lock_path(db_path).parent
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        shutil.rmtree(root)
+        os.symlink(elsewhere, root)
+
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+        # Never followed, never replaced.
+        assert root.is_symlink()
+        assert os.readlink(root) == str(elsewhere)
+
+    def test_cannot_create_root_at_all_degrades_to_admitted(
+        self, tmp_path, monkeypatch
+    ):
+        """Distinct from the invariant failures above: a plain inability to
+        create the root (parent missing, not a directory, read-only fs) is
+        operational, not a tampering signal, so it degrades the way an
+        unopenable lock file always has."""
+        db_path = tmp_path / "state.db"
+        blocker = tmp_path / "blocker"
+        blocker.write_bytes(b"")  # a file, not a directory
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(blocker / "root"))
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+
+class TestLockRootPlatformSplit:
+    def test_posix_root_is_uid_scoped_under_tempdir(self, monkeypatch):
+        monkeypatch.delenv("HERMES_STATE_LOCK_ROOT", raising=False)
+        root = _posix_lock_root()
+        assert str(os.getuid()) in root.name
+        assert root.parent == Path(tempfile.gettempdir())
+
+    def test_windows_root_is_under_localappdata(self, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", "C:\\Users\\jose\\AppData\\Local")
+        root = _windows_lock_root()
+        assert root == Path("C:\\Users\\jose\\AppData\\Local") / "hermes" / "state-locks"
+
+    def test_windows_root_falls_back_without_localappdata(self, monkeypatch):
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        root = _windows_lock_root()
+        assert root == Path.home() / "AppData" / "Local" / "hermes" / "state-locks"
+
+    def test_lock_root_override_env_var_takes_precedence(
+        self, tmp_path, monkeypatch
+    ):
+        override = tmp_path / "custom-root"
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(override))
+        assert _lock_root(is_windows=False) == override
+        assert _lock_root(is_windows=True) == override
 
 
 class TestLockOpenFlagsPortability:

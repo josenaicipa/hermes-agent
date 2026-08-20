@@ -16,37 +16,63 @@ Why ``flock`` (and not a pidfile):
 * The kernel drops the lock when the holding process dies, so a crash cannot
   leave an orphan that wedges every later writer.
 * Readers never take it, so WAL concurrent reads stay intact.
-* The lock file is a sibling sidecar (``state.db.write.lock``); the database
-  file, WAL and SHM are untouched. The sidecar name is derived from the
-  symlink-resolved database path so aliases (a symlink or a different
-  relative spelling pointing at the same file) share one sidecar instead of
-  splitting admission across two. The sidecar is opened with ``O_NOFOLLOW``
-  on POSIX so a sidecar swapped for a symlink between processes is refused
-  rather than silently locked through (``O_NOFOLLOW`` itself is optional on
-  the ``os`` module — some POSIX platforms don't expose it — so the flag is
-  simply omitted there rather than raising).
 
-Symlink swap is not the only substitution a co-tenant with write access to
-the directory can attempt: it can also ``unlink`` the sidecar and hardlink
-another file onto the freed name. ``O_NOFOLLOW`` does not see that — the
-result is a plain regular file, not a symlink. After winning the flock this
-module re-validates, via ``fstat``/``lstat``, that the fd it just locked is
-still the *sole-linked, live* directory entry at the sidecar path
-(``st_nlink == 1`` and matching ``(st_dev, st_ino)``); a sidecar this module
-creates is always exactly one name pointing at one inode, so anything else
-means a co-tenant relinked the name out from under the open. On mismatch the
-fd is dropped (never the path itself — unlinking it ourselves would just be
-the same attack performed by trusted code) and the acquire retries against
-whatever is live now, bounded by the same deadline as ordinary contention.
+Why the lock file does NOT live next to ``state.db`` (private lock root):
 
-This closes the case where an already-tampered sidecar is discovered before
-we start relying on it. It cannot detect a co-tenant that unlinks the
-sidecar and drops in an indistinguishable *fresh* regular file between two
-independent acquires — nothing in the new file's metadata differs from a
-sidecar this module would have created itself, so no ``fstat``-only check
-can tell them apart. Closing that residual requires the sidecar's directory
-to be writable only by the Hermes process's own account; that is a
-deployment control, not something this module can enforce at call time.
+Earlier revisions of this module kept the admission token as a sibling
+sidecar (``state.db.write.lock``) next to the database, hardened with
+``O_NOFOLLOW`` against a symlink swap and an ``fstat``/``lstat`` re-check
+(``st_nlink`` + ``(st_dev, st_ino)``) against a hardlink swap. Both defenses
+assume the attacker substitutes something *distinguishable* — a symlink, or
+a second name pointing at a still-open inode. Neither survives the residual
+case Nemo found: a co-tenant with write access to the database's directory
+can ``unlink`` the sidecar and drop in a brand-new, ordinary regular file
+under the same name. Nothing in that fresh file's metadata differs from a
+sidecar this module would have created itself — no ``fstat``-only check can
+tell them apart — so a holder that kept the old inode locked and a second
+process that locks the new one both believe they hold admission. That is
+the exact mutual-exclusion break this module exists to prevent.
+
+The fix is not a better detector; it is removing the shared directory. The
+sidecar now lives in a **private, per-user lock root** that a co-tenant of
+the database's directory cannot write into at all, so there is no directory
+entry for it to unlink or replace in the first place:
+
+* POSIX: ``<tempdir>/hermes-state-locks-<uid>``, created with mode ``0700``
+  and re-verified on every acquire — owned by the current effective user,
+  not a symlink, and exactly ``0700`` (loosened permissions are tightened
+  back with ``chmod`` when we own the directory; corrected can't when we
+  don't). Any of those checks failing means the invariant this design
+  depends on cannot be guaranteed, so the acquire **fails closed** (yields
+  ``False``, the same signal ordinary lock contention produces) rather than
+  silently falling back to an unprotected acquire — that fallback is exactly
+  the co-tenant-writable-directory condition being removed. This is
+  distinct from simply being unable to create the root at all (parent
+  missing, read-only filesystem, ``ENOSPC``): that is an operational
+  condition, not evidence of tampering, and degrades to admitted the same
+  way an unopenable lock file always has.
+* Windows: ``%LOCALAPPDATA%\\hermes\\state-locks``. ``%LOCALAPPDATA%`` is
+  already restricted to the owning user profile by the OS's own ACLs, so
+  there is no POSIX-style owner/mode dance to perform there; only creation
+  is attempted, and a failure degrades to admitted (same operational-vs-
+  tampering distinction as POSIX).
+
+The sidecar's *name* inside that root is a stable hash of
+``canonical_db_key()`` (which already resolves symlinks and case-folds), not
+the raw ``db_path``, so ``state.db`` and any alias pointing at it — a
+symlink, or a different relative spelling — share one lock file instead of
+splitting admission across two.
+
+The old symlink-swap (``O_NOFOLLOW``) and hardlink-swap (``fstat``/``lstat``
+identity) defenses are kept as defense-in-depth: they now protect against
+same-account races (a rotation script recreating the lock file while a hold
+is live, a bug), not against a hostile co-tenant, since a co-tenant can no
+longer reach the directory at all. They are no longer the primary defense —
+the private lock root's directory permissions are.
+
+This closes the case Nemo flagged: a co-tenant cannot unlink or hardlink
+anything inside a ``0700`` directory it does not own, so "unlink + drop in
+an indistinguishable fresh regular file" has no directory entry to act on.
 
 The lock is **not** a substitute for SQLite's own locking.  Callers still
 ``BEGIN IMMEDIATE`` and still retry on ``SQLITE_BUSY`` from holders that do
@@ -58,17 +84,29 @@ Per-thread re-entrant: a nested write on the same path (reconnect during a
 failed write, a helper that writes again) must not block on its own flock.
 Other threads and other processes wait.
 
-If the lock file cannot be created (read-only directory, exhausted fds) the
-acquire degrades to admitted — the in-process ``SessionDB._lock`` plus SQLite
-busy handling remain, which is what shipped before this module existed.
+If the lock file cannot be opened (private root verified, but e.g. exhausted
+fds) the acquire degrades to admitted — the in-process ``SessionDB._lock``
+plus SQLite busy handling remain, which is what shipped before this module
+existed.
+
+A caveat this module cannot enforce: every Hermes process of the same OS
+account must see the same ``tempfile.gettempdir()`` (i.e. a consistent
+``TMPDIR``/``TEMP``/``TMP``) for the private root to be the *same* root
+across processes. That is a deployment consistency requirement, not
+something checkable at call time — the same category as requiring
+``HERMES_HOME`` to be propagated consistently to subprocess spawners
+elsewhere in this codebase.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
+import stat
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -79,6 +117,8 @@ logger = logging.getLogger("hermes_state")
 _IS_WINDOWS = sys.platform == "win32"
 _POLL_S = 0.05
 _WRITE_LOCK_SUFFIX = ".write.lock"
+_LOCK_ROOT_PREFIX = "hermes-state-locks"
+_ROOT_MODE = 0o700
 
 # thread ident -> {canonical key: _Hold}.  Depth is per-thread so a nested
 # acquire on the same path does not open a second fd and self-deadlock
@@ -94,6 +134,15 @@ class _Hold:
         self.depth = 1
 
 
+class _LockRootUnsafe(Exception):
+    """The private lock root exists but fails a POSIX safety invariant.
+
+    Raised (never returned as a bool) so ``acquire_state_write_lock`` cannot
+    accidentally treat "exists but tampered/misowned" the same as "could not
+    be created at all" — the two must fail differently (closed vs. degrade).
+    """
+
+
 def canonical_db_key(db_path: os.PathLike | str) -> str:
     """Canonicalize a database path so aliases share one lock.
 
@@ -107,39 +156,134 @@ def canonical_db_key(db_path: os.PathLike | str) -> str:
         return os.path.normcase(text)
 
 
-def write_lock_path(db_path: os.PathLike | str) -> Path:
-    """Return the sidecar lock path for *db_path* (``<name>.write.lock``).
-
-    Derived from the symlink-resolved path, not the raw spelling the caller
-    passed in.  ``canonical_db_key()`` already collapses aliases for the
-    in-process re-entrancy table; if this function used the raw path instead,
-    ``state.db`` and a symlink alias pointing at it (``alias.db ->
-    state.db``) would resolve to *different* sidecars
-    (``state.db.write.lock`` vs. ``alias.db.write.lock``) and two processes
-    could hold admission on the same underlying SQLite file at once —
-    reintroducing the exact contention/starvation this module exists to
-    remove.
-    """
-    text = str(db_path)
+def _posix_lock_root() -> Path:
     try:
-        resolved = os.path.realpath(text)
+        uid = os.getuid()
+    except AttributeError:  # pragma: no cover - no POSIX getuid, shouldn't happen
+        uid = "unknown"
+    return Path(tempfile.gettempdir()) / f"{_LOCK_ROOT_PREFIX}-{uid}"
+
+
+def _windows_lock_root() -> Path:
+    local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+    base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+    return base / "hermes" / "state-locks"
+
+
+def _lock_root(is_windows: bool = _IS_WINDOWS) -> Path:
+    """Return the private per-user lock root (no I/O — pure path math).
+
+    Deliberately independent of ``db_path``/``HERMES_HOME``: the root's
+    safety comes from being an OS-account-private location this module
+    fully controls, not from wherever a particular database happens to
+    live.
+
+    ``HERMES_STATE_LOCK_ROOT`` overrides the platform default when set.
+    This exists so tests never touch the real per-account lock root shared
+    with any live Hermes process on the same machine, and so an operator
+    with an unusual ``TMPDIR``/profile layout can relocate it; the override
+    is still subject to the exact same :func:`_ensure_private_lock_root`
+    safety checks, so pointing it at an unsafe directory fails closed rather
+    than silently reopening the co-tenant bypass.
+    """
+    override = os.environ.get("HERMES_STATE_LOCK_ROOT", "").strip()
+    if override:
+        return Path(override)
+    return _windows_lock_root() if is_windows else _posix_lock_root()
+
+
+def _ensure_private_lock_root(root: Path, is_windows: bool = _IS_WINDOWS) -> bool:
+    """Create *root* if needed and verify it is safe to hold lock sidecars.
+
+    Returns ``True`` once *root* is confirmed private to this account.
+    Returns ``False`` when *root* could not even be created/stat'd (missing
+    parent, read-only filesystem, exhausted resources) — an operational
+    condition the caller degrades from, same as an unopenable lock file.
+
+    Raises :class:`_LockRootUnsafe` when *root* exists but fails a safety
+    invariant (symlink, wrong owner, or a permission mode we cannot correct)
+    — the caller must fail closed for this case, not degrade, because an
+    unverified root is precisely the co-tenant-writable-directory condition
+    this design removes.
+    """
+    if is_windows:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        # %LOCALAPPDATA% is already restricted to the owning user profile by
+        # NTFS ACLs; there is no POSIX-style owner/mode check to perform.
+        return True
+
+    try:
+        os.mkdir(root, _ROOT_MODE)
+    except FileExistsError:
+        pass
     except OSError:
-        resolved = text
-    path = Path(resolved)
-    return path.with_name(path.name + _WRITE_LOCK_SUFFIX)
+        return False
+
+    try:
+        st = os.lstat(root)
+    except OSError:
+        return False
+
+    if stat.S_ISLNK(st.st_mode):
+        # Never follow it, never replace it ourselves — just refuse.
+        raise _LockRootUnsafe(f"{root} is a symlink, refusing to use it")
+    if not stat.S_ISDIR(st.st_mode):
+        raise _LockRootUnsafe(f"{root} is not a directory")
+
+    try:
+        current_uid = os.getuid()
+    except AttributeError:  # pragma: no cover - no POSIX getuid, shouldn't happen
+        raise _LockRootUnsafe("cannot determine current uid to verify ownership")
+    if st.st_uid != current_uid:
+        raise _LockRootUnsafe(f"{root} is owned by uid {st.st_uid}, not {current_uid}")
+
+    if stat.S_IMODE(st.st_mode) != _ROOT_MODE:
+        try:
+            os.chmod(root, _ROOT_MODE)
+            st = os.lstat(root)
+        except OSError as exc:
+            raise _LockRootUnsafe(f"could not tighten {root} to 0700: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode) or stat.S_IMODE(st.st_mode) != _ROOT_MODE:
+            raise _LockRootUnsafe(f"{root} did not converge to 0700")
+
+    return True
+
+
+def write_lock_path(db_path: os.PathLike | str) -> Path:
+    """Return the sidecar lock path for *db_path* inside the private root.
+
+    Named by a stable hash of :func:`canonical_db_key` (symlink-resolved,
+    case-folded), not colocated with the database file. Two consequences:
+
+    * Aliases converge — ``state.db`` and a symlink alias pointing at it
+      (``alias.db -> state.db``) hash to the same key and share one lock
+      file, so two processes can never hold admission on the same
+      underlying SQLite file through different names.
+    * The lock never lives in a directory a co-tenant of the database's
+      directory can write to — see the module docstring for why that
+      colocation was the residual bypass this module used to have.
+    """
+    key = canonical_db_key(db_path)
+    digest = hashlib.sha256(key.encode("utf-8", "surrogateescape")).hexdigest()
+    return _lock_root() / f"{digest}{_WRITE_LOCK_SUFFIX}"
 
 
 def _lock_open_flags(is_windows: bool = _IS_WINDOWS) -> int:
     """Flags for opening the sidecar lock file.
 
-    POSIX adds ``O_NOFOLLOW`` so a sidecar an untrusted actor swapped for a
-    symlink between processes is refused (``ELOOP``) instead of silently
-    followed to whatever it points at. Windows has no equivalent open flag,
-    so the platform split is explicit here rather than inside the ``try``.
-    ``O_NOFOLLOW`` is POSIX-only *and* not guaranteed to exist on every POSIX
-    ``os`` module (e.g. some minimal/embedded builds) — a bare
-    ``os.O_NOFOLLOW`` reference would raise ``AttributeError`` outside the
-    caller's ``except OSError``, so it is looked up with ``getattr`` and
+    POSIX adds ``O_NOFOLLOW`` so a sidecar swapped for a symlink between
+    processes is refused (``ELOOP``) instead of silently followed to
+    whatever it points at. This is defense-in-depth against a same-account
+    race or bug now that the containing directory is private — a co-tenant
+    can no longer reach this path to swap it at all. Windows has no
+    equivalent open flag, so the platform split is explicit here rather than
+    inside the ``try``. ``O_NOFOLLOW`` is POSIX-only *and* not guaranteed to
+    exist on every POSIX ``os`` module (e.g. some minimal/embedded builds) —
+    a bare ``os.O_NOFOLLOW`` reference would raise ``AttributeError`` outside
+    the caller's ``except OSError``, so it is looked up with ``getattr`` and
     simply omitted where absent rather than crashing the acquire.
     """
     flags = os.O_RDWR | os.O_CREAT
@@ -198,14 +342,14 @@ def _sidecar_identity_is_trustworthy(handle, lock_path: Path) -> bool:
     """True if *handle*'s fd is still the sole-linked, live entry at
     *lock_path* — i.e. flock on it means something.
 
-    A sidecar this module creates is always exactly one directory entry
-    pointing at one inode. If a co-tenant with write access to the
-    directory has ``unlink``'d that entry and hardlinked another file onto
-    the freed name, the fd we already hold and the name now on disk have
+    Defense-in-depth against a same-account race (not a hostile co-tenant,
+    who can no longer reach the private lock root at all): a sidecar this
+    module creates is always exactly one directory entry pointing at one
+    inode. If the name has been unlinked and a hardlink dropped onto it
+    since we opened it, the fd we hold and the name now on disk have
     diverged: either the inode gained a second name (``st_nlink != 1``) or
     the name currently points elsewhere entirely (``(st_dev, st_ino)``
-    mismatch). Either signals a lock nobody contending on the real path
-    would ever see, so it must not be trusted as admission.
+    mismatch).
     """
     try:
         fd_stat = os.fstat(handle.fileno())
@@ -247,8 +391,10 @@ def acquire_state_write_lock(
 
     Yields ``True`` when this thread holds admission (including a nested
     re-acquire, and including the degrade-open path).  Yields ``False`` when
-    the bounded wait expired; the caller has not touched SQLite and must
-    treat it as contention.
+    the bounded wait expired, OR when the private lock root's safety
+    invariant could not be guaranteed (fail-closed — see the module
+    docstring); the caller has not touched SQLite and must treat both the
+    same way: as contention.
 
     A non-positive *timeout_s* still performs one non-blocking attempt so a
     caller whose budget is already spent can make one last honest try.
@@ -264,9 +410,29 @@ def acquire_state_write_lock(
             existing.depth -= 1
         return
 
+    root = _lock_root()
+    try:
+        root_ready = _ensure_private_lock_root(root)
+    except _LockRootUnsafe as exc:
+        logger.error(
+            "State write-lock root %s failed a safety check (%s) — "
+            "refusing admission rather than proceeding unprotected.",
+            root,
+            exc,
+        )
+        yield False
+        return
+    if not root_ready:
+        logger.warning(
+            "Could not create state write-lock root %s — proceeding with "
+            "SQLite busy handling only.",
+            root,
+        )
+        yield True
+        return
+
     lock_path = write_lock_path(db_path)
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = _open_sidecar(lock_path)
     except OSError as exc:
         logger.warning(
@@ -287,12 +453,12 @@ def acquire_state_write_lock(
                     acquired = True
                     break
                 # We won the flock, but the fd is no longer the live,
-                # sole-linked entry at lock_path — a co-tenant swapped it
-                # (hardlink, or unlink+recreate racing our own open) after
-                # we opened it. Drop this fd — never the path itself,
-                # unlinking it ourselves would just be the same attack
-                # performed by trusted code — and fall through to reopen a
-                # fresh candidate against whatever is live now.
+                # sole-linked entry at lock_path — a same-account race
+                # (hardlink, or unlink+recreate racing our own open)
+                # swapped it after we opened it. Drop this fd — never the
+                # path itself, unlinking it ourselves would just be the
+                # same attack performed by trusted code — and fall through
+                # to reopen a fresh candidate against whatever is live now.
                 _unlock(handle)
                 try:
                     handle.close()

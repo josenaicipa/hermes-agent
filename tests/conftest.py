@@ -510,6 +510,21 @@ def _hermetic_environment(tmp_path, monkeypatch):
             hermes_state_mod, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
         )
 
+    # 3c. hermes_state_lock resolves a private, per-account lock root (real
+    #     default: <tempdir>/hermes-state-locks-<uid> on POSIX,
+    #     %LOCALAPPDATA%\hermes\state-locks on Windows) that is deliberately
+    #     independent of HERMES_HOME/db_path — that's the point, a co-tenant
+    #     of the database's own directory must not be able to reach it. But
+    #     it also means redirecting HERMES_HOME above does NOT isolate it:
+    #     without this, every test that opens a SessionDB (directly or via
+    #     acquire_state_write_lock) would create/verify/chmod lock sidecars
+    #     in the REAL per-account root — the same one any live Hermes
+    #     process under this OS account is using. Pin it to this test's own
+    #     tempdir instead.
+    monkeypatch.setenv(
+        "HERMES_STATE_LOCK_ROOT", str(fake_hermes_home / "state-locks")
+    )
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")
