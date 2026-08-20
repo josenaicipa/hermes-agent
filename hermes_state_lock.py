@@ -71,7 +71,15 @@ sidecar lives in a **private, per-user lock root** that a co-tenant of any
 database's directory cannot write into at all, so there is no directory
 entry for it to unlink or replace in the first place:
 
-* POSIX: ``<tempdir>/hermes-state-locks-<uid>``, created with mode ``0700``
+* POSIX: ``<passwd home>/.hermes-state-locks-<uid>`` — the home directory
+  from the **passwd database** (``pwd.getpwuid``), never from ``$HOME`` or
+  any other environment variable (see the "Fase C8" section below for why
+  the root must not depend on per-process environment). When the account
+  has no usable passwd entry (no entry at all, or a non-absolute
+  ``pw_dir``), the root falls back to the static path
+  ``/tmp/hermes-state-locks-<uid>`` — a literal ``/tmp``, not
+  ``tempfile.gettempdir()``, for the same reason. Either way the root is
+  created with mode ``0700``
   and re-verified on every acquire — owned by the current effective user,
   not a symlink, and exactly ``0700`` (loosened permissions are tightened
   back with ``chmod`` when we own the directory; corrected can't when we
@@ -147,13 +155,56 @@ fds) the acquire degrades to admitted — the in-process ``SessionDB._lock``
 plus SQLite busy handling remain, which is what shipped before this module
 existed.
 
-A caveat this module cannot enforce: every Hermes process of the same OS
-account must see the same ``tempfile.gettempdir()`` (i.e. a consistent
-``TMPDIR``/``TEMP``/``TMP``) for the private root to be the *same* root
-across processes. That is a deployment consistency requirement, not
-something checkable at call time — the same category as requiring
-``HERMES_HOME`` to be propagated consistently to subprocess spawners
-elsewhere in this codebase.
+Fase C8 — the lock root is deterministic per UID, never per environment
+(Nemo gate 20260820T144423Z):
+
+Fase C7's root was ``<tempfile.gettempdir()>/hermes-state-locks-<uid>``,
+and ``gettempdir()`` reads ``TMPDIR``/``TEMP``/``TMP`` — *per-process*
+state. Two processes of the same account writing the same ``state.db``
+with different ``TMPDIR`` (a systemd unit with ``PrivateTmp=``/a
+per-service ``TMPDIR=``, a cron job, a login shell — exactly the
+Gateway/Dashboard/ACP shape) would derive *different* roots, therefore
+different sidecars, and both would be admitted concurrently: the global
+lock silently stops being global. C7 documented that as an unenforceable
+deployment-consistency caveat; C8 removes the dependency instead of
+documenting it.
+
+The root is now a pure function of the **uid**, resolved through
+system-wide state only:
+
+* Primary: the account's home directory from the passwd database
+  (``pwd.getpwuid(uid).pw_dir``). The passwd database is host state,
+  identical for every process of the account no matter what its
+  environment says — unlike ``$HOME``, which subprocess spawners in this
+  codebase deliberately repoint (``HERMES_HOME``-scoped profiles). A
+  process that can write any Hermes state database can, in Hermes's
+  deployment shape, also write this account's home, so the root does not
+  demand any access the writer did not already have.
+* Fallback (account has no passwd entry, or its ``pw_dir`` is not an
+  absolute path): the static literal ``/tmp/hermes-state-locks-<uid>``.
+  Whether an account has a usable passwd entry is also host state, so
+  every process of the account takes the same branch.
+
+``HERMES_STATE_LOCK_ROOT`` remains an explicit override (tests, unusual
+layouts). It is an environment variable, so it reintroduces the
+per-process divergence risk *by explicit operator choice*; setting it
+inconsistently across Hermes processes is unsupported.
+
+What no root choice can survive: mount-namespace isolation that presents
+different filesystems to different processes (``ProtectHome=``, chroots,
+containers bind-mounting the same ``state.db`` but not the same home /
+``/tmp``). No path resolves identically across namespaces that disagree
+about what is mounted where; that boundary needs deployment configuration,
+not a cleverer path. Similarly, a home directory on a filesystem without
+working ``flock`` semantics (NFSv3 without ``lockd``) degrades to SQLite's
+own busy handling, as any unopenable/unlockable sidecar always has.
+
+Rolling upgrades: a pre-C8 process (root under ``gettempdir()``) and a
+post-C8 process (root under the passwd home) use different sidecars for
+the window in which both are running. That window falls back to SQLite
+busy handling — the documented behavior for mixed-version writers since
+this module was introduced. Restart all Hermes processes together, as the
+prior C-phase lock-identity changes already required.
 """
 
 from __future__ import annotations
@@ -163,7 +214,6 @@ import logging
 import os
 import stat
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -237,12 +287,53 @@ class _SidecarIdentitySwapped(Exception):
     """
 
 
+# Fallback base when the account has no usable passwd entry. A literal
+# ``/tmp``, never ``tempfile.gettempdir()``: gettempdir() reads
+# TMPDIR/TEMP/TMP, which is per-process state — the exact divergence Fase C8
+# removes (see the module docstring).
+_POSIX_FALLBACK_TMP = Path("/tmp")
+
+
+def _posix_passwd_home() -> Optional[Path]:
+    """Current account's home from the passwd database, or ``None``.
+
+    Deliberately never consults ``$HOME`` (or any other environment
+    variable): subprocess spawners in this codebase repoint ``HOME`` at
+    ``HERMES_HOME``-scoped profiles, and a per-process source would split
+    the lock root across processes — the Fase C8 bug class. ``None`` means
+    "no entry for this uid" or "entry without an absolute ``pw_dir``";
+    both are host-wide conditions, so every process of the account
+    resolves the same answer.
+    """
+    try:
+        import pwd
+
+        entry = pwd.getpwuid(os.getuid())
+    except (ImportError, AttributeError, KeyError, OSError):
+        return None
+    home = (entry.pw_dir or "").strip()
+    if not home or not os.path.isabs(home):
+        return None
+    return Path(home)
+
+
 def _posix_lock_root() -> Path:
+    """Deterministic per-uid root — a pure function of host state (Fase C8).
+
+    ``<passwd home>/.hermes-state-locks-<uid>`` normally;
+    ``/tmp/hermes-state-locks-<uid>`` when the account has no usable passwd
+    entry. Nothing here reads the process environment, so two processes of
+    the same account always derive the same root regardless of how their
+    ``TMPDIR``/``TEMP``/``TMP``/``HOME`` differ.
+    """
     try:
         uid = os.getuid()
     except AttributeError:  # pragma: no cover - no POSIX getuid, shouldn't happen
         uid = "unknown"
-    return Path(tempfile.gettempdir()) / f"{_LOCK_ROOT_PREFIX}-{uid}"
+    home = _posix_passwd_home()
+    if home is not None:
+        return home / f".{_LOCK_ROOT_PREFIX}-{uid}"
+    return _POSIX_FALLBACK_TMP / f"{_LOCK_ROOT_PREFIX}-{uid}"
 
 
 def _windows_lock_root() -> Path:
@@ -262,7 +353,11 @@ def _lock_root(is_windows: bool = _IS_WINDOWS) -> Path:
     ``HERMES_STATE_LOCK_ROOT`` overrides the platform default when set.
     This exists so tests never touch the real per-account lock root shared
     with any live Hermes process on the same machine, and so an operator
-    with an unusual ``TMPDIR``/profile layout can relocate it; the override
+    with an unusual home/profile layout can relocate it. Being an
+    environment variable, it is per-process state: the operator owns
+    keeping it identical across every Hermes process of the account
+    (Fase C8 made the *default* independent of the environment precisely
+    so nothing requires this variable in normal deployments). The override
     is still subject to the exact same :func:`_ensure_private_lock_root`
     safety checks, so pointing it at an unsafe directory fails closed rather
     than silently reopening the co-tenant bypass.

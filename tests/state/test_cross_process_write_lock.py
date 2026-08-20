@@ -9,9 +9,13 @@ watchdog).  These tests use real child processes and temporary databases
 
 Every test in this module gets its own isolated private lock root under
 ``tmp_path`` (see the ``_isolated_lock_root`` autouse fixture below) — never
-the real per-account root (``/tmp/hermes-state-locks-<uid>`` on POSIX) that
-any live Hermes process on the same machine, under the same OS account,
-might already be relying on.
+the real per-account root (``<passwd home>/.hermes-state-locks-<uid>`` on
+POSIX since Fase C8) that any live Hermes process on the same machine,
+under the same OS account, might already be relying on. The two cross-
+process tests that must exercise the *default* (non-overridden) resolution
+either perform pure path math with no acquire, or repoint the passwd-home
+seam (``_posix_passwd_home``) at a directory under ``tmp_path`` before
+acquiring — see ``TestLockRootSurvivesEnvironmentDivergence``.
 
 Fase C7: ``hermes_state_lock`` used to name its sidecar after a stable hash
 of ``canonical_db_key(db_path)`` — symlink-resolved, and case/Unicode-folded
@@ -49,6 +53,7 @@ import time
 import traceback
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -177,6 +182,98 @@ def _child_cooperative_cycles(
                 st = os.stat(_write_lock_path())
                 identities.append([st.st_dev, st.st_ino])
         Path(identity_path).write_text(json.dumps(identities), encoding="utf-8")
+    except Exception:
+        Path(err_path).write_text(traceback.format_exc(), encoding="utf-8")
+
+
+def _make_env_divergent(private_env_dir: str) -> None:
+    """Give this child process a deliberately divergent environment.
+
+    Removes the test-suite override so the *default* root resolution is
+    exercised, then points every tempdir/home variable somewhere unique to
+    this process — the exact shape of a systemd unit with PrivateTmp=/a
+    per-service TMPDIR= running next to a login shell (Fase C8)."""
+    os.environ.pop("HERMES_STATE_LOCK_ROOT", None)
+    for var in ("TMPDIR", "TEMP", "TMP", "HOME"):
+        os.environ[var] = private_env_dir
+    tempfile.tempdir = None  # force gettempdir() to re-read the env
+
+
+def _child_report_default_lock_root(
+    private_env_dir: str,
+    out_path: str,
+    err_path: str,
+) -> None:
+    """Resolve the default lock root under a divergent environment and
+    report it. Pure path math — no acquire, no mkdir — so the real
+    per-account root is never touched despite the override being removed."""
+    _make_env_divergent(private_env_dir)
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    try:
+        from hermes_state_lock import _lock_root as _child_lock_root
+
+        Path(out_path).write_text(str(_child_lock_root()), encoding="utf-8")
+    except Exception:
+        Path(err_path).write_text(traceback.format_exc(), encoding="utf-8")
+
+
+def _child_divergent_env_hold(
+    fake_home: str,
+    private_env_dir: str,
+    ready_path: str,
+    release_path: str,
+    err_path: str,
+) -> None:
+    """Acquire and hold admission under a divergent environment.
+
+    The passwd-home seam is repointed at *fake_home* (a per-test directory)
+    so the acquire exercises the real default derivation without ever
+    touching the account's live lock root."""
+    _make_env_divergent(private_env_dir)
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    try:
+        import hermes_state_lock as _hsl
+
+        _hsl._posix_passwd_home = lambda: Path(fake_home)
+        with _hsl.acquire_state_write_lock(
+            "env-divergence-context.db", timeout_s=5.0
+        ) as admitted:
+            if not admitted:
+                Path(err_path).write_text("holder not admitted", encoding="utf-8")
+                return
+            Path(ready_path).touch()
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                if Path(release_path).exists():
+                    break
+                time.sleep(0.05)
+    except Exception:
+        Path(err_path).write_text(traceback.format_exc(), encoding="utf-8")
+
+
+def _child_divergent_env_probe(
+    fake_home: str,
+    private_env_dir: str,
+    outcome_path: str,
+    err_path: str,
+) -> None:
+    """One bounded acquire attempt under a divergent environment; reports
+    ``admitted`` or ``excluded``. Same passwd-home seam as the holder."""
+    _make_env_divergent(private_env_dir)
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    try:
+        import hermes_state_lock as _hsl
+
+        _hsl._posix_passwd_home = lambda: Path(fake_home)
+        with _hsl.acquire_state_write_lock(
+            "env-divergence-context.db", timeout_s=0.5
+        ) as admitted:
+            Path(outcome_path).write_text(
+                "admitted" if admitted else "excluded", encoding="utf-8"
+            )
     except Exception:
         Path(err_path).write_text(traceback.format_exc(), encoding="utf-8")
 
@@ -1077,11 +1174,81 @@ class TestPrivateLockRootInvariants:
 
 
 class TestLockRootPlatformSplit:
-    def test_posix_root_is_uid_scoped_under_tempdir(self, monkeypatch):
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX root derivation")
+    def test_posix_root_is_uid_scoped_under_the_passwd_home(self, monkeypatch):
         monkeypatch.delenv("HERMES_STATE_LOCK_ROOT", raising=False)
+        import pwd
+
+        uid = os.getuid()
         root = _posix_lock_root()
-        assert str(os.getuid()) in root.name
-        assert root.parent == Path(tempfile.gettempdir())
+        assert root.name == f".hermes-state-locks-{uid}"
+        assert root.parent == Path(pwd.getpwuid(uid).pw_dir)
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX root derivation")
+    def test_posix_root_ignores_every_tempdir_and_home_env_var(
+        self, monkeypatch, tmp_path
+    ):
+        """Fase C8 (Nemo gate 20260820T144423Z): the root must be a pure
+        function of host state, so per-process TMPDIR/TEMP/TMP/HOME
+        divergence — a systemd unit's PrivateTmp=, a per-service TMPDIR=,
+        a repointed profile HOME — cannot split the global lock into two
+        sidecars. RED against C7, whose root was ``gettempdir()``-based."""
+        baseline = _posix_lock_root()
+        divergent = tmp_path / "divergent-tmp"
+        divergent.mkdir()
+        for var in ("TMPDIR", "TEMP", "TMP", "HOME"):
+            monkeypatch.setenv(var, str(divergent))
+        # Force gettempdir() to re-read the (now divergent) environment and
+        # prove the divergence is real — then prove the root ignores it.
+        monkeypatch.setattr(tempfile, "tempdir", None)
+        assert tempfile.gettempdir() == str(divergent)
+        root = _posix_lock_root()
+        assert root == baseline
+        assert str(divergent) not in str(root)
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX root derivation")
+    def test_posix_root_without_passwd_entry_falls_back_to_static_tmp(
+        self, monkeypatch, tmp_path
+    ):
+        """No usable passwd entry falls back to the *literal* ``/tmp`` —
+        never ``gettempdir()``, which would reintroduce the env dependence
+        in exactly the degraded case."""
+        monkeypatch.setattr(hermes_state_lock, "_posix_passwd_home", lambda: None)
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setattr(tempfile, "tempdir", None)
+        assert tempfile.gettempdir() == str(tmp_path)
+        root = _posix_lock_root()
+        assert root == Path("/tmp") / f"hermes-state-locks-{os.getuid()}"
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="POSIX root derivation")
+    def test_passwd_home_must_be_absolute_and_present_or_is_rejected(
+        self, monkeypatch
+    ):
+        """A missing entry, an empty ``pw_dir``, or a relative ``pw_dir``
+        (which would resolve against the per-process cwd — nondeterministic
+        in the same way an env var is) must all reject to the fallback."""
+        import pwd
+
+        def _no_entry(uid):
+            raise KeyError(uid)
+
+        monkeypatch.setattr(pwd, "getpwuid", _no_entry)
+        assert hermes_state_lock._posix_passwd_home() is None
+
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir="relative/home")
+        )
+        assert hermes_state_lock._posix_passwd_home() is None
+
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir="   ")
+        )
+        assert hermes_state_lock._posix_passwd_home() is None
+
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir="/srv/hermes")
+        )
+        assert hermes_state_lock._posix_passwd_home() == Path("/srv/hermes")
 
     def test_windows_root_is_under_localappdata(self, monkeypatch):
         monkeypatch.setenv("LOCALAPPDATA", "C:\\Users\\jose\\AppData\\Local")
@@ -1100,6 +1267,147 @@ class TestLockRootPlatformSplit:
         monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(override))
         assert _lock_root(is_windows=False) == override
         assert _lock_root(is_windows=True) == override
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="POSIX root derivation")
+class TestLockRootSurvivesEnvironmentDivergence:
+    """Fase C8 (Nemo REQUEST_CHANGES 20260820T144423Z): under C7 the root
+    was ``<gettempdir()>/hermes-state-locks-<uid>``, so two processes over
+    the same ``state.db`` whose TMPDIR/TEMP/TMP differed derived *different*
+    sidecars and were both admitted concurrently — the global lock silently
+    stopped being global, and the earlier tests never saw it because every
+    child was handed one explicit shared ``lock_root``. These tests spawn
+    real children whose environments *disagree on purpose* and share
+    nothing but the uid-level host state the C8 derivation reads."""
+
+    def test_two_processes_with_divergent_env_derive_the_same_default_root(
+        self, tmp_path
+    ):
+        """Pure derivation, no acquire: each child removes the test
+        override, points TMPDIR/TEMP/TMP/HOME at its own private directory,
+        and reports the default root it would use. Both must agree — with
+        each other, and with this parent process (a third, differently-
+        configured environment)."""
+        import pwd
+
+        ctx = mp.get_context("spawn")
+        procs, outs, errs, env_dirs = [], [], [], []
+        for i in range(2):
+            env_dir = tmp_path / f"private-env-{i}"
+            env_dir.mkdir()
+            out = tmp_path / f"root-{i}.txt"
+            err = tmp_path / f"err-{i}"
+            env_dirs.append(env_dir)
+            outs.append(out)
+            errs.append(err)
+            procs.append(
+                _spawn(
+                    ctx,
+                    _child_report_default_lock_root,
+                    (str(env_dir), str(out), str(err)),
+                )
+            )
+        for proc, err in zip(procs, errs):
+            _join_ok(proc, 30.0, err)
+
+        roots = [out.read_text(encoding="utf-8") for out in outs]
+        assert roots[0] == roots[1], (
+            "two processes of the same account derived different default "
+            f"lock roots from divergent environments: {roots}"
+        )
+        uid = os.getuid()
+        expected = Path(pwd.getpwuid(uid).pw_dir) / f".hermes-state-locks-{uid}"
+        assert roots[0] == str(expected)
+        for env_dir, root in zip(env_dirs, roots):
+            assert str(env_dir) not in root, (
+                "a child's private TMPDIR/HOME leaked into its lock root"
+            )
+
+    def test_divergent_tmpdir_processes_still_serialize_on_one_sidecar(
+        self, tmp_path
+    ):
+        """Functional half — RED against C7: a holder and a prober whose
+        TMPDIR/TEMP/TMP/HOME all disagree must still contend for one
+        sidecar. Under the C7 derivation each would have opened a sidecar
+        inside its own private tempdir and the probe would have been
+        admitted alongside the live holder."""
+        fake_home = tmp_path / "fake-passwd-home"
+        fake_home.mkdir()
+        holder_env = tmp_path / "holder-env"
+        holder_env.mkdir()
+        prober_env = tmp_path / "prober-env"
+        prober_env.mkdir()
+
+        ctx = mp.get_context("spawn")
+        ready = tmp_path / "ready"
+        release = tmp_path / "release"
+        hold_err = tmp_path / "hold-err"
+        holder = _spawn(
+            ctx,
+            _child_divergent_env_hold,
+            (
+                str(fake_home),
+                str(holder_env),
+                str(ready),
+                str(release),
+                str(hold_err),
+            ),
+        )
+        try:
+            deadline = time.monotonic() + 10.0
+            while not ready.exists():
+                if time.monotonic() > deadline:
+                    extra = (
+                        hold_err.read_text(encoding="utf-8")
+                        if hold_err.exists()
+                        else ""
+                    )
+                    pytest.fail(f"holder never acquired the write lock\n{extra}")
+                time.sleep(0.05)
+
+            outcome = tmp_path / "outcome"
+            probe_err = tmp_path / "probe-err"
+            prober = _spawn(
+                ctx,
+                _child_divergent_env_probe,
+                (str(fake_home), str(prober_env), str(outcome), str(probe_err)),
+            )
+            _join_ok(prober, 30.0, probe_err)
+            assert outcome.read_text(encoding="utf-8") == "excluded", (
+                "a prober with a divergent TMPDIR was admitted alongside a "
+                "live holder — the lock root split on per-process environment"
+            )
+        finally:
+            release.touch()
+            holder.join(10.0)
+            if holder.is_alive():
+                holder.kill()
+                holder.join(5.0)
+        _join_ok(holder, 5.0, hold_err)
+
+        # After the holder exits, a fresh process (yet another divergent
+        # environment) must be admitted — same sidecar, now free.
+        outcome2 = tmp_path / "outcome-after-release"
+        probe2_err = tmp_path / "probe2-err"
+        prober2_env = tmp_path / "prober2-env"
+        prober2_env.mkdir()
+        prober2 = _spawn(
+            ctx,
+            _child_divergent_env_probe,
+            (str(fake_home), str(prober2_env), str(outcome2), str(probe2_err)),
+        )
+        _join_ok(prober2, 30.0, probe2_err)
+        assert outcome2.read_text(encoding="utf-8") == "admitted"
+
+        # The sidecar lived under the (shared, uid-derived) home — and
+        # nothing lock-related ever appeared inside any process's private
+        # tempdir, which is where C7 would have put it.
+        root = fake_home / f".hermes-state-locks-{os.getuid()}"
+        assert (root / "global.write.lock").exists()
+        for env_dir in (holder_env, prober_env, prober2_env):
+            assert not list(env_dir.glob("*hermes-state-locks*")), (
+                f"a lock root leaked into the per-process tempdir {env_dir}"
+            )
 
 
 class TestLockOpenFlagsPortability:
