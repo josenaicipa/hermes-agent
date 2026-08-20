@@ -17,7 +17,12 @@ Why ``flock`` (and not a pidfile):
   leave an orphan that wedges every later writer.
 * Readers never take it, so WAL concurrent reads stay intact.
 * The lock file is a sibling sidecar (``state.db.write.lock``); the database
-  file, WAL and SHM are untouched.
+  file, WAL and SHM are untouched. The sidecar name is derived from the
+  symlink-resolved database path so aliases (a symlink or a different
+  relative spelling pointing at the same file) share one sidecar instead of
+  splitting admission across two. The sidecar is opened with ``O_NOFOLLOW``
+  on POSIX so a sidecar swapped for a symlink between processes is refused
+  rather than silently locked through.
 
 The lock is **not** a substitute for SQLite's own locking.  Callers still
 ``BEGIN IMMEDIATE`` and still retry on ``SQLITE_BUSY`` from holders that do
@@ -79,9 +84,39 @@ def canonical_db_key(db_path: os.PathLike | str) -> str:
 
 
 def write_lock_path(db_path: os.PathLike | str) -> Path:
-    """Return the sidecar lock path for *db_path* (``<name>.write.lock``)."""
-    path = Path(db_path)
+    """Return the sidecar lock path for *db_path* (``<name>.write.lock``).
+
+    Derived from the symlink-resolved path, not the raw spelling the caller
+    passed in.  ``canonical_db_key()`` already collapses aliases for the
+    in-process re-entrancy table; if this function used the raw path instead,
+    ``state.db`` and a symlink alias pointing at it (``alias.db ->
+    state.db``) would resolve to *different* sidecars
+    (``state.db.write.lock`` vs. ``alias.db.write.lock``) and two processes
+    could hold admission on the same underlying SQLite file at once —
+    reintroducing the exact contention/starvation this module exists to
+    remove.
+    """
+    text = str(db_path)
+    try:
+        resolved = os.path.realpath(text)
+    except OSError:
+        resolved = text
+    path = Path(resolved)
     return path.with_name(path.name + _WRITE_LOCK_SUFFIX)
+
+
+def _lock_open_flags(is_windows: bool = _IS_WINDOWS) -> int:
+    """Flags for opening the sidecar lock file.
+
+    POSIX adds ``O_NOFOLLOW`` so a sidecar an untrusted actor swapped for a
+    symlink between processes is refused (``ELOOP``) instead of silently
+    followed to whatever it points at. Windows has no equivalent open flag,
+    so the platform split is explicit here rather than inside the ``try``.
+    """
+    flags = os.O_RDWR | os.O_CREAT
+    if not is_windows:
+        flags |= os.O_NOFOLLOW
+    return flags
 
 
 def _holds() -> dict:
@@ -174,7 +209,8 @@ def acquire_state_write_lock(
     lock_path = write_lock_path(db_path)
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+b")
+        fd = os.open(str(lock_path), _lock_open_flags(), 0o644)
+        handle = os.fdopen(fd, "a+b")
     except OSError as exc:
         logger.warning(
             "Could not open state.db write lock %s (%s) — proceeding with "

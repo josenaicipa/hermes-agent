@@ -22,9 +22,16 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_lock import acquire_state_write_lock
+from hermes_state_lock import (
+    _lock_open_flags,
+    acquire_state_write_lock,
+    canonical_db_key,
+    write_lock_path,
+)
 
 REPO_ROOT = str(Path(__file__).resolve().parents[2])
+
+_HAS_SYMLINK = hasattr(os, "symlink")
 
 
 def _prepare_child_env(hermes_home: str) -> None:
@@ -348,6 +355,143 @@ class TestTwoProcessWriters:
             if holder.is_alive():
                 holder.kill()
                 holder.join(5.0)
+
+
+@pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
+class TestSymlinkAliasSharesLock:
+    """Nemo REQUEST_CHANGES (20260820T042052Z): write_lock_path() derived the
+    sidecar from the raw path while canonical_db_key() resolved symlinks, so
+    ``state.db`` and ``alias.db -> state.db`` locked different sidecars and
+    two processes could hold admission on the same SQLite file at once."""
+
+    def test_write_lock_path_matches_for_symlink_alias(self, tmp_path):
+        real_db = tmp_path / "state.db"
+        real_db.touch()
+        alias_db = tmp_path / "alias.db"
+        os.symlink(real_db, alias_db)
+
+        assert write_lock_path(real_db) == write_lock_path(alias_db)
+        assert canonical_db_key(real_db) == canonical_db_key(alias_db)
+
+    def test_alias_writer_is_blocked_by_real_path_holder(self, tmp_path):
+        real_db = tmp_path / "state.db"
+        real_db.touch()
+        alias_db = tmp_path / "alias.db"
+        os.symlink(real_db, alias_db)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            # A different thread going through the alias must see the same
+            # admission token as the real path and time out while it is held.
+            t0 = time.monotonic()
+            with acquire_state_write_lock(alias_db, timeout_s=0.25) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(alias_db, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+
+@pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
+class TestSidecarSymlinkSubstitution:
+    """A sidecar swapped for a symlink (e.g. by an untrusted co-tenant of a
+    writable directory) must not be followed: the acquire should degrade to
+    admitted rather than silently flock whatever the symlink points at."""
+
+    def test_symlinked_sidecar_is_refused_not_followed(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        target = tmp_path / "other-process.lock"
+        target.write_bytes(b"")
+        lock_path = write_lock_path(db_path)
+        os.symlink(target, lock_path)
+
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            # Degrades to admitted (same policy as a read-only directory);
+            # the important property is it never opens `target` through the
+            # symlink.
+            assert admitted is True
+
+        # The symlink itself is untouched — proof the module didn't unlink
+        # or rewrite it while degrading.
+        assert lock_path.is_symlink()
+        assert os.readlink(lock_path) == str(target)
+
+
+class TestLockOpenFlagsPortability:
+    def test_posix_adds_nofollow_against_symlink_swap(self):
+        flags = _lock_open_flags(is_windows=False)
+        assert flags & os.O_CREAT
+        assert flags & os.O_RDWR
+        assert hasattr(os, "O_NOFOLLOW")
+        assert flags & os.O_NOFOLLOW
+
+    def test_windows_has_no_nofollow_equivalent(self):
+        # msvcrt has no O_NOFOLLOW; asserting its absence here pins the
+        # platform split so it can't silently regress into OSError on
+        # Windows (O_NOFOLLOW doesn't exist in the os module there either).
+        flags = _lock_open_flags(is_windows=True)
+        assert flags == (os.O_RDWR | os.O_CREAT)
+
+
+class TestSustainedContentionNoStarvation:
+    def test_many_threads_all_make_progress_under_sustained_contention(
+        self, tmp_path
+    ):
+        """Sustained contention with more concurrent writers than the
+        earlier two/three-process tests: every writer must complete within a
+        bounded window and none may be starved outright."""
+        db_path = tmp_path / "state.db"
+        n_workers = 8
+        n_rounds = 15
+        completions: dict[int, float] = {}
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def _worker(idx: int) -> None:
+            try:
+                for _ in range(n_rounds):
+                    with acquire_state_write_lock(
+                        db_path, timeout_s=10.0
+                    ) as admitted:
+                        if not admitted:
+                            with lock:
+                                errors.append(f"worker {idx} starved")
+                            return
+                        time.sleep(0.001)
+                with lock:
+                    completions[idx] = time.monotonic()
+            except Exception as exc:  # pragma: no cover - defensive
+                with lock:
+                    errors.append(f"worker {idx}: {exc!r}")
+
+        threads = [
+            threading.Thread(target=_worker, args=(i,)) for i in range(n_workers)
+        ]
+        t0 = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30.0)
+        for t in threads:
+            assert not t.is_alive(), "worker thread hung under contention"
+
+        assert errors == []
+        assert len(completions) == n_workers
+        assert time.monotonic() - t0 < 25.0
 
 
 class TestNullActiveHealSkipsNoopWrite:
