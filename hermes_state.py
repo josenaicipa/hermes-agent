@@ -3154,10 +3154,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # so a SQLITE_BUSY from an ungated holder cannot pin the token.  Schema
     # init and each BEGIN IMMEDIATE take one slice; the existing patience
     # loop supplies the total wall-clock bound.
+    #
+    # Long maintenance (VACUUM, unbounded FTS ``'optimize'``, TRUNCATE
+    # checkpoint) must NOT hold this token for the SQLite operation. The
+    # per-user flock is an admission gate for short writes; holding it for
+    # a 12 GB rewrite starves every other state.db under the account
+    # (2026-08-20 vpsclone: auto-VACUUM monopolized ``global.write.lock``
+    # for >20 min → ``session storage was busy`` / ``database is locked``).
     _WRITE_LOCK_SLICE_S = 1.0
-    # VACUUM holds the exclusive SQLite lock for the rewrite; wait this
-    # long for sibling Hermes writers to drop the flock before starting.
-    _VACUUM_WRITE_LOCK_S = 120.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -4021,12 +4025,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *patience_s* is the total time budget for lock retries (default
         ``_WRITE_PATIENCE_S``).  Transcript-critical writes pass
         ``_TRANSCRIPT_WRITE_PATIENCE_S`` so a sibling process holding the
-        lock for a legitimate long operation (VACUUM, TRUNCATE checkpoint,
-        pre-bounded-merge FTS optimize from an older still-running
-        install) exhausts routine writers' patience without destroying a
-        user turn.  Jitter starts small (20-150ms) for fast reclaim on
-        millisecond contention and backs off to 250ms-1s once the lock has
-        been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
+        lock for a legitimate long operation (an older still-running
+        install's VACUUM that still takes the flock, a TRUNCATE checkpoint,
+        pre-bounded-merge FTS optimize) exhausts routine writers' patience
+        without destroying a user turn.  Current vacuum/auto-maintenance
+        paths must not be that holder — they do not take the per-user
+        flock for the rewrite.  Jitter starts small (20-150ms) for fast
+        reclaim on millisecond contention and backs off to 250ms-1s once
+        the lock has been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
 
         Returns whatever *fn* returns.
         """
@@ -12877,9 +12883,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         VACUUM rewrites the entire DB, so it's expensive (seconds per
         100MB) and cannot run inside a transaction. It also acquires an
-        exclusive lock, so callers must ensure no other writers are
-        active. Safe to call at startup before the gateway/CLI starts
-        serving traffic.
+        exclusive SQLite lock on THIS file. Callers must not treat that as
+        a reason to hold the per-user write-admission flock: that token is
+        shared by every Hermes state database under the OS account, and a
+        12 GB rewrite holding it starves Gateway / ACP / other-profile
+        writers for tens of minutes (2026-08-20 vpsclone). SQLite's own
+        exclusive lock already serializes writers on this file; WAL
+        readers stay concurrent until VACUUM actually needs exclusive.
+
+        This is an explicit operator command (``hermes sessions vacuum`` /
+        ``optimize``), not automatic maintenance. Auto-prune defers VACUUM
+        so a live gateway's ``append_message`` cannot expire behind it.
 
         FTS5 segments are merged first via :meth:`optimize_fts` so the
         subsequent VACUUM reclaims the pages freed by the merge. This is a
@@ -12889,50 +12903,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         merge step failed or no FTS tables exist).
         """
         # Merge FTS5 segments before VACUUM so the freed pages are returned
-        # to the OS in the same pass. optimize_fts() manages its own lock.
+        # to the OS in the same pass. optimize_fts() uses the in-process
+        # lock only — never the per-user flock.
         optimized = 0
         try:
             optimized = self.optimize_fts()
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
-        # VACUUM cannot be executed inside a transaction.  Take the
-        # cross-process flock first so a live gateway's append_message waits
-        # on admission instead of hammering SQLITE_BUSY for its whole
-        # patience window; the kernel drops the flock if this process dies
-        # mid-rewrite.
-        with acquire_state_write_lock(
-            self.db_path, timeout_s=self._VACUUM_WRITE_LOCK_S
-        ) as admitted:
-            if not admitted:
-                raise sqlite3.OperationalError(
-                    "database is locked (another Hermes process held the "
-                    "state.db write lock; the database itself is healthy)"
+        # VACUUM cannot run inside a transaction. Do NOT take
+        # acquire_state_write_lock around this rewrite: the flock is the
+        # short-write admission token for every state.db under this
+        # account, and holding it here is the class of bug that turned a
+        # local exclusive rewrite into a host-wide "session storage was
+        # busy" outage. SQLite exclusive on this connection is enough for
+        # this file; other databases and WAL readers proceed.
+        with self._lock:
+            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
+            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
+            # CLI process, and a TRUNCATE reset here would race a live gateway
+            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
+            # itself; journal_size_limit bounds the file.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception as exc:
+                logger.debug(
+                    "WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc
                 )
-            with self._lock:
-                # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
-                # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
-                # CLI process, and a TRUNCATE reset here would race a live gateway
-                # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
-                # itself; journal_size_limit bounds the file.
+            self._conn.execute("VACUUM")
+            # ...and again afterwards. VACUUM rewrites every page THROUGH the
+            # WAL, so the pre-VACUUM checkpoint above does nothing for the
+            # slack VACUUM itself creates: on a 3.0 GB database it left a
+            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
+            # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
+            # filling the host to 100%. Truncating here is what makes the
+            # command a net win instead of a net loss on large databases
+            # when we are the only writer. If a sibling already has a
+            # lock, TRUNCATE must fail closed (PASSIVE) rather than race
+            # them — we no longer hold the per-user flock across this
+            # window, so #45383 is a live risk again if we insist on
+            # TRUNCATE.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as exc:
+                logger.debug(
+                    "WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc
+                )
                 try:
                     self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except Exception as exc:
+                except Exception as passive_exc:
                     logger.debug(
-                        "WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc
-                    )
-                self._conn.execute("VACUUM")
-                # ...and again afterwards. VACUUM rewrites every page THROUGH the
-                # WAL, so the pre-VACUUM checkpoint above does nothing for the
-                # slack VACUUM itself creates: on a 3.0 GB database it left a
-                # 3.07 GB state.db-wal behind, so `sessions optimize` reported
-                # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
-                # filling the host to 100%. Truncating here is what makes the
-                # command a net win instead of a net loss on large databases.
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception as exc:
-                    logger.debug(
-                        "WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc
+                        "WAL checkpoint (PASSIVE) after VACUUM failed: %s",
+                        passive_exc,
                     )
         return optimized
 
@@ -12947,11 +12968,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Idempotent auto-maintenance: prune inactive sessions + optional VACUUM.
 
         Records the last run timestamp in state_meta so subsequent calls
-        within ``min_interval_hours`` no-op. VACUUM has its own, typically
-        longer, throttle controlled by ``min_vacuum_interval_days`` so routine
-        pruning does not repeatedly rewrite the database. Designed to be
-        called once at startup from long-lived entrypoints (CLI, gateway, cron
-        scheduler).
+        within ``min_interval_hours`` no-op. VACUUM is **never** started
+        from this path: a production rewrite holds exclusive SQLite access
+        for tens of minutes and used to monopolize the per-user write
+        flock as well (2026-08-20 vpsclone). ``vacuum`` /
+        ``min_vacuum_interval_days`` still decide whether reclaim is
+        *due*; when it is, the result records ``vacuum_deferred`` so an
+        operator can run ``hermes sessions vacuum`` while writers are idle.
+        Designed to be called once at startup from long-lived entrypoints
+        (CLI, gateway, cron scheduler) without blocking them.
 
         When *sessions_dir* is provided, on-disk transcript files
         (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
@@ -12963,7 +12988,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns a dict with keys:
           - ``"skipped"`` (bool) — true if within min_interval_hours of last run
           - ``"pruned"`` (int)   — number of sessions deleted
-          - ``"vacuumed"`` (bool) — true if VACUUM ran
+          - ``"vacuumed"`` (bool) — always false here (auto-VACUUM is deferred)
+          - ``"vacuum_deferred"`` (bool, optional) — true when a VACUUM was
+            due and skipped so interactive writers are not blocked
           - ``"error"`` (str, optional) — present only on failure
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
@@ -12986,13 +13013,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             result["pruned"] = pruned
 
-            # Only VACUUM if we actually freed rows, and no more often than
-            # once every min_vacuum_interval_days -- a large prune (e.g. the
-            # first one to cross retention_days on a DB with tens of
-            # thousands of rows) can free enough pages that pruned > 0 fires
-            # on every subsequent startup even though a VACUUM already ran
-            # recently. VACUUM on this DB's size (FTS5 shadow tables) is not
-            # cheap -- it holds an exclusive lock for the full rewrite.
+            # Automatic VACUUM is deferred even when a rewrite is due.
+            # A large prune used to trip vacuum() on the next startup while
+            # the gateway/ACPs were live; on a 12 GB DB that held the
+            # per-user flock for >20 min (2026-08-20). last_vacuum is left
+            # unset so an explicit `hermes sessions vacuum` is still
+            # advertised as due.
             last_vacuum_raw = self.get_meta("last_vacuum")
             vacuum_due = True
             if last_vacuum_raw:
@@ -13001,12 +13027,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except (TypeError, ValueError):
                     vacuum_due = True
             if vacuum and pruned > 0 and vacuum_due:
-                try:
-                    self.vacuum()
-                    result["vacuumed"] = True
-                    self.set_meta("last_vacuum", str(now))
-                except Exception as exc:
-                    logger.warning("state.db VACUUM failed: %s", exc)
+                result["vacuum_deferred"] = True
 
             # Record the attempt even if pruned == 0, so we don't retry
             # every startup within the min_interval_hours window.
@@ -13017,7 +13038,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "state.db auto-maintenance: pruned %d session(s) inactive for %d days%s",
                     pruned,
                     retention_days,
-                    " + VACUUM" if result["vacuumed"] else "",
+                    " (VACUUM deferred)" if result.get("vacuum_deferred") else "",
                 )
         except Exception as exc:
             # Maintenance must never block startup. Log and return error marker.

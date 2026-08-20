@@ -2502,8 +2502,10 @@ def _run_state_db_auto_maintenance(session_db) -> None:
     deep-merges DEFAULT_CONFIG, so unmigrated configs still get default
     values). Honours ``auto_prune`` / ``retention_days`` /
     ``vacuum_after_prune`` / ``min_vacuum_interval_days`` /
-    ``min_interval_hours``, and delegates to the DB. Never raises —
-    maintenance must never block interactive startup.
+    ``min_interval_hours``, and delegates to the DB. Automatic VACUUM is
+    deferred by the DB layer so this cannot monopolize the per-user write
+    flock during startup. Never raises — maintenance must never block
+    interactive startup.
     """
     if session_db is None:
         return

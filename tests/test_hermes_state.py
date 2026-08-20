@@ -2600,16 +2600,19 @@ class TestVacuum:
         # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
 
-    def test_auto_maintenance_records_successful_vacuum(self, db, monkeypatch):
+    def test_auto_maintenance_defers_vacuum(self, db, monkeypatch):
+        """Auto-prune must not start VACUUM — that rewrite monopolized the
+        per-user write flock for >20 min on a live 12 GB DB (2026-08-20)."""
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
         vacuum_calls = []
         monkeypatch.setattr(db, "vacuum", lambda: vacuum_calls.append(True))
 
         result = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
-        assert result["vacuumed"] is True
-        assert vacuum_calls == [True]
-        assert db.get_meta("last_vacuum") is not None
+        assert result["vacuumed"] is False
+        assert result.get("vacuum_deferred") is True
+        assert vacuum_calls == []
+        assert db.get_meta("last_vacuum") is None
 
     def test_auto_maintenance_skips_recent_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
@@ -2623,9 +2626,10 @@ class TestVacuum:
         )
 
         assert result["vacuumed"] is False
+        assert result.get("vacuum_deferred") is not True
         assert vacuum_calls == []
 
-    def test_auto_maintenance_retries_after_vacuum_interval(self, db, monkeypatch):
+    def test_auto_maintenance_still_defers_after_vacuum_interval(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
         db.set_meta("last_vacuum", str(time.time() - 31 * 86400))
         vacuum_calls = []
@@ -2636,30 +2640,26 @@ class TestVacuum:
             min_vacuum_interval_days=30,
         )
 
-        assert result["vacuumed"] is True
-        assert vacuum_calls == [True]
+        assert result["vacuumed"] is False
+        assert result.get("vacuum_deferred") is True
+        assert vacuum_calls == []
+        assert db.get_meta("last_vacuum") is not None  # previous stamp kept
 
-    def test_auto_maintenance_retries_after_failed_vacuum(self, db, monkeypatch):
+    def test_auto_maintenance_does_not_invoke_vacuum_on_failure_path(
+        self, db, monkeypatch
+    ):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
-        vacuum_calls = []
 
-        def fail_first_vacuum():
-            vacuum_calls.append(True)
-            if len(vacuum_calls) == 1:
-                raise RuntimeError("vacuum failed")
+        def fail_if_called():
+            raise AssertionError("auto-maintenance must not call vacuum()")
 
-        monkeypatch.setattr(db, "vacuum", fail_first_vacuum)
+        monkeypatch.setattr(db, "vacuum", fail_if_called)
 
         first = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
 
         assert first["vacuumed"] is False
+        assert first.get("vacuum_deferred") is True
         assert db.get_meta("last_vacuum") is None
-
-        second = db.maybe_auto_prune_and_vacuum(min_interval_hours=0)
-
-        assert second["vacuumed"] is True
-        assert vacuum_calls == [True, True]
-        assert db.get_meta("last_vacuum") is not None
 
     def test_wal_size_limit_is_bounded(self, db):
         """journal_size_limit must be a finite bound, not SQLite's -1 default.
@@ -2791,7 +2791,7 @@ class TestAutoMaintenance:
         )
         db._conn.commit()
 
-    def test_first_run_prunes_and_vacuums(self, db):
+    def test_first_run_prunes_and_defers_vacuum(self, db):
         self._make_old_ended(db, "old1", days_old=100)
         self._make_old_ended(db, "old2", days_old=100)
         db.create_session(session_id="new", source="cli")  # active, must survive
@@ -2799,7 +2799,8 @@ class TestAutoMaintenance:
         result = db.maybe_auto_prune_and_vacuum(retention_days=90)
         assert result["skipped"] is False
         assert result["pruned"] == 2
-        assert result["vacuumed"] is True
+        assert result["vacuumed"] is False
+        assert result.get("vacuum_deferred") is True
         assert result.get("error") is None
         assert db.get_session("old1") is None
         assert db.get_session("old2") is None

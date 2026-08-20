@@ -9,7 +9,11 @@ another writer) holds the lock — the 2026-08-19 vpsclone incident.
 
 An in-process gate cannot fix that class.  This module is the cross-process
 half: one ``flock``/``msvcrt.locking`` admission token, acquired around
-schema init and around each ``BEGIN IMMEDIATE``.
+schema init and around each ``BEGIN IMMEDIATE``.  It is **not** acquired
+around VACUUM, unbounded FTS ``'optimize'``, or a WAL TRUNCATE checkpoint
+— those hold SQLite exclusive on one file for minutes-to-hours, and pinning
+the per-user token for that window starves every other state.db under the
+account (2026-08-20 vpsclone auto-VACUUM outage).
 
 Why ``flock`` (and not a pidfile):
 

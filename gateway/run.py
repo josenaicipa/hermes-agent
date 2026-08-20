@@ -7072,11 +7072,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_db_init_error = str(e)
 
         # Opportunistic state.db maintenance: prune ended sessions inactive
-        # for sessions.retention_days + optional VACUUM. Tracks last-run
-        # in state_meta so it only actually executes once per
-        # sessions.min_interval_hours.  Gateway is long-lived so blocking
-        # a few seconds once per day is acceptable; failures are logged
-        # but never raised.
+        # for sessions.retention_days. Tracks last-run in state_meta so it
+        # only actually executes once per sessions.min_interval_hours.
+        # Automatic VACUUM is deferred inside maybe_auto_prune_and_vacuum
+        # (a production rewrite is tens of minutes and must not monopolize
+        # the per-user write flock while this process is about to serve).
+        # Failures are logged but never raised.
         if self._session_db is not None:
             try:
                 from hermes_cli.config import load_config as _load_full_config
