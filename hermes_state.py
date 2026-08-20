@@ -48,6 +48,7 @@ from hermes_cli.sqlite_runtime import (
 )
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
+from hermes_state_lock import acquire_state_write_lock
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
@@ -3148,6 +3149,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
+    # One slice of the cross-process write flock (see hermes_state_lock).
+    # A polling slice, not a budget: admission is released between slices
+    # so a SQLITE_BUSY from an ungated holder cannot pin the token.  Schema
+    # init and each BEGIN IMMEDIATE take one slice; the existing patience
+    # loop supplies the total wall-clock bound.
+    _WRITE_LOCK_SLICE_S = 1.0
+    # VACUUM holds the exclusive SQLite lock for the rewrite; wait this
+    # long for sibling Hermes writers to drop the flock before starting.
+    _VACUUM_WRITE_LOCK_S = 120.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -3429,7 +3439,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                self._init_schema_under_write_lock()
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -3964,6 +3974,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _init_schema_under_write_lock(
+        self, timeout_s: Optional[float] = None
+    ) -> None:
+        """Run ``_init_schema`` while holding the cross-process write flock.
+
+        Schema init bypasses :meth:`_execute_write` (multi-statement
+        migrations must not be replayed mid-sequence), so without this
+        wrapper a Dashboard ``SessionDB()`` and a Gateway ``append_message``
+        contend only at SQLite — unfair, and the opener's 1 s busy_timeout
+        loses.  The flock serializes those writers; the kernel drops it if
+        the opener dies.  Readers never take it.
+
+        Raises ``sqlite3.OperationalError("database is locked")`` when the
+        slice expires so the constructor's jittered patience loop retries.
+        """
+        if timeout_s is None:
+            timeout_s = self._WRITE_LOCK_SLICE_S
+        with acquire_state_write_lock(self.db_path, timeout_s=timeout_s) as admitted:
+            if not admitted:
+                raise sqlite3.OperationalError("database is locked")
+            self._init_schema()
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -3980,6 +4012,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         On ``database is locked``, we release the Python lock, sleep a
         random jitter, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
+
+        Cross-process admission (``acquire_state_write_lock``) is taken for
+        each attempt and released before the retry sleep, so Gateway /
+        Dashboard / ACP do not starve each other at SQLite and a dead
+        holder cannot leave an orphan lock.  Readers never take the flock.
 
         *patience_s* is the total time budget for lock retries (default
         ``_WRITE_PATIENCE_S``).  Transcript-critical writes pass
@@ -4012,18 +4049,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise sqlite3.OperationalError(
+                        f"database is locked (another Hermes process held the "
+                        f"state.db write lock for over {patience_s:.0f}s — "
+                        "likely a long maintenance operation such as VACUUM, "
+                        "a large WAL checkpoint, or an older pre-update "
+                        "process; the database itself is healthy)"
+                    )
+                with acquire_state_write_lock(
+                    self.db_path,
+                    timeout_s=min(self._WRITE_LOCK_SLICE_S, remaining),
+                ) as admitted:
+                    if not admitted:
+                        raise sqlite3.OperationalError("database is locked")
+                    with self._lock:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                # Success — flock already released. Periodic best-effort
+                # checkpoint + FTS merge must not hold admission.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
@@ -4181,7 +4234,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 apply_database_pragmas(new_conn, db_label="state.db")
                 new_conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
-                self._init_schema()
+                self._init_schema_under_write_lock(
+                    timeout_s=self._WRITE_PATIENCE_S
+                )
         except Exception as exc:
             logger.error(
                 "state.db reconnect after 'file is not a database' failed (%s); "
@@ -12825,29 +12880,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             optimized = self.optimize_fts()
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
-        # VACUUM cannot be executed inside a transaction.
-        with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
-            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
-            # CLI process, and a TRUNCATE reset here would race a live gateway
-            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
-            # itself; journal_size_limit bounds the file.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
-            # ...and again afterwards. VACUUM rewrites every page THROUGH the
-            # WAL, so the pre-VACUUM checkpoint above does nothing for the
-            # slack VACUUM itself creates: on a 3.0 GB database it left a
-            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
-            # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
-            # filling the host to 100%. Truncating here is what makes the
-            # command a net win instead of a net loss on large databases.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
+        # VACUUM cannot be executed inside a transaction.  Take the
+        # cross-process flock first so a live gateway's append_message waits
+        # on admission instead of hammering SQLITE_BUSY for its whole
+        # patience window; the kernel drops the flock if this process dies
+        # mid-rewrite.
+        with acquire_state_write_lock(
+            self.db_path, timeout_s=self._VACUUM_WRITE_LOCK_S
+        ) as admitted:
+            if not admitted:
+                raise sqlite3.OperationalError(
+                    "database is locked (another Hermes process held the "
+                    "state.db write lock; the database itself is healthy)"
+                )
+            with self._lock:
+                # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
+                # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
+                # CLI process, and a TRUNCATE reset here would race a live gateway
+                # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
+                # itself; journal_size_limit bounds the file.
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as exc:
+                    logger.debug(
+                        "WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc
+                    )
+                self._conn.execute("VACUUM")
+                # ...and again afterwards. VACUUM rewrites every page THROUGH the
+                # WAL, so the pre-VACUUM checkpoint above does nothing for the
+                # slack VACUUM itself creates: on a 3.0 GB database it left a
+                # 3.07 GB state.db-wal behind, so `sessions optimize` reported
+                # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
+                # filling the host to 100%. Truncating here is what makes the
+                # command a net win instead of a net loss on large databases.
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception as exc:
+                    logger.debug(
+                        "WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc
+                    )
         return optimized
 
     def maybe_auto_prune_and_vacuum(

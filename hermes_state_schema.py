@@ -862,20 +862,30 @@ class SessionSchemaMixin:
         # column (idx_messages_session_active) — same ordering constraint.
         cursor.executescript(DEFERRED_INDEX_SQL)
 
-        # Heal NULL ``active`` rows unconditionally on every startup.
-        # On real-world DBs the reconciler-added ``active`` column can lack
-        # its NOT NULL DEFAULT 1 (older reconciler builds reconstructed the
-        # type without the default — see #51646: PRAGMA shows
+        # Heal NULL ``active`` rows when any still exist.  On real-world DBs
+        # the reconciler-added ``active`` column can lack its NOT NULL
+        # DEFAULT 1 (older reconciler builds reconstructed the type without
+        # the default — see #51646: PRAGMA shows
         # (17,'active','INTEGER',0,None,0) in the wild), so INSERTs that
         # omitted the column wrote NULL and the ``WHERE active = 1``
         # transcript loaders hid the whole history.  The INSERTs now set
         # active=1 explicitly; this idempotent repair un-hides rows written
         # before the fix.  It was previously gated at ``current_version <
-        # 12`` which never re-ran for already-v12+ databases.
+        # 12`` which never re-ran for already-v12+ databases, then run as a
+        # write on every open — a RESERVED lock plus a WAL frame even when
+        # ``idx_messages_active_null`` proved the table clean, which is how
+        # a Dashboard ``SessionDB()`` starved Gateway appends on a shared
+        # multi-GB store.  The EXISTS probe is a WAL snapshot read against
+        # that partial index (empty = no rows) and does not take the write
+        # lock; the UPDATE runs only when it can do work.
         try:
-            cursor.execute(
-                "UPDATE messages SET active = 1 WHERE active IS NULL"
-            )
+            needs_heal = cursor.execute(
+                "SELECT 1 FROM messages WHERE active IS NULL LIMIT 1"
+            ).fetchone()
+            if needs_heal is not None:
+                cursor.execute(
+                    "UPDATE messages SET active = 1 WHERE active IS NULL"
+                )
         except sqlite3.OperationalError:
             pass
 
