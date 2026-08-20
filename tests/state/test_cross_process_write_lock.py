@@ -32,6 +32,7 @@ import pytest
 
 from hermes_state import SessionDB
 from hermes_state_lock import (
+    _is_case_insensitive_fs,
     _lock_open_flags,
     _lock_root,
     _posix_lock_root,
@@ -44,6 +45,7 @@ from hermes_state_lock import (
 REPO_ROOT = str(Path(__file__).resolve().parents[2])
 
 _HAS_SYMLINK = hasattr(os, "symlink")
+_HAS_HARDLINK = hasattr(os, "link")
 _IS_WINDOWS = sys.platform == "win32"
 
 
@@ -474,6 +476,103 @@ class TestSymlinkAliasSharesLock:
 
         with acquire_state_write_lock(alias_db, timeout_s=1.0) as admitted:
             assert admitted is True
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
+class TestCaseInsensitiveAliasSharesLock:
+    """Gate 20260820T124010Z: ``canonical_db_key()`` folded case with
+    ``os.path.normcase``, but ``normcase`` is the identity function on every
+    POSIX platform, including macOS — regardless of whether the underlying
+    volume is case-insensitive. macOS's default APFS/HFS+ volumes *are*
+    case-insensitive (case-preserving), so ``State.db`` and ``state.db`` can
+    be the very same on-disk file there, yet the old ``canonical_db_key``
+    hashed them to two different keys and split admission across two
+    sidecars — the same class of bug ``TestSymlinkAliasSharesLock`` covers
+    for symlinks, just reached through case instead of a link.
+
+    A genuinely case-insensitive volume isn't available on every runner this
+    suite executes on, but the property under test — two spellings that name
+    the same file must canonicalize identically — doesn't require one: a
+    hardlink from a differently-cased name onto the same inode reproduces
+    exactly what a case-insensitive lookup resolves to, without depending on
+    the host filesystem's own case sensitivity. The alias is built with
+    ``str.swapcase()`` (not a single flipped letter) because that is exactly
+    what :func:`hermes_state_lock._is_case_insensitive_fs` probes with —
+    matching it exactly is what lets the hardlink stand in for a real
+    case-insensitive volume, where *every* case spelling of the name
+    (single-letter or fully swapped) would land on the one directory entry.
+    """
+
+    @pytest.mark.skipif(not _HAS_HARDLINK, reason="platform has no os.link")
+    def test_write_lock_path_matches_for_differently_cased_alias(self, tmp_path):
+        real_db = tmp_path / "state.db"
+        real_db.touch()
+        cased_alias = tmp_path / real_db.name.swapcase()
+        os.link(real_db, cased_alias)
+
+        assert write_lock_path(real_db) == write_lock_path(cased_alias)
+        assert canonical_db_key(real_db) == canonical_db_key(cased_alias)
+
+    @pytest.mark.skipif(not _HAS_HARDLINK, reason="platform has no os.link")
+    def test_alias_writer_is_blocked_by_differently_cased_holder(self, tmp_path):
+        real_db = tmp_path / "state.db"
+        real_db.touch()
+        cased_alias = tmp_path / real_db.name.swapcase()
+        os.link(real_db, cased_alias)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            # A different thread going through the differently-cased alias
+            # must see the same admission token as the real path and time
+            # out while it is held.
+            t0 = time.monotonic()
+            with acquire_state_write_lock(cased_alias, timeout_s=0.25) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(cased_alias, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+    def test_genuinely_distinct_files_differing_only_in_case_are_not_merged(
+        self, tmp_path
+    ):
+        """The probe must not report false positives: two *separate* files
+        that happen to differ only in case (no hardlink, no symlink between
+        them) must keep separate keys — merging them would let a writer on
+        one file believe it holds admission over the other."""
+        lower_db = tmp_path / "state.db"
+        lower_db.write_bytes(b"lower")
+        upper_db = tmp_path / "State.db"
+        upper_db.write_bytes(b"upper")
+
+        assert not _is_case_insensitive_fs(str(lower_db))
+        assert canonical_db_key(lower_db) != canonical_db_key(upper_db)
+        assert write_lock_path(lower_db) != write_lock_path(upper_db)
+
+    def test_basename_with_no_cased_characters_is_not_probed_as_insensitive(
+        self, tmp_path
+    ):
+        digits_db = tmp_path / "12345.db"
+        digits_db.touch()
+        assert _is_case_insensitive_fs(str(digits_db)) is False
+
+    def test_missing_path_probes_as_not_case_insensitive(self, tmp_path):
+        missing = tmp_path / "does-not-exist.db"
+        assert _is_case_insensitive_fs(str(missing)) is False
 
 
 class TestLegacyColocationNoLongerMatters:

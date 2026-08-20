@@ -58,10 +58,12 @@ entry for it to unlink or replace in the first place:
   tampering distinction as POSIX).
 
 The sidecar's *name* inside that root is a stable hash of
-``canonical_db_key()`` (which already resolves symlinks and case-folds), not
-the raw ``db_path``, so ``state.db`` and any alias pointing at it — a
-symlink, or a different relative spelling — share one lock file instead of
-splitting admission across two.
+``canonical_db_key()`` (which resolves symlinks and, where the underlying
+filesystem actually folds case, case-folds too — see the note on
+``canonical_db_key`` below), not the raw ``db_path``, so ``state.db`` and
+any alias pointing at it — a symlink, a different relative spelling, or a
+differently-cased spelling on a case-insensitive volume — share one lock
+file instead of splitting admission across two.
 
 The old symlink-swap (``O_NOFOLLOW``) and hardlink-swap (``fstat``/``lstat``
 identity) defenses are kept as defense-in-depth: they now protect against
@@ -146,14 +148,67 @@ class _LockRootUnsafe(Exception):
 def canonical_db_key(db_path: os.PathLike | str) -> str:
     """Canonicalize a database path so aliases share one lock.
 
-    ``realpath`` collapses symlinks and relative spellings; ``normcase``
-    folds case on filesystems where the OS does (macOS, Windows).
+    ``realpath`` collapses symlinks and relative spellings. Case is trickier
+    than ``os.path.normcase`` alone can handle: ``normcase`` only folds case
+    on Windows (``ntpath``) — on every POSIX platform, including macOS,
+    ``posixpath.normcase`` is the identity function, regardless of whether
+    the actual filesystem underneath is case-insensitive. macOS's default
+    APFS/HFS+ volumes *are* case-insensitive (case-preserving), so
+    ``State.db`` and ``state.db`` can be the same on-disk file even though
+    ``normcase`` alone would hash them to two different keys and split
+    admission across two sidecars — the exact bypass this function exists to
+    prevent for symlink aliases.
+
+    There is no static "is this platform case-insensitive" answer (a volume
+    can be formatted case-sensitive on macOS, and a case-sensitive network
+    share can be mounted on any OS), so case-folding is decided by probing
+    the resolved path's own filesystem via :func:`_is_case_insensitive_fs`
+    rather than switching on ``sys.platform``.
     """
     text = str(db_path)
     try:
-        return os.path.normcase(os.path.realpath(text))
+        real = os.path.realpath(text)
     except OSError:
         return os.path.normcase(text)
+    if not _IS_WINDOWS and _is_case_insensitive_fs(real):
+        real = real.lower()
+    return os.path.normcase(real)
+
+
+def _is_case_insensitive_fs(real_path: str) -> bool:
+    """Probe whether *real_path*'s filesystem folds case on lookup.
+
+    ``os.path.normcase`` cannot answer this on POSIX (see
+    :func:`canonical_db_key`), so this stats the same directory entry twice:
+    once by its real spelling, once by a case-swapped spelling of just the
+    basename. If both stats land on the same ``(st_dev, st_ino)``, the
+    filesystem folded the case difference away on lookup — case-insensitive.
+    A mismatch, a missing swapped entry, or any ``OSError`` (including
+    ``ENOENT``, e.g. the db not created yet) means "cannot prove
+    case-insensitive", so callers keep the case as-is rather than fold it —
+    failing toward the existing (already correct) symlink-alias behavior,
+    never toward silently merging two genuinely distinct files.
+
+    ``swapcase`` rather than ``upper``/``lower`` alone so a basename that
+    happens to already be all-lowercase (or all-uppercase) still produces a
+    differently-spelled candidate to probe with. A basename with no cased
+    characters at all (e.g. ``"12345.db"``) has nothing to swap — folding
+    case would be a no-op on it anyway, so returning ``False`` there costs
+    nothing.
+    """
+    directory, name = os.path.split(real_path)
+    swapped = name.swapcase()
+    if swapped == name:
+        return False
+    try:
+        original_stat = os.stat(real_path)
+        swapped_stat = os.stat(os.path.join(directory, swapped))
+    except OSError:
+        return False
+    return (original_stat.st_dev, original_stat.st_ino) == (
+        swapped_stat.st_dev,
+        swapped_stat.st_ino,
+    )
 
 
 def _posix_lock_root() -> Path:
