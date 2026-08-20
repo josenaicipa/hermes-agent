@@ -59,11 +59,13 @@ entry for it to unlink or replace in the first place:
 
 The sidecar's *name* inside that root is a stable hash of
 ``canonical_db_key()`` (which resolves symlinks and, where the underlying
-filesystem actually folds case, case-folds too — see the note on
-``canonical_db_key`` below), not the raw ``db_path``, so ``state.db`` and
-any alias pointing at it — a symlink, a different relative spelling, or a
-differently-cased spelling on a case-insensitive volume — share one lock
-file instead of splitting admission across two.
+filesystem actually folds case and/or Unicode normalization, folds those
+too — see the note on ``canonical_db_key`` below), not the raw ``db_path``,
+so ``state.db`` and any alias pointing at it — a symlink, a different
+relative spelling, a differently-cased spelling on a case-insensitive
+volume, or a differently Unicode-normalized (NFC vs NFD) spelling on a
+normalization-insensitive volume — share one lock file instead of
+splitting admission across two.
 
 The old symlink-swap (``O_NOFOLLOW``) and hardlink-swap (``fstat``/``lstat``
 identity) defenses are kept as defense-in-depth: they now protect against
@@ -149,6 +151,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -160,7 +163,13 @@ _WRITE_LOCK_SUFFIX = ".write.lock"
 _LOCK_ROOT_PREFIX = "hermes-state-locks"
 _ROOT_MODE = 0o700
 _CASE_PROBE_PREFIX = "HermesCaseProbe-"
-_CASE_PROBE_ATTEMPTS = 4
+_NORM_PROBE_PREFIX = "HermesNormProbe-"
+# LATIN SMALL LETTER E WITH ACUTE — has a real canonical decomposition
+# ("e" + U+0301 COMBINING ACUTE ACCENT), so appending it gives every probe
+# name a genuine NFC-vs-NFD distinction to test, the normalization
+# counterpart of _CASE_PROBE_PREFIX needing cased characters to swap.
+_NORM_PROBE_NFC_MARKER = "é"
+_PROBE_ATTEMPTS = 4
 
 # thread ident -> {canonical key: _Hold}.  Depth is per-thread so a nested
 # acquire on the same path does not open a second fd and self-deadlock
@@ -232,20 +241,129 @@ def canonical_db_key(db_path: os.PathLike | str) -> str:
     admission across two sidecars — the exact bypass this function exists to
     prevent for symlink aliases.
 
-    There is no static "is this platform case-insensitive" answer (a volume
-    can be formatted case-sensitive on macOS, and a case-sensitive network
-    share can be mounted on any OS), so case-folding is decided by probing
-    the resolved path's own filesystem via :func:`_is_case_insensitive_fs`
-    rather than switching on ``sys.platform``.
+    Unicode adds two more axes ``normcase`` cannot fold on any platform:
+    ``str.lower()`` is not Unicode caseless matching (``'ß'.lower() == 'ß'``,
+    unchanged, while ``'ß'.casefold() == 'ss'``), and normalization form
+    (NFC vs NFD — e.g. a precomposed "é" vs "e" + a combining accent) is an
+    entirely separate distinction ``.lower()``/``.casefold()`` never touch.
+    APFS's default mode folds both. See :func:`_fold_alias_spelling` for how
+    those two axes are handled without extending the same guess-a-transform
+    approach case-folding started with — that approach only ever proves
+    convergence for the specific transforms it happens to construct
+    (``swapcase()``, NFC-vs-NFD), and real Unicode aliasing is not limited to
+    those (a compatibility ligature like "ﬁ" case-folds to "fi" but is
+    neither a case-swap nor a canonical decomposition of it).
+
+    There is no static "is this platform case/normalization-insensitive"
+    answer (a volume can be formatted case-sensitive on macOS, and a
+    case-sensitive network share can be mounted on any OS), so folding is
+    decided per resolved path rather than by switching on ``sys.platform``.
     """
     text = str(db_path)
     try:
         real = os.path.realpath(text)
     except OSError:
         return os.path.normcase(text)
-    if not _IS_WINDOWS and _is_case_insensitive_fs(real):
-        real = real.lower()
-    return os.path.normcase(real)
+    if _IS_WINDOWS:
+        # ntpath.normcase already folds case; Unicode normalization is not
+        # folded by NTFS, so there is nothing else to do here.
+        return os.path.normcase(real)
+    return os.path.normcase(_fold_alias_spelling(real))
+
+
+def _fold_alias_spelling(real_path: str) -> str:
+    """POSIX alias folding for an already symlink-resolved *real_path*.
+
+    For a target that already exists, this prefers the resolved object's own
+    stable identity — ``(st_dev, st_ino)`` — over guessing which Unicode
+    transform an alias might use. It builds the single, fully-folded
+    candidate spelling (``unicodedata.normalize("NFC", ...)`` then
+    ``str.casefold()``) and asks the filesystem itself, via ``os.stat``,
+    whether that candidate names the same object as *real_path*. That is one
+    comprehensive, non-guessing check: unlike probing individual
+    hand-picked transforms (a case swap, or NFC vs NFD), it also converges
+    aliases those specific probes never construct — a compatibility ligature
+    that case-folds to plain letters, Turkish dotted/dotless I, German
+    ß-vs-ss, anything Unicode's real case/normalization tables cover that
+    this module's synthetic probes do not enumerate.
+
+    Deliberately NOT ``f"{st_dev}:{st_ino}"`` as the returned key: the
+    schema-init race this module exists to close (two sibling processes
+    racing to *create* ``state.db``) happens precisely during the window
+    where the file transitions from not-existing to existing. If the
+    returned key's *format* changed at that transition (text before, raw
+    identity after), a process that computed the pre-existence key and is
+    still holding its sidecar could be joined by a sibling that computes the
+    identity-based key moments later — once the creator's ``sqlite3.connect``
+    has touched the file into existence but before schema init finishes and
+    the pre-existence key's sidecar is released — landing on a *different*
+    sidecar and getting admitted concurrently. That is the exact bug this
+    module exists to prevent, reintroduced by the key format itself. Staying
+    string-valued and derived only from *real_path* sidesteps it: the
+    fold-or-not decision this function makes is answering the same
+    time-invariant question (does an alias of this spelling resolve to the
+    same object) regardless of whether it is answered via direct identity
+    comparison (object exists) or via :func:`_fold_by_probed_capability`
+    (object does not exist yet, so the containing directory's own folding
+    behavior is probed instead) — both branches necessarily agree for the
+    same location, because neither is testing something that changes from
+    one moment to the next, only whether *this* filesystem folds at all. See
+    ``TestUnicodeAliasConvergesViaStableIdentity`` and
+    ``TestNewDatabaseNormalizationInsensitiveAliasConverges`` in the test
+    suite for both sides of that invariant pinned down directly.
+
+    A fully-folded candidate identical to *real_path* (the common case: a
+    plain ASCII name with no cased or decomposable characters) short-circuits
+    before touching the filesystem at all — folding a no-op string can never
+    change the answer, existing or not.
+    """
+    candidate = unicodedata.normalize("NFC", real_path).casefold()
+    if candidate == real_path:
+        return real_path
+    try:
+        real_stat = os.stat(real_path)
+    except OSError:
+        return _fold_by_probed_capability(real_path)
+    try:
+        candidate_stat = os.stat(candidate)
+    except OSError:
+        return real_path
+    if real_stat.st_ino == 0 or candidate_stat.st_ino == 0:
+        # Some filesystems (certain FUSE/virtual mounts) never populate a
+        # usable inode; "stat succeeded" there carries no identity
+        # guarantee, so fall back to the probe-based decision rather than
+        # trusting a zero into a false merge.
+        return _fold_by_probed_capability(real_path)
+    if (real_stat.st_dev, real_stat.st_ino) == (
+        candidate_stat.st_dev,
+        candidate_stat.st_ino,
+    ):
+        return candidate
+    return real_path
+
+
+def _fold_by_probed_capability(real_path: str) -> str:
+    """Fallback folding for a *real_path* whose identity could not be used —
+    most commonly because it does not exist yet (the schema-init race: two
+    sibling processes racing to create a fresh database through differently
+    -spelled paths before either has). There is no object to stat, so this
+    probes the containing directory's own folding behavior instead, on both
+    axes, and only folds what was actually proven — never assumed from
+    ``sys.platform`` — exactly as :func:`_is_case_insensitive_fs` already did
+    for case; :func:`_is_normalization_insensitive_fs` extends the same
+    approach to Unicode normalization (NFC vs NFD).
+
+    Both probes run against the untouched *real_path*, not against a
+    partially-folded intermediate, so neither probe's own behavior depends
+    on whether the other axis already applied — each answers a single,
+    independent question about the directory.
+    """
+    folded = real_path
+    if _is_normalization_insensitive_fs(real_path):
+        folded = unicodedata.normalize("NFC", folded)
+    if _is_case_insensitive_fs(real_path):
+        folded = folded.casefold()
+    return folded
 
 
 def _is_case_insensitive_fs(real_path: str) -> bool:
@@ -346,7 +464,7 @@ def _probe_directory_case_folds(directory: str) -> bool:
     if not _IS_WINDOWS:
         flags |= getattr(os, "O_NOFOLLOW", 0)
 
-    for _ in range(_CASE_PROBE_ATTEMPTS):
+    for _ in range(_PROBE_ATTEMPTS):
         name = f"{_CASE_PROBE_PREFIX}{secrets.token_hex(16)}"
         swapped = name.swapcase()
         probe_path = os.path.join(directory, name)
@@ -370,6 +488,109 @@ def _probe_directory_case_folds(directory: str) -> bool:
             return (probe_stat.st_dev, probe_stat.st_ino) == (
                 swapped_stat.st_dev,
                 swapped_stat.st_ino,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(probe_path)
+
+    return False
+
+
+def _is_normalization_insensitive_fs(real_path: str) -> bool:
+    """Probe whether *real_path*'s filesystem folds Unicode normalization
+    forms on lookup — the normalization counterpart of
+    :func:`_is_case_insensitive_fs`.
+
+    Most POSIX filesystems (ext4 included) are normalization-*sensitive*: a
+    name stored with a precomposed character (NFC, e.g. U+00E9 "é") and the
+    same name spelled with a combining accent (NFD, "e" + U+0301) are two
+    different byte sequences and, on such a filesystem, two different
+    files. HFS+/APFS's default case-insensitive, case-preserving mode
+    additionally folds normalization on lookup, so a database opened
+    through an NFC-spelled path and an NFD-spelled alias of the identical
+    visible name can be the very same on-disk file there — the same class
+    of problem :func:`_is_case_insensitive_fs` exists for, on a different
+    Unicode axis, and just as unprovable from ``sys.platform`` alone (a
+    volume can be reformatted case/normalization-sensitive on any OS).
+
+    A basename with nothing decomposable at all (no precomposed/accented
+    characters) short-circuits to ``False`` — folding would be a no-op on
+    it regardless of what the filesystem does, mirroring
+    :func:`_is_case_insensitive_fs`'s no-cased-characters short circuit.
+
+    *real_path* not existing yet is handled the same way
+    :func:`_is_case_insensitive_fs` handles it: there is no directory entry
+    to stat two ways, so this falls back to
+    :func:`_probe_directory_normalization_folds` against the parent
+    directory. Any other ``OSError`` degrades to ``False`` — cannot prove,
+    never merge.
+    """
+    directory, name = os.path.split(real_path)
+    nfc_name = unicodedata.normalize("NFC", name)
+    nfd_name = unicodedata.normalize("NFD", name)
+    if nfc_name == nfd_name:
+        return False
+    try:
+        nfc_stat = os.stat(os.path.join(directory, nfc_name))
+    except FileNotFoundError:
+        return _probe_directory_normalization_folds(directory or ".")
+    except OSError:
+        return False
+    try:
+        nfd_stat = os.stat(os.path.join(directory, nfd_name))
+    except OSError:
+        return False
+    return (nfc_stat.st_dev, nfc_stat.st_ino) == (nfd_stat.st_dev, nfd_stat.st_ino)
+
+
+def _probe_directory_normalization_folds(directory: str) -> bool:
+    """Probe whether *directory* (which must already exist) folds Unicode
+    normalization forms — the normalization counterpart of
+    :func:`_probe_directory_case_folds`, used for the same reason: the
+    target database does not exist yet, so there is no real directory entry
+    for :func:`_is_normalization_insensitive_fs` to stat two ways.
+
+    Mirrors :func:`_probe_directory_case_folds`'s safety properties exactly
+    — randomized name (``secrets.token_hex``) with bounded retries,
+    ``O_CREAT | O_EXCL`` (+ ``O_NOFOLLOW`` on POSIX) so it never overwrites
+    or follows a symlink onto a co-tenant's file, identity taken from the
+    fd this call itself created rather than a second path lookup, the
+    alternate spelling only ever ``lstat``-ed (never opened or unlinked),
+    and cleanup of the exact created name guaranteed in a ``finally`` — the
+    only difference is which two spellings are compared: the NFC- and
+    NFD-normalized forms of one probe name (which differ because the name
+    embeds a character with a real canonical decomposition), not an
+    original/case-swapped pair.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    if not _IS_WINDOWS:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+
+    for _ in range(_PROBE_ATTEMPTS):
+        core = f"{_NORM_PROBE_PREFIX}{secrets.token_hex(16)}{_NORM_PROBE_NFC_MARKER}"
+        nfc_name = unicodedata.normalize("NFC", core)
+        nfd_name = unicodedata.normalize("NFD", core)
+        probe_path = os.path.join(directory, nfc_name)
+
+        try:
+            fd = os.open(probe_path, flags, 0o600)
+        except FileExistsError:
+            continue
+        except OSError:
+            return False
+
+        try:
+            try:
+                probe_stat = os.fstat(fd)
+            finally:
+                os.close(fd)
+            try:
+                alt_stat = os.lstat(os.path.join(directory, nfd_name))
+            except OSError:
+                return False
+            return (probe_stat.st_dev, probe_stat.st_ino) == (
+                alt_stat.st_dev,
+                alt_stat.st_ino,
             )
         finally:
             with contextlib.suppress(OSError):

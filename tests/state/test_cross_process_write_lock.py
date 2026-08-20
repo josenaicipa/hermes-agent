@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,9 @@ import hermes_state_lock
 from hermes_state import SessionDB
 from hermes_state_lock import (
     _CASE_PROBE_PREFIX,
+    _NORM_PROBE_PREFIX,
     _is_case_insensitive_fs,
+    _is_normalization_insensitive_fs,
     _lock_open_flags,
     _lock_root,
     _posix_lock_root,
@@ -874,6 +877,362 @@ class TestDirectoryCaseProbeHygiene:
         degenerate into the swapped==original no-op guard and this whole
         fallback would be dead code."""
         assert _CASE_PROBE_PREFIX.swapcase() != _CASE_PROBE_PREFIX
+
+
+@pytest.mark.skipif(not _HAS_HARDLINK, reason="platform has no os.link")
+class TestUnicodeAliasConvergesViaStableIdentity:
+    """Gate 20260820T131955Z REQUEST_CHANGES: ``canonical_db_key()`` folded
+    case with ``real.lower()`` after ``_is_case_insensitive_fs`` proved a
+    filesystem folds case -- but ``str.lower()`` is not the same operation as
+    Unicode caseless matching (``str.casefold()``), and the module never
+    considered Unicode *normalization* equivalence (NFC vs NFD) at all. Two
+    real, non-trivial Unicode aliases of the very same on-disk file could
+    therefore hash to two different sidecars and defeat the mutual exclusion
+    this module exists to provide.
+
+    A genuinely case/normalization-folding volume isn't available on every
+    runner, so — exactly like ``TestCaseInsensitiveAliasSharesLock`` — a
+    hardlink from an alternate spelling onto the same inode reproduces
+    precisely what such a volume's own lookup resolves to, without depending
+    on the host filesystem's own folding behavior.
+    """
+
+    def test_casefold_beyond_ascii_converges_for_an_existing_file(self, tmp_path):
+        """``'ß'.lower() == 'ß'`` (unchanged) but ``'ß'.casefold() == 'ss'``
+        -- the textbook case where ``str.lower()`` is not Unicode caseless
+        matching. A filesystem whose case-fold table merges 'ß' with 'ss'
+        (as APFS's does) would resolve ``strasse.db`` and ``straße.db`` to
+        the same file; the old ``.lower()``-based fold could not converge
+        them even after ``_is_case_insensitive_fs`` proved the location
+        case-insensitive for *some* pair, because folding the sharp-s
+        spelling with ``.lower()`` leaves it unchanged instead of merging it
+        with the double-s spelling."""
+        sharp_s_db = tmp_path / "straße.db"  # "straße.db"
+        sharp_s_db.touch()
+        double_s_alias = tmp_path / "strasse.db"
+        os.link(sharp_s_db, double_s_alias)
+
+        assert canonical_db_key(sharp_s_db) == canonical_db_key(double_s_alias)
+        assert write_lock_path(sharp_s_db) == write_lock_path(double_s_alias)
+
+    def test_nfc_and_nfd_spellings_of_an_existing_file_converge(self, tmp_path):
+        """ "café.db" written with the precomposed 'é' (U+00E9, NFC) and the
+        same visual name spelled with 'e' + a combining acute accent
+        (U+0065 U+0301, NFD) are two different byte sequences. HFS+/APFS's
+        default mode folds normalization on lookup in addition to case, so
+        they can be the very same on-disk file there -- ``canonical_db_key``
+        never considered this axis at all before this fix, regardless of
+        ``.lower()`` vs ``.casefold()``."""
+        nfc_name = unicodedata.normalize("NFC", "café.db")  # "café.db"
+        nfd_name = unicodedata.normalize("NFD", "café.db")  # "café.db"
+        assert nfc_name != nfd_name, "sanity: the two spellings must differ"
+
+        nfc_db = tmp_path / nfc_name
+        nfc_db.touch()
+        nfd_alias = tmp_path / nfd_name
+        os.link(nfc_db, nfd_alias)
+
+        assert canonical_db_key(nfc_db) == canonical_db_key(nfd_alias)
+        assert write_lock_path(nfc_db) == write_lock_path(nfd_alias)
+
+    def test_ligature_alias_converges_even_though_no_probe_constructs_it(
+        self, tmp_path
+    ):
+        """ "file.db" and "ﬁle.db" (U+FB01 LATIN SMALL LIGATURE FI in place of
+        the two letters "fi") are neither a ``swapcase()`` of one another
+        nor NFC/NFD forms of each other -- ``unicodedata.normalize`` treats a
+        compatibility ligature like this as a *compatibility* (NFKC/NFKD)
+        distinction, not a canonical (NFC/NFD) one, so this alias is outside
+        what this module's swapcase- and NFC/NFD-based probes construct or
+        test for. Unicode full case folding (``str.casefold()``) still maps
+        the ligature to "fi", though, so preferring the resolved object's
+        own stable identity over any specific guessed transform converges
+        this alias too -- without this module needing to special-case
+        ligatures, or any other exotic casefold mapping, at all."""
+        ligature_db = tmp_path / "ﬁle.db"  # "ﬁle.db"
+        ligature_db.touch()
+        plain_alias = tmp_path / "file.db"
+        os.link(ligature_db, plain_alias)
+
+        assert canonical_db_key(ligature_db) == canonical_db_key(plain_alias)
+        assert write_lock_path(ligature_db) == write_lock_path(plain_alias)
+
+    def test_alias_writer_is_blocked_by_unicode_normalized_holder(self, tmp_path):
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        nfd_name = unicodedata.normalize("NFD", "café.db")
+        nfc_db = tmp_path / nfc_name
+        nfc_db.touch()
+        nfd_alias = tmp_path / nfd_name
+        os.link(nfc_db, nfd_alias)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(nfc_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            t0 = time.monotonic()
+            with acquire_state_write_lock(nfd_alias, timeout_s=0.25) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(nfd_alias, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+
+class TestGenuinelyDistinctUnicodeFilesAreNotMerged:
+    """Companion control to ``TestUnicodeAliasConvergesViaStableIdentity``:
+    on a normalization- and case-*sensitive* filesystem (this test's real,
+    unmodified ``tmp_path`` -- no hardlink, no shim), two Unicode spellings
+    that merely happen to differ only in normalization form or case, with no
+    hardlink or symlink tying them together, are genuinely different files
+    and must keep separate keys. Converging them would let a writer holding
+    admission on one believe it also covers the other."""
+
+    def test_nfc_and_nfd_spellings_that_are_separate_files_are_not_merged(
+        self, tmp_path
+    ):
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        nfd_name = unicodedata.normalize("NFD", "café.db")
+        nfc_db = tmp_path / nfc_name
+        nfc_db.write_bytes(b"nfc")
+        nfd_db = tmp_path / nfd_name
+        nfd_db.write_bytes(b"nfd")
+
+        assert not _is_normalization_insensitive_fs(str(nfc_db))
+        assert canonical_db_key(nfc_db) != canonical_db_key(nfd_db)
+        assert write_lock_path(nfc_db) != write_lock_path(nfd_db)
+
+    def test_casefold_distinct_spellings_that_are_separate_files_are_not_merged(
+        self, tmp_path
+    ):
+        sharp_s_db = tmp_path / "straße.db"
+        sharp_s_db.write_bytes(b"sharp-s")
+        double_s_db = tmp_path / "strasse.db"
+        double_s_db.write_bytes(b"double-s")
+
+        assert canonical_db_key(sharp_s_db) != canonical_db_key(double_s_db)
+        assert write_lock_path(sharp_s_db) != write_lock_path(double_s_db)
+
+
+def _make_normalization_insensitive_lookup(monkeypatch, directory):
+    """Simulate a filesystem that folds Unicode normalization forms on
+    lookup (as HFS+/APFS's default mode does) for *directory*, the same way
+    ``_make_case_insensitive_lookup`` simulates case-folding: by wrapping
+    ``os.lstat`` so a lookup for a name that doesn't exist verbatim falls
+    back to a normalization-insensitive match among the directory's real
+    entries.
+
+    This targets ``os.lstat`` for the same reason ``_make_case_insensitive_
+    lookup`` does: it is the only syscall ``_probe_directory_normalization_
+    folds`` uses to resolve the alternate-normalization spelling once a
+    fresh probe file has been created via ``os.open``.
+    """
+    real_lstat = os.lstat
+    directory = os.path.realpath(str(directory))
+
+    def fake_lstat(path, *args, **kwargs):
+        fspath = os.fspath(path)
+        try:
+            return real_lstat(fspath, *args, **kwargs)
+        except FileNotFoundError:
+            parent, name = os.path.split(fspath)
+            if os.path.realpath(parent or ".") != directory:
+                raise
+            try:
+                entries = os.listdir(directory)
+            except OSError:
+                raise
+            target = unicodedata.normalize("NFC", name)
+            for entry in entries:
+                if unicodedata.normalize("NFC", entry) == target:
+                    return real_lstat(os.path.join(directory, entry), *args, **kwargs)
+            raise
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
+class TestNewDatabaseNormalizationInsensitiveAliasConverges:
+    """Requirement 3 (Fase C6, 20260820T131955Z): extend the not-yet-created
+    -database probe (used for the schema-init race, two sibling processes
+    racing to create ``state.db`` before either has) to also detect Unicode
+    normalization folding, not just case folding -- mirrors
+    ``TestNewDatabaseCaseInsensitiveAliasConverges`` on the normalization
+    axis."""
+
+    def test_canonical_db_key_converges_for_normalization_alias_of_nonexistent_db(
+        self, tmp_path, monkeypatch
+    ):
+        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        nfd_name = unicodedata.normalize("NFD", "café.db")
+        nfc_db = tmp_path / nfc_name
+        nfd_alias = tmp_path / nfd_name
+
+        assert not nfc_db.exists()
+        assert not nfd_alias.exists()
+        assert canonical_db_key(nfc_db) == canonical_db_key(nfd_alias)
+
+    def test_write_lock_path_converges_for_normalization_alias_of_nonexistent_db(
+        self, tmp_path, monkeypatch
+    ):
+        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        nfd_name = unicodedata.normalize("NFD", "café.db")
+        nfc_db = tmp_path / nfc_name
+        nfd_alias = tmp_path / nfd_name
+
+        assert write_lock_path(nfc_db) == write_lock_path(nfd_alias)
+
+    def test_concurrent_schema_init_via_normalization_alias_is_serialized(
+        self, tmp_path, monkeypatch
+    ):
+        """The actual failure mode this requirement exists to close: two
+        "sibling processes" (here, threads) racing schema init on a
+        not-yet-created database through NFC- and NFD-spelled paths must be
+        admitted as one writer at a time, not two."""
+        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        nfd_name = unicodedata.normalize("NFD", "café.db")
+        nfc_db = tmp_path / nfc_name
+        nfd_alias = tmp_path / nfd_name
+        assert not nfc_db.exists()
+        assert not nfd_alias.exists()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(nfc_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            t0 = time.monotonic()
+            with acquire_state_write_lock(nfd_alias, timeout_s=0.25) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(nfd_alias, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+    def test_normalization_sensitive_directory_keeps_nonexistent_aliases_separate(
+        self, tmp_path
+    ):
+        """No shim here: on this (real, normalization-sensitive) test
+        filesystem, NFC- and NFD-spelled paths neither side has created yet
+        must keep separate keys and must NOT block each other."""
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        nfd_name = unicodedata.normalize("NFD", "café.db")
+        nfc_db = tmp_path / nfc_name
+        nfd_alias = tmp_path / nfd_name
+        assert not nfc_db.exists()
+        assert not nfd_alias.exists()
+
+        assert canonical_db_key(nfc_db) != canonical_db_key(nfd_alias)
+        assert write_lock_path(nfc_db) != write_lock_path(nfd_alias)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(nfc_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            with acquire_state_write_lock(nfd_alias, timeout_s=1.0) as admitted:
+                assert admitted is True
+        finally:
+            release.set()
+            holder.join(5.0)
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
+class TestIsNormalizationInsensitiveFsUnit:
+    """Direct unit coverage of ``_is_normalization_insensitive_fs``, mirroring
+    the existing direct coverage of ``_is_case_insensitive_fs``."""
+
+    def test_basename_with_nothing_decomposable_is_not_probed(self, tmp_path):
+        plain_db = tmp_path / "state.db"
+        plain_db.touch()
+        assert _is_normalization_insensitive_fs(str(plain_db)) is False
+
+    def test_missing_path_probes_the_parent_directory_instead_of_giving_up(
+        self, tmp_path
+    ):
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        missing = tmp_path / nfc_name
+        assert _is_normalization_insensitive_fs(str(missing)) is False
+
+    def test_probe_never_deletes_a_preexisting_alternate_normalization_file(
+        self, tmp_path
+    ):
+        """If a file that happens to collide with a probe's alternate-
+        normalization name already exists for unrelated reasons, the probe
+        must leave it untouched."""
+        real_lstat = os.lstat
+        probed_names = []
+
+        def spying_lstat(path, *args, **kwargs):
+            fspath = os.fspath(path)
+            name = os.path.basename(fspath)
+            if name.startswith(_NORM_PROBE_PREFIX):
+                probed_names.append(fspath)
+            return real_lstat(fspath, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "lstat", spying_lstat)
+            nfc_name = unicodedata.normalize("NFC", "café.db")
+            missing = tmp_path / nfc_name
+            assert _is_normalization_insensitive_fs(str(missing)) is False
+
+        assert probed_names
+        for candidate in probed_names:
+            assert not os.path.lexists(candidate)
+
+    def test_probe_leaves_no_file_behind_on_a_normalization_sensitive_directory(
+        self, tmp_path
+    ):
+        before = set(os.listdir(tmp_path))
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        missing = tmp_path / nfc_name
+
+        assert _is_normalization_insensitive_fs(str(missing)) is False
+        assert set(os.listdir(tmp_path)) == before
+
+    def test_probe_leaves_no_file_behind_on_a_normalization_insensitive_directory(
+        self, tmp_path, monkeypatch
+    ):
+        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
+        before = set(os.listdir(tmp_path))
+        nfc_name = unicodedata.normalize("NFC", "café.db")
+        missing = tmp_path / nfc_name
+
+        assert _is_normalization_insensitive_fs(str(missing)) is True
+        assert set(os.listdir(tmp_path)) == before
 
 
 class TestLegacyColocationNoLongerMatters:
