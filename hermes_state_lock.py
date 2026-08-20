@@ -67,14 +67,51 @@ file instead of splitting admission across two.
 
 The old symlink-swap (``O_NOFOLLOW``) and hardlink-swap (``fstat``/``lstat``
 identity) defenses are kept as defense-in-depth: they now protect against
-same-account races (a rotation script recreating the lock file while a hold
-is live, a bug), not against a hostile co-tenant, since a co-tenant can no
-longer reach the directory at all. They are no longer the primary defense —
-the private lock root's directory permissions are.
+same-account accidents (a rotation script or bug recreating the lock file
+while a hold is live), not against a hostile co-tenant, since a co-tenant
+can no longer reach the directory at all. They are no longer the primary
+defense — the private lock root's directory permissions are. They are also
+not a defense against a hostile *same-account* actor — see the threat model
+below for why that is a different, unclosable case.
 
-This closes the case Nemo flagged: a co-tenant cannot unlink or hardlink
-anything inside a ``0700`` directory it does not own, so "unlink + drop in
-an indistinguishable fresh regular file" has no directory entry to act on.
+This closes the case Nemo flagged for a co-tenant of a *different* OS
+account: it cannot unlink or hardlink anything inside a ``0700`` directory
+it does not own, so "unlink + drop in an indistinguishable fresh regular
+file" has no directory entry for it to act on.
+
+Threat model — what this module protects and what it explicitly does not:
+
+* **In scope, fully handled:** cooperative Hermes processes of the same OS
+  account racing each other (Gateway, Dashboard, ACP, a CLI invocation) —
+  handled by ``flock`` plus the admission bookkeeping below — and a
+  *different* OS account's co-tenant that can write into the database's own
+  directory but not into this account's private lock root — handled by the
+  0700 ownership check on that root.
+* **Explicitly out of scope: an adversarial process running as the *same*
+  OS account.** That account owns every filesystem object this module
+  touches — the private lock root, the sidecar, the database file itself —
+  so it can delete and recreate any of them at will, including reproducing
+  a sidecar this module would have created itself, with no distinguishing
+  metadata left behind. No filesystem-based anchor (inode identity, link
+  count, ownership, permission mode) can tell a same-account attacker's
+  replacement apart from a legitimate one, because the attacker holds
+  exactly the same rights over that location that this module does. This
+  module does not claim, and must not be read as claiming, resistance to
+  that actor. Where that actor is a real concern, the fix is process
+  isolation — a dedicated service account per tenant — not a cleverer
+  check in this file; no check in this file can draw that boundary.
+* ``_check_sidecar_continuity`` (below) narrows the *accidental* slice of
+  that same-account case — a cleanup script, a rotation bug, a
+  ``tmpfiles.d``-style sweep of ``/tmp`` recreating the sidecar while this
+  process is still running — by remembering, in this process's own memory,
+  the identity it last trusted for a given database, and refusing admission
+  the moment a later acquire in this same process disagrees with that
+  memory. It is deliberately not a security boundary: a same-account
+  attacker who never lets this process observe a consistent baseline (a
+  swap staged before this process's first acquire, or one that waits for a
+  restart, which wipes the in-memory baseline) is not caught by it — that
+  residual gap is the same one the paragraph above describes, not a new one
+  this check introduces.
 
 The lock is **not** a substitute for SQLite's own locking.  Callers still
 ``BEGIN IMMEDIATE`` and still retry on ``SQLITE_BUSY`` from holders that do
@@ -130,6 +167,18 @@ _CASE_PROBE_ATTEMPTS = 4
 # (Linux flock is per open-file-description; two fds of the same path block).
 _tls = threading.local()
 
+# canonical key -> (st_dev, st_ino) this *process* (not just this thread)
+# last trusted for that key. Deliberately process-wide, not thread-local:
+# the gap this closes is a second thread in the same process opening a
+# sidecar that was unlinked-and-recreated (no hardlink, so
+# _sidecar_identity_is_trustworthy's nlink check sees nothing wrong) while
+# a first thread's hold is still live — that only shows up by comparing
+# against what this process itself remembers, not against the current
+# acquire attempt's own fd. See _check_sidecar_continuity and the module
+# docstring's threat model.
+_sidecar_identity_lock = threading.Lock()
+_known_sidecar_identity: dict[str, tuple[int, int]] = {}
+
 
 class _Hold:
     __slots__ = ("handle", "depth")
@@ -145,6 +194,27 @@ class _LockRootUnsafe(Exception):
     Raised (never returned as a bool) so ``acquire_state_write_lock`` cannot
     accidentally treat "exists but tampered/misowned" the same as "could not
     be created at all" — the two must fail differently (closed vs. degrade).
+    """
+
+
+class _SidecarIdentitySwapped(Exception):
+    """This process has direct evidence its trusted sidecar was replaced.
+
+    Raised (never returned as a bool) when a freshly-opened, otherwise
+    "trustworthy" sidecar's ``(st_dev, st_ino)`` disagrees with the identity
+    this same process previously recorded for the same canonical key — see
+    :func:`_check_sidecar_continuity`.
+
+    Once raised for a key, this process never admits under that key again:
+    the recorded baseline is intentionally never overwritten with the new,
+    disagreeing identity, so a retry cannot quietly converge on a still-live
+    same-account swap. Recovering requires a process restart, which starts
+    the in-memory baseline over from an unpoisoned bootstrap. That is a
+    deliberate fail-closed choice, not an oversight — silently re-trusting
+    whatever now has the name is exactly the residual bypass this check
+    exists to close. It is not, and is not meant to be, resistance to a
+    determined same-account attacker; see the module docstring's threat
+    model.
     """
 
 
@@ -513,6 +583,43 @@ def _sidecar_identity_is_trustworthy(handle, lock_path: Path) -> bool:
     return (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
 
 
+def _check_sidecar_continuity(key: str, identity: tuple[int, int]) -> None:
+    """Compare *identity* against what this process itself last trusted for
+    *key*, recording a first-time baseline rather than rejecting it.
+
+    ``_sidecar_identity_is_trustworthy`` only compares a fd against the
+    *current* on-disk name at the instant of one acquire attempt — a plain
+    ``unlink`` followed by a brand-new regular file (no hardlink, so
+    ``st_nlink`` stays ``1``) is entirely self-consistent from that single
+    attempt's point of view; there is nothing in that one stat call to
+    disagree with. This closes that gap using memory that check does not
+    have: what *this process* itself has already trusted for *key*.
+
+    Bootstrap — no prior identity recorded for *key* in this process — is
+    not a failure. There is nothing yet to compare against, and refusing
+    here would break the very first acquire on a fresh database, which is
+    exactly the case that must keep working. ``setdefault`` records this
+    identity as the trusted baseline atomically with the read, so two
+    threads racing a brand-new key's first acquire cannot each observe "no
+    baseline" and both proceed on two different answers.
+
+    Once a baseline is recorded, a *different* identity turning up on a
+    later acquire is not inferred, it is witnessed: this process previously
+    held that sidecar open, and something removed and replaced it since.
+    The mismatch is reported by raising rather than by updating the
+    baseline to the new value, so a same-account swap that is still live
+    (a second thread's hold not yet released) cannot be quietly re-trusted
+    on the very next attempt — see ``_SidecarIdentitySwapped``.
+    """
+    with _sidecar_identity_lock:
+        previous = _known_sidecar_identity.setdefault(key, identity)
+    if previous != identity:
+        raise _SidecarIdentitySwapped(
+            f"sidecar identity for {key!r} changed from {previous} to "
+            f"{identity} since this process last trusted it"
+        )
+
+
 def _reset_after_fork() -> None:
     """Drop inherited holds in a forked child without unlocking the parent.
 
@@ -544,9 +651,11 @@ def acquire_state_write_lock(
     Yields ``True`` when this thread holds admission (including a nested
     re-acquire, and including the degrade-open path).  Yields ``False`` when
     the bounded wait expired, OR when the private lock root's safety
-    invariant could not be guaranteed (fail-closed — see the module
-    docstring); the caller has not touched SQLite and must treat both the
-    same way: as contention.
+    invariant could not be guaranteed, OR when this process's own memory of
+    the sidecar's identity disagrees with what it just opened (fail-closed
+    in all three cases — see the module docstring's threat model and
+    :func:`_check_sidecar_continuity`); the caller has not touched SQLite
+    and must treat all three the same way: as contention.
 
     A non-positive *timeout_s* still performs one non-blocking attempt so a
     caller whose budget is already spent can make one last honest try.
@@ -632,6 +741,31 @@ def acquire_state_write_lock(
         if not acquired or handle is None:
             yield False
             return
+
+        try:
+            fd_stat = os.fstat(handle.fileno())
+            identity: Optional[tuple[int, int]] = (fd_stat.st_dev, fd_stat.st_ino)
+        except OSError:
+            identity = None
+        if identity is not None:
+            try:
+                _check_sidecar_continuity(key, identity)
+            except _SidecarIdentitySwapped as exc:
+                logger.error(
+                    "State write-lock sidecar %s: %s — refusing admission "
+                    "rather than trusting a same-account replacement this "
+                    "process has not itself verified.",
+                    lock_path,
+                    exc,
+                )
+                _unlock(handle)
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+                handle = None
+                yield False
+                return
 
         holds[key] = _Hold(handle)
         released = False

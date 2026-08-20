@@ -16,6 +16,7 @@ might already be relying on.
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import shutil
@@ -30,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_state_lock
 from hermes_state import SessionDB
 from hermes_state_lock import (
     _CASE_PROBE_PREFIX,
@@ -123,6 +125,40 @@ def _child_hold_flock(
                 if Path(release_path).exists():
                     break
                 time.sleep(0.05)
+    except Exception:
+        Path(err_path).write_text(traceback.format_exc(), encoding="utf-8")
+
+
+def _child_cooperative_cycles(
+    db_path: str,
+    lock_root: str,
+    n: int,
+    identity_path: str,
+    err_path: str,
+) -> None:
+    """Cooperative worker: N plain acquire/release cycles, no tampering.
+
+    Records the sidecar's (st_dev, st_ino) after each cycle so the parent
+    can assert every cooperative process — and every cycle within each —
+    observed exactly one, unchanging identity. Never unlinks the sidecar
+    itself; that is the property under test.
+    """
+    os.environ["HERMES_STATE_LOCK_ROOT"] = lock_root
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    try:
+        from hermes_state_lock import acquire_state_write_lock as _acquire
+        from hermes_state_lock import write_lock_path as _write_lock_path
+
+        identities = []
+        for _ in range(n):
+            with _acquire(db_path, timeout_s=5.0) as admitted:
+                if not admitted:
+                    Path(err_path).write_text("not admitted", encoding="utf-8")
+                    return
+                st = os.stat(_write_lock_path(db_path))
+                identities.append([st.st_dev, st.st_ino])
+        Path(identity_path).write_text(json.dumps(identities), encoding="utf-8")
     except Exception:
         Path(err_path).write_text(traceback.format_exc(), encoding="utf-8")
 
@@ -942,7 +978,11 @@ class TestSidecarInodeSubstitutionBypass:
     can no longer reach this path to swap it — this is defense-in-depth
     against a same-account race or bug (a rotation script, a retry that
     reopens mid-hold): a hardlink swap onto the sidecar's name must still
-    not grant concurrent admission while a holder is active."""
+    not grant concurrent admission while a holder is active, and — per the
+    C5 remediation for 20260820T125928Z — a subsequent plain unlink+recreate
+    of the same name must not let this same process quietly resume trusting
+    it either, since that pattern is exactly what a same-account attacker
+    would perform after the hardlink swap is noticed."""
 
     def test_hardlink_substitution_does_not_grant_concurrent_admission(
         self, tmp_path
@@ -989,11 +1029,197 @@ class TestSidecarInodeSubstitutionBypass:
         victim = tmp_path / "victim.lock"
         assert os.path.samefile(lock_path, victim)
 
-        # Once the tampering is cleaned up (an operator removing the rogue
-        # entry, as would happen operationally), normal admission resumes.
+        # Cleaning up the tampering does NOT silently resume admission in
+        # THIS process: this process's own memory of the sidecar's identity
+        # (recorded when the holder thread first acquired it, above) now
+        # disagrees with the fresh file that replaces the hardlinked one —
+        # see _check_sidecar_continuity. That disagreement is direct
+        # evidence of a same-account swap this process itself witnessed, so
+        # it fails closed rather than re-trusting whatever now has the
+        # name; converging back to admission requires a process restart
+        # (an unpoisoned bootstrap), not just removing the rogue entry.
         os.unlink(lock_path)
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+
+        # A process that never held the original sidecar has no baseline to
+        # disagree with, so it is unaffected by what this process witnessed
+        # — bootstrap must keep working for everyone else.
+        with pytest.MonkeyPatch.context() as mpatch:
+            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", {})
+            with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+                assert admitted is True
+
+
+class TestSidecarIdentityContinuity:
+    """C5 remediation for REQUEST_CHANGES 20260820T125928Z: cover accidental
+    sidecar recreation without claiming a boundary this module cannot
+    actually hold against malicious same-account code.
+
+    Requirement 1 of that gate was an audit, not a test: neither this
+    module nor ``hermes_state.py`` ever unlinks or recreates the sidecar on
+    release or cleanup — ``acquire_state_write_lock`` releases by
+    ``flock(LOCK_UN)`` + ``close()`` only (see the ``finally`` block), and
+    ``_open_sidecar`` opens with ``O_CREAT`` (create-if-absent), never
+    truncates or replaces an existing file. There was no cooperative
+    delete/recreate path to remove. These tests pin that down as a
+    regression guard, then exercise the one gap that *did* need a fix: a
+    plain unlink+recreate (no hardlink, so ``st_nlink`` never moves off
+    ``1``) is invisible to ``_sidecar_identity_is_trustworthy``'s
+    single-attempt check, because a freshly-opened replacement is
+    self-consistent from that one check's point of view. Only a second,
+    independent memory — this process's own record of what it last
+    trusted, added in ``_check_sidecar_continuity`` — can catch that."""
+
+    def test_cooperative_release_reacquire_cycles_never_unlink_and_keep_one_inode(
+        self, tmp_path
+    ):
+        """Purely cooperative use (no tampering): many sequential
+        release/reacquire cycles on the same path must observe exactly one
+        ``(st_dev, st_ino)`` throughout, and this module must never call
+        ``os.unlink``/``os.remove`` on the sidecar itself."""
+        db_path = tmp_path / "state.db"
+        real_unlink = os.unlink
+        unlinked_paths = []
+
+        def _spying_unlink(path, *a, **kw):
+            unlinked_paths.append(os.fspath(path))
+            return real_unlink(path, *a, **kw)
+
+        with pytest.MonkeyPatch.context() as mpatch:
+            mpatch.setattr(os, "unlink", _spying_unlink)
+
+            identities = set()
+            for _ in range(25):
+                with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+                    assert admitted is True
+                    st = os.stat(write_lock_path(db_path))
+                    identities.add((st.st_dev, st.st_ino))
+
+        assert len(identities) == 1, (
+            "the sidecar's identity must not change across cooperative "
+            f"release/reacquire cycles, observed: {identities}"
+        )
+        lock_path = str(write_lock_path(db_path))
+        assert lock_path not in unlinked_paths, (
+            "acquire_state_write_lock must never unlink its own sidecar"
+        )
+
+    def test_cooperative_multi_process_cycles_never_unlink_and_keep_one_inode(
+        self, tmp_path, _isolated_lock_root
+    ):
+        """Same invariant, but across real cooperative processes rather than
+        one process's threads — the actual Gateway/Dashboard/ACP shape."""
+        db_path = tmp_path / "state.db"
+        lock_root = str(_isolated_lock_root)
+        # Establish the sidecar before spawning so both children observe
+        # the same starting identity, not two independent bootstraps.
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
+        baseline = os.stat(write_lock_path(db_path))
+        baseline_identity = [baseline.st_dev, baseline.st_ino]
+
+        ctx = mp.get_context("spawn")
+        procs = []
+        identity_paths = []
+        err_paths = []
+        for i in range(2):
+            identity_path = tmp_path / f"identities-{i}.json"
+            err = tmp_path / f"err-{i}"
+            identity_paths.append(identity_path)
+            err_paths.append(err)
+            procs.append(
+                _spawn(
+                    ctx,
+                    _child_cooperative_cycles,
+                    (str(db_path), lock_root, 10, str(identity_path), str(err)),
+                )
+            )
+        for proc, err in zip(procs, err_paths):
+            _join_ok(proc, 30.0, err)
+
+        all_identities = [baseline_identity]
+        for identity_path in identity_paths:
+            all_identities.extend(json.loads(identity_path.read_text(encoding="utf-8")))
+
+        unique = {tuple(identity) for identity in all_identities}
+        assert unique == {tuple(baseline_identity)}, (
+            "two cooperative processes cycling the same lock must observe "
+            f"exactly the pre-spawn identity throughout, observed: {unique}"
+        )
+
+    def test_bootstrap_first_ever_acquire_has_no_baseline_to_reject(
+        self, tmp_path
+    ):
+        """Requirement 3's condition: the new check must not break the very
+        first acquire on a fresh database, where there is nothing yet to
+        compare against."""
+        db_path = tmp_path / "state.db"
+        key = canonical_db_key(db_path)
+        assert key not in hermes_state_lock._known_sidecar_identity
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        assert key in hermes_state_lock._known_sidecar_identity
+
+    def test_plain_unlink_and_recreate_between_cycles_is_rejected(self, tmp_path):
+        """RED before the continuity check existed: a plain unlink+recreate
+        (no hardlink — ``st_nlink`` stays ``1`` throughout) between two
+        non-overlapping acquires, with no concurrent holder at all, is
+        exactly the accidental-recreation shape (a cleanup script, a
+        ``tmpfiles.d``-style sweep, a bug) this gate exists to cover.
+        ``_sidecar_identity_is_trustworthy`` alone cannot see this — the
+        replacement is internally self-consistent — so this is GREEN only
+        because ``_check_sidecar_continuity`` now compares against this
+        process's own prior observation."""
+        db_path = tmp_path / "state.db"
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+        lock_path = write_lock_path(db_path)
+        original = os.stat(lock_path)
+        os.unlink(lock_path)
+        lock_path.write_bytes(b"")  # ordinary regular file, nlink == 1
+        replacement = os.stat(lock_path)
+        assert replacement.st_ino != original.st_ino or (
+            replacement.st_dev != original.st_dev
+        ), "the replacement must actually be a different inode for this test to mean anything"
+        assert replacement.st_nlink == 1, (
+            "no hardlink involved — the nlink-based check must not be what "
+            "catches this"
+        )
+
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+
+    def test_matching_identity_on_reacquire_does_not_raise(self, tmp_path):
+        """Sanity check on the mechanism itself, independent of the public
+        context-manager API: an unchanged identity across two calls must
+        not raise."""
+        db_path = tmp_path / "state.db"
+        key = canonical_db_key(db_path)
+        identity = (1, 42)
+        hermes_state_lock._check_sidecar_continuity(key, identity)
+        hermes_state_lock._check_sidecar_continuity(key, identity)  # no raise
+
+    def test_differing_identity_on_recheck_raises_and_keeps_original_baseline(
+        self, tmp_path
+    ):
+        """Sanity check on the mechanism itself: a disagreeing identity
+        raises, and the *original* identity remains the recorded baseline
+        afterward — the mismatch is never "healed" onto the new value,
+        which is what keeps a still-live swap from being re-trusted on the
+        very next attempt."""
+        db_path = tmp_path / "state.db"
+        key = canonical_db_key(db_path)
+        original = (1, 42)
+        swapped = (1, 99)
+        hermes_state_lock._check_sidecar_continuity(key, original)
+        with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
+            hermes_state_lock._check_sidecar_continuity(key, swapped)
+        assert hermes_state_lock._known_sidecar_identity[key] == original
+        # And the disagreement keeps being reported, not just the first time.
+        with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
+            hermes_state_lock._check_sidecar_continuity(key, swapped)
 
 
 class TestPrivateLockRootInvariants:
