@@ -525,21 +525,19 @@ def _hermetic_environment(tmp_path, monkeypatch):
         "HERMES_STATE_LOCK_ROOT", str(fake_hermes_home / "state-locks")
     )
 
-    # 3d. Fase C7 collapsed hermes_state_lock's per-database identity memory
-    #     (keyed by canonical_db_key, so different tests' different db_paths
-    #     never collided) into one process-global ``(st_dev, st_ino)``
-    #     baseline shared by every database under the account. That is
-    #     correct for a real process (the lock root never moves mid-run) but
-    #     breaks across tests in this same pytest process: 3c above points
-    #     each test at a freshly rooted sidecar, so the very next test's
-    #     genuinely different sidecar would disagree with whatever this
-    #     process last trusted and get refused by ``_check_sidecar_
-    #     continuity`` as if it were a same-account swap. Reset the baseline
-    #     alongside the root so each test starts with a clean bootstrap, the
-    #     same as a freshly started process would.
-    hermes_state_lock_mod = sys.modules.get("hermes_state_lock")
-    if hermes_state_lock_mod is not None:
-        monkeypatch.setattr(hermes_state_lock_mod, "_known_sidecar_identity", None)
+    # 3d. (removed in Fase C9 — Nemo gate 20260820T152324Z) This fixture
+    #     used to reset hermes_state_lock._known_sidecar_identity to None
+    #     per test, because C7 held sidecar continuity as one process-global
+    #     baseline and 3c's per-test lock root would otherwise be refused as
+    #     a phantom swap of the previous test's sidecar. That reset masked a
+    #     real production bug: any process that legitimately observed two
+    #     lock roots (a HERMES_STATE_LOCK_ROOT change mid-run) wedged
+    #     permanently. Continuity is now keyed per lock root, so each test's
+    #     fresh root under 3c bootstraps its own baseline naturally — no
+    #     production state needs resetting, and the suite itself now proves
+    #     that. Do not reintroduce a reset here; if cross-test lock failures
+    #     reappear, that is a per-root continuity regression to fix in
+    #     hermes_state_lock, not to hide.
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

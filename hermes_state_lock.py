@@ -131,8 +131,9 @@ Threat model — what this module protects and what it explicitly does not:
   that same-account case — a cleanup script, a rotation bug, a
   ``tmpfiles.d``-style sweep of ``/tmp`` recreating the sidecar while this
   process is still running — by remembering, in this process's own memory,
-  the identity it last trusted, and refusing admission the moment a later
-  acquire in this same process disagrees with that memory. It is
+  the identity it last trusted *per lock root* (Fase C9), and refusing
+  admission the moment a later acquire in this same process, under that
+  same root, disagrees with that memory. It is
   deliberately not a security boundary: a same-account attacker who never
   lets this process observe a consistent baseline (a swap staged before this
   process's first acquire, or one that waits for a restart, which wipes the
@@ -205,6 +206,25 @@ the window in which both are running. That window falls back to SQLite
 busy handling — the documented behavior for mixed-version writers since
 this module was introduced. Restart all Hermes processes together, as the
 prior C-phase lock-identity changes already required.
+
+Fase C9 — sidecar continuity is remembered per lock root, never once per
+process (Nemo gate 20260820T152324Z):
+
+The C5 continuity baseline was a single process-global ``(st_dev,
+st_ino)``. That conflated two very different events: "the sidecar under
+the root I am using was replaced" (the accident the check exists to
+catch) and "this process is now resolving a different root" (a legitimate
+``HERMES_STATE_LOCK_ROOT`` change mid-run, or simply two valid roots
+observed by one process). The first acquire under any second valid root
+was refused as a phantom swap, permanently — cooperative writers wedged
+with no tampering anywhere. The baseline is now a mapping from the lock
+root's canonical path (:func:`_lock_root_identity` — ``realpath`` +
+``normcase`` of the *root* this module itself resolved, never of
+``db_path``; per-database identity stays gone per Fase C7) to the
+identity last trusted inside that root. Continuity is compared and
+updated only within one root; a witnessed swap still poisons that root
+for the life of the process (the same fail-closed rule as before, now
+exactly as wide as the evidence), and every other root is unaffected.
 """
 
 from __future__ import annotations
@@ -237,17 +257,23 @@ _WRITE_LOCK_FILENAME = "global.write.lock"
 # same path block each other).
 _tls = threading.local()
 
-# (st_dev, st_ino) this *process* (not just this thread) last trusted for
-# the global sidecar. Deliberately process-wide, not thread-local: the gap
-# this closes is a second thread in the same process opening a sidecar that
-# was unlinked-and-recreated (no hardlink, so
-# _sidecar_identity_is_trustworthy's nlink check sees nothing wrong) while a
-# first thread's hold is still live — that only shows up by comparing
-# against what this process itself remembers, not against the current
-# acquire attempt's own fd. See _check_sidecar_continuity and the module
-# docstring's threat model.
+# Per lock root (keyed by the root's canonical path — see
+# _lock_root_identity): the (st_dev, st_ino) this *process* (not just this
+# thread) last trusted for the sidecar inside that root. Deliberately
+# process-wide, not thread-local: the gap this closes is a second thread in
+# the same process opening a sidecar that was unlinked-and-recreated (no
+# hardlink, so _sidecar_identity_is_trustworthy's nlink check sees nothing
+# wrong) while a first thread's hold is still live — that only shows up by
+# comparing against what this process itself remembers, not against the
+# current acquire attempt's own fd. Keyed per root (Fase C9) rather than
+# held as one process-global baseline: a baseline recorded under one root
+# says nothing about the sidecar inside a different root, so two valid
+# roots in one process (a legitimate ``HERMES_STATE_LOCK_ROOT`` change, a
+# test harness) each bootstrap and keep their own continuity instead of
+# the second one being refused as a phantom swap of the first. See
+# _check_sidecar_continuity and the module docstring's threat model.
 _sidecar_identity_lock = threading.Lock()
-_known_sidecar_identity: Optional[tuple[int, int]] = None
+_known_sidecar_identity: dict[str, tuple[int, int]] = {}
 
 
 class _Hold:
@@ -272,10 +298,11 @@ class _SidecarIdentitySwapped(Exception):
 
     Raised (never returned as a bool) when a freshly-opened, otherwise
     "trustworthy" sidecar's ``(st_dev, st_ino)`` disagrees with the identity
-    this same process previously recorded — see
+    this same process previously recorded *for the same lock root* — see
     :func:`_check_sidecar_continuity`.
 
-    Once raised, this process never admits again: the recorded baseline is
+    Once raised, this process never admits again under that lock root: the
+    recorded baseline is
     intentionally never overwritten with the new, disagreeing identity, so
     a retry cannot quietly converge on a still-live same-account swap.
     Recovering requires a process restart, which starts the in-memory
@@ -533,10 +560,25 @@ def _sidecar_identity_is_trustworthy(handle, lock_path: Path) -> bool:
     return (fd_stat.st_dev, fd_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
 
 
-def _check_sidecar_continuity(identity: tuple[int, int]) -> None:
+def _lock_root_identity(root: Path) -> str:
+    """Stable per-process key for *root* in ``_known_sidecar_identity``.
+
+    ``os.path.realpath`` + ``os.path.normcase`` so different spellings of
+    the same physical root (a symlinked *parent* directory — the root
+    itself is refused if it is a symlink — or Windows case variance) share
+    one continuity baseline instead of splitting into two that could each
+    miss a swap the other witnessed. This canonicalizes the *lock root* —
+    a directory this module itself resolved and re-verifies on every
+    acquire — never ``db_path``; per-database identity stays gone
+    (Fase C7), and nothing here reads the database path at all.
+    """
+    return os.path.normcase(os.path.realpath(os.fspath(root)))
+
+
+def _check_sidecar_continuity(root_key: str, identity: tuple[int, int]) -> None:
     """Compare *identity* against what this process itself last trusted for
-    the (single, global) sidecar, recording a first-time baseline rather
-    than rejecting it.
+    the sidecar inside the lock root identified by *root_key*, recording a
+    first-time baseline for that root rather than rejecting it.
 
     ``_sidecar_identity_is_trustworthy`` only compares a fd against the
     *current* on-disk name at the instant of one acquire attempt — a plain
@@ -546,30 +588,36 @@ def _check_sidecar_continuity(identity: tuple[int, int]) -> None:
     disagree with. This closes that gap using memory that check does not
     have: what *this process* itself has already trusted.
 
-    Bootstrap — no prior identity recorded in this process — is not a
-    failure. There is nothing yet to compare against, and refusing here
-    would break the very first acquire, which is exactly the case that must
-    keep working.
+    The memory is per lock root (Fase C9, Nemo gate 20260820T152324Z), not
+    one process-global value: a baseline recorded under one root is an
+    observation about *that root's* sidecar and nothing else. Holding it
+    globally turned every second valid root in the same process — a
+    legitimate ``HERMES_STATE_LOCK_ROOT`` change mid-run, a harness giving
+    each test its own root — into a phantom "swap" that permanently wedged
+    admission. Comparing only within one root keeps the real detection
+    (below) and removes the false one.
 
-    Once a baseline is recorded, a *different* identity turning up on a
-    later acquire is not inferred, it is witnessed: this process previously
-    held that sidecar open, and something removed and replaced it since.
-    The mismatch is reported by raising rather than by updating the
-    baseline to the new value, so a same-account swap that is still live
-    (a second thread's hold not yet released) cannot be quietly re-trusted
-    on the very next attempt — see ``_SidecarIdentitySwapped``.
+    Bootstrap — no prior identity recorded in this process for this root —
+    is not a failure. There is nothing yet to compare against, and refusing
+    here would break the very first acquire under any root, which is
+    exactly the case that must keep working.
+
+    Once a baseline is recorded for a root, a *different* identity turning
+    up on a later acquire under that same root is not inferred, it is
+    witnessed: this process previously held that root's sidecar open, and
+    something removed and replaced it since. The mismatch is reported by
+    raising rather than by updating the baseline to the new value, so a
+    same-account swap that is still live (a second thread's hold not yet
+    released) cannot be quietly re-trusted on the very next attempt — see
+    ``_SidecarIdentitySwapped``. Other roots are unaffected: the poisoning
+    is exactly as wide as the evidence.
     """
-    global _known_sidecar_identity
     with _sidecar_identity_lock:
-        if _known_sidecar_identity is None:
-            _known_sidecar_identity = identity
-            previous = identity
-        else:
-            previous = _known_sidecar_identity
+        previous = _known_sidecar_identity.setdefault(root_key, identity)
     if previous != identity:
         raise _SidecarIdentitySwapped(
-            f"sidecar identity changed from {previous} to {identity} since "
-            "this process last trusted it"
+            f"sidecar identity under lock root {root_key} changed from "
+            f"{previous} to {identity} since this process last trusted it"
         )
 
 
@@ -707,7 +755,7 @@ def acquire_state_write_lock(
             identity = None
         if identity is not None:
             try:
-                _check_sidecar_continuity(identity)
+                _check_sidecar_continuity(_lock_root_identity(root), identity)
             except _SidecarIdentitySwapped as exc:
                 logger.error(
                     "State write-lock sidecar %s: %s — refusing admission "

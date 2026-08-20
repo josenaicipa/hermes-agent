@@ -900,7 +900,7 @@ class TestSidecarInodeSubstitutionBypass:
         # disagree with, so it is unaffected by what this process witnessed
         # — bootstrap must keep working for everyone else.
         with pytest.MonkeyPatch.context() as mpatch:
-            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", None)
+            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", {})
             with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
                 assert admitted is True
 
@@ -1006,12 +1006,14 @@ class TestSidecarIdentityContinuity:
         self, tmp_path
     ):
         """Requirement 3's condition: the new check must not break the very
-        first acquire, where there is nothing yet to compare against."""
+        first acquire under a root, where there is nothing yet to compare
+        against — the baseline for that root is recorded by the acquire."""
         db_path = tmp_path / "state.db"
-        assert hermes_state_lock._known_sidecar_identity is None
+        root_key = hermes_state_lock._lock_root_identity(_lock_root())
+        assert root_key not in hermes_state_lock._known_sidecar_identity
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        assert hermes_state_lock._known_sidecar_identity is not None
+        assert root_key in hermes_state_lock._known_sidecar_identity
 
     def test_plain_unlink_and_recreate_between_cycles_is_rejected(self, tmp_path):
         """RED before the continuity check existed: a plain unlink+recreate
@@ -1045,29 +1047,151 @@ class TestSidecarIdentityContinuity:
 
     def test_matching_identity_on_reacquire_does_not_raise(self):
         """Sanity check on the mechanism itself, independent of the public
-        context-manager API: an unchanged identity across two calls must
-        not raise."""
+        context-manager API: an unchanged identity across two calls under
+        the same root must not raise."""
         identity = (1, 42)
-        hermes_state_lock._check_sidecar_continuity(identity)
-        hermes_state_lock._check_sidecar_continuity(identity)  # no raise
+        with pytest.MonkeyPatch.context() as mpatch:
+            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", {})
+            hermes_state_lock._check_sidecar_continuity("root-a", identity)
+            hermes_state_lock._check_sidecar_continuity("root-a", identity)
 
     def test_differing_identity_on_recheck_raises_and_keeps_original_baseline(
         self,
     ):
         """Sanity check on the mechanism itself: a disagreeing identity
-        raises, and the *original* identity remains the recorded baseline
-        afterward — the mismatch is never "healed" onto the new value,
-        which is what keeps a still-live swap from being re-trusted on the
-        very next attempt."""
+        under the same root raises, and the *original* identity remains the
+        recorded baseline for that root afterward — the mismatch is never
+        "healed" onto the new value, which is what keeps a still-live swap
+        from being re-trusted on the very next attempt. A different root is
+        its own bootstrap, unaffected by the poisoned one (Fase C9)."""
         original = (1, 42)
         swapped = (1, 99)
-        hermes_state_lock._check_sidecar_continuity(original)
-        with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
-            hermes_state_lock._check_sidecar_continuity(swapped)
-        assert hermes_state_lock._known_sidecar_identity == original
-        # And the disagreement keeps being reported, not just the first time.
-        with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
-            hermes_state_lock._check_sidecar_continuity(swapped)
+        with pytest.MonkeyPatch.context() as mpatch:
+            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", {})
+            hermes_state_lock._check_sidecar_continuity("root-a", original)
+            with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
+                hermes_state_lock._check_sidecar_continuity("root-a", swapped)
+            assert hermes_state_lock._known_sidecar_identity == {
+                "root-a": original
+            }
+            # The disagreement keeps being reported, not just the first time.
+            with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
+                hermes_state_lock._check_sidecar_continuity("root-a", swapped)
+            # The identity that is a swap under root-a is a perfectly fine
+            # bootstrap under a root this process has never observed.
+            hermes_state_lock._check_sidecar_continuity("root-b", swapped)
+            assert hermes_state_lock._known_sidecar_identity == {
+                "root-a": original,
+                "root-b": swapped,
+            }
+
+
+class TestSidecarContinuityIsPerLockRoot:
+    """Fase C9 (Nemo gate 20260820T152324Z): the continuity baseline used to
+    be one process-global ``(st_dev, st_ino)``. That conflated "the sidecar
+    under the root I am using was replaced" — the accident
+    ``_check_sidecar_continuity`` exists to catch — with "this process is now
+    using a different lock root": a legitimate ``HERMES_STATE_LOCK_ROOT``
+    change mid-process, or simply two valid roots in one process, left the
+    process permanently refused after its first acquire. Continuity must be
+    remembered *per lock root* (keyed by the root's canonical path), so each
+    root bootstraps and keeps its own baseline, while a swap staged inside
+    one root still poisons exactly that root."""
+
+    def test_two_distinct_roots_in_one_process_each_keep_their_own_continuity(
+        self, tmp_path, monkeypatch
+    ):
+        """RED against C8: sequential acquires under two genuinely different,
+        equally valid roots in the same process. The second root's first
+        acquire is a bootstrap for *that root*, not a swap of the first."""
+        db_path = tmp_path / "state.db"
+        root_a = tmp_path / "root-a"
+        root_b = tmp_path / "root-b"
+
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root_a))
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root_b))
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True, (
+                "a second valid lock root in the same process was refused — "
+                "continuity is being held process-globally, not per root"
+            )
+
+        # Returning to the first root finds its own baseline intact — the
+        # detour through root_b neither poisoned nor rewrote it.
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root_a))
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+    def test_swap_within_one_root_poisons_that_root_only(
+        self, tmp_path, monkeypatch
+    ):
+        """The C5 detection must survive the per-root split: an
+        unlink+recreate inside root_a is still witnessed and still refuses
+        admission under root_a permanently — but says nothing about root_b,
+        which this process has never observed being tampered with."""
+        db_path = tmp_path / "state.db"
+        root_a = tmp_path / "root-a"
+        root_b = tmp_path / "root-b"
+
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root_a))
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        sidecar_a = write_lock_path()
+        os.unlink(sidecar_a)
+        sidecar_a.write_bytes(b"")  # ordinary regular file, nlink == 1
+
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root_b))
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True, (
+                "a swap witnessed under one root must not poison a "
+                "different, untampered root"
+            )
+
+        # And root_a stays refused — the per-root split must not have
+        # weakened the fail-closed rule inside the tampered root.
+        monkeypatch.setenv("HERMES_STATE_LOCK_ROOT", str(root_a))
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False
+
+    @pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
+    def test_root_reached_through_a_symlinked_parent_shares_one_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """The per-root key must be the root's *canonical* path: two
+        spellings of the same physical root (here, via a symlinked parent
+        directory — the root itself is still a real directory, which the
+        safety checks require) share one baseline, so a swap staged under
+        one spelling is refused under the other."""
+        real_parent = tmp_path / "real-parent"
+        real_parent.mkdir()
+        alias_parent = tmp_path / "alias-parent"
+        os.symlink(real_parent, alias_parent)
+        db_path = tmp_path / "state.db"
+
+        monkeypatch.setenv(
+            "HERMES_STATE_LOCK_ROOT", str(real_parent / "lock-root")
+        )
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+        sidecar = write_lock_path()
+        os.unlink(sidecar)
+        sidecar.write_bytes(b"")
+
+        monkeypatch.setenv(
+            "HERMES_STATE_LOCK_ROOT", str(alias_parent / "lock-root")
+        )
+        with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+            assert admitted is False, (
+                "the same physical root spelled through a symlinked parent "
+                "was treated as a fresh root — the continuity key is not "
+                "canonical"
+            )
 
 
 class TestPrivateLockRootInvariants:
