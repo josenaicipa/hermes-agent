@@ -1,10 +1,10 @@
-"""Cross-process write admission for the shared state.db.
+"""Cross-process write admission for Hermes state databases.
 
-Gateway, Dashboard and ACP share one SQLite file.  SQLite's busy handler is
+Gateway, Dashboard and ACP share SQLite files.  SQLite's busy handler is
 not a queue, so a sibling's schema init can starve create_session /
 append_message until their patience budget expires (2026-08-19 vpsclone:
 Dashboard ``_run_init_schema_with_wide_busy_timeout`` vs Gateway 60 s
-watchdog).  These tests use real child processes and a temporary database
+watchdog).  These tests use real child processes and temporary databases
 — never the live profile store.
 
 Every test in this module gets its own isolated private lock root under
@@ -12,10 +12,30 @@ Every test in this module gets its own isolated private lock root under
 the real per-account root (``/tmp/hermes-state-locks-<uid>`` on POSIX) that
 any live Hermes process on the same machine, under the same OS account,
 might already be relying on.
+
+Fase C7: ``hermes_state_lock`` used to name its sidecar after a stable hash
+of ``canonical_db_key(db_path)`` — symlink-resolved, and case/Unicode-folded
+where the underlying filesystem actually folded those. That kept growing to
+cover one more alias class and was broken outright by a simpler one: an
+arbitrary *hardlink* to a database's inode, created under any name,
+resolves through ``realpath`` to the identical canonical path the real
+database has — there is no alias to detect, the hardlink's identity *is*
+the real identity. The fix removed per-database identity entirely: there is
+now exactly one sidecar (``global.write.lock``) per OS account, shared by
+every Hermes state database that account writes to. ``write_lock_path()``
+takes no database argument at all, so most of the alias-specific test
+classes this module used to need (symlink, hardlink, case-insensitive
+volume, Unicode normalization/casefold) no longer test anything meaningful
+— convergence for those is now a structural property of the function
+signature, not a per-alias behavior to verify. What still needs runtime
+coverage is the actual admission behavior: two genuinely distinct
+databases, and every alias class at once, must now serialize against the
+same lock — see ``TestGlobalLockUnifiesEveryAliasAndDatabase``.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -35,16 +55,11 @@ import pytest
 import hermes_state_lock
 from hermes_state import SessionDB
 from hermes_state_lock import (
-    _CASE_PROBE_PREFIX,
-    _NORM_PROBE_PREFIX,
-    _is_case_insensitive_fs,
-    _is_normalization_insensitive_fs,
     _lock_open_flags,
     _lock_root,
     _posix_lock_root,
     _windows_lock_root,
     acquire_state_write_lock,
-    canonical_db_key,
     write_lock_path,
 )
 
@@ -159,7 +174,7 @@ def _child_cooperative_cycles(
                 if not admitted:
                     Path(err_path).write_text("not admitted", encoding="utf-8")
                     return
-                st = os.stat(_write_lock_path(db_path))
+                st = os.stat(_write_lock_path())
                 identities.append([st.st_dev, st.st_ino])
         Path(identity_path).write_text(json.dumps(identities), encoding="utf-8")
     except Exception:
@@ -468,28 +483,109 @@ class TestTwoProcessWriters:
                 holder.join(5.0)
 
 
-@pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
-class TestSymlinkAliasSharesLock:
-    """Nemo REQUEST_CHANGES (20260820T042052Z): write_lock_path() derived the
-    sidecar from the raw path while canonical_db_key() resolved symlinks, so
-    ``state.db`` and ``alias.db -> state.db`` locked different sidecars and
-    two processes could hold admission on the same underlying SQLite file at
-    once."""
+class TestAcquireSignatureCompatibility:
+    """Requirement 2 (Fase C7): ``acquire_state_write_lock(db_path, ...)``
+    keeps its signature even though ``db_path`` no longer derives the
+    lock's identity — every call site in this codebase (``hermes_state.py``)
+    still passes one, and it remains useful for logging/diagnostics."""
 
-    def test_write_lock_path_matches_for_symlink_alias(self, tmp_path):
+    def test_db_path_remains_the_first_positional_parameter(self):
+        sig = inspect.signature(acquire_state_write_lock)
+        params = list(sig.parameters.values())
+        assert params[0].name == "db_path"
+        assert params[0].kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        assert "timeout_s" in sig.parameters
+        assert sig.parameters["timeout_s"].default == 1.0
+
+    def test_write_lock_path_takes_no_database_argument(self):
+        # Requirement 3: canonicalization/hashing of db_path is gone from
+        # the admission path entirely — there is nothing left to pass.
+        assert inspect.signature(write_lock_path).parameters == {}
+
+
+class TestGlobalLockUnifiesEveryAliasAndDatabase:
+    """Fase C7 (gate 20260820T134628Z): a hardlink to a database's inode,
+    created under an arbitrary name, resolves through ``realpath`` to that
+    database's own canonical path — the old per-database identity
+    (``canonical_db_key`` + case/Unicode folding + hashing) had no way to
+    treat that as anything but the same database, because it *is* the same
+    database by every filesystem measure. The fix is not a better identity
+    check: it is one sidecar per OS account, full stop. These tests would
+    have failed against the pre-C7 design for ``other_db`` specifically —
+    that design deliberately kept genuinely distinct databases on separate
+    locks; unifying them onto one lock is exactly what changed.
+    """
+
+    def test_two_genuinely_distinct_databases_serialize_on_one_lock(
+        self, tmp_path
+    ):
+        """The core behavior change: db_a and db_b share no inode, no
+        directory, no name — nothing but the OS account. Under the old
+        per-database design these would never have blocked each other."""
+        db_a = tmp_path / "a" / "state.db"
+        db_b = tmp_path / "b" / "state.db"
+        db_a.parent.mkdir()
+        db_b.parent.mkdir()
+        db_a.touch()
+        db_b.touch()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_a():
+            with acquire_state_write_lock(db_a, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_a)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            t0 = time.monotonic()
+            with acquire_state_write_lock(db_b, timeout_s=0.25) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(db_b, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+    def test_distinct_db_symlink_hardlink_case_unicode_and_nonexistent_aliases_all_serialize(
+        self, tmp_path
+    ):
+        """One holder on the real database; every other spelling/alias
+        class this module used to canonicalize individually — plus a
+        wholly unrelated second database and a path that does not exist at
+        all — must all observe the same admission token."""
         real_db = tmp_path / "state.db"
         real_db.touch()
-        alias_db = tmp_path / "alias.db"
-        os.symlink(real_db, alias_db)
 
-        assert write_lock_path(real_db) == write_lock_path(alias_db)
-        assert canonical_db_key(real_db) == canonical_db_key(alias_db)
+        candidates = []
+        if _HAS_SYMLINK:
+            symlink_alias = tmp_path / "alias.db"
+            os.symlink(real_db, symlink_alias)
+            candidates.append(symlink_alias)
+        if _HAS_HARDLINK:
+            hardlink_alias = tmp_path / "State.DB"
+            os.link(real_db, hardlink_alias)
+            candidates.append(hardlink_alias)
 
-    def test_alias_writer_is_blocked_by_real_path_holder(self, tmp_path):
-        real_db = tmp_path / "state.db"
-        real_db.touch()
-        alias_db = tmp_path / "alias.db"
-        os.symlink(real_db, alias_db)
+        other_db = tmp_path / "other" / "state.db"
+        other_db.parent.mkdir()
+        other_db.touch()
+        candidates.append(other_db)
+
+        unicode_db = tmp_path / unicodedata.normalize("NFC", "café.db")
+        candidates.append(unicode_db)  # does not exist
+
+        nonexistent_db = tmp_path / "does-not-exist-yet.db"
+        candidates.append(nonexistent_db)
 
         started = threading.Event()
         release = threading.Event()
@@ -504,735 +600,37 @@ class TestSymlinkAliasSharesLock:
         holder.start()
         try:
             assert started.wait(2.0)
-            # A different thread going through the alias must see the same
-            # admission token as the real path and time out while it is held.
-            t0 = time.monotonic()
-            with acquire_state_write_lock(alias_db, timeout_s=0.25) as admitted:
-                assert admitted is False
-            assert time.monotonic() - t0 < 1.5
+            for candidate in candidates:
+                t0 = time.monotonic()
+                with acquire_state_write_lock(candidate, timeout_s=0.25) as admitted:
+                    assert admitted is False, (
+                        f"{candidate} was not serialized behind the global lock"
+                    )
+                assert time.monotonic() - t0 < 1.5
         finally:
             release.set()
             holder.join(5.0)
 
-        with acquire_state_write_lock(alias_db, timeout_s=1.0) as admitted:
+        for candidate in candidates:
+            with acquire_state_write_lock(candidate, timeout_s=1.0) as admitted:
+                assert admitted is True
+
+    def test_db_path_is_never_touched_on_the_filesystem(self, tmp_path):
+        """A db_path whose parent directories do not even exist must still
+        admit — proof nothing in the admission path stats, resolves, or
+        otherwise touches db_path itself."""
+        bogus = tmp_path / "does" / "not" / "exist" / "at" / "all.db"
+        assert not bogus.parent.exists()
+        with acquire_state_write_lock(bogus, timeout_s=1.0) as admitted:
             assert admitted is True
+        assert not bogus.parent.exists()
 
-
-@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
-class TestCaseInsensitiveAliasSharesLock:
-    """Gate 20260820T124010Z: ``canonical_db_key()`` folded case with
-    ``os.path.normcase``, but ``normcase`` is the identity function on every
-    POSIX platform, including macOS — regardless of whether the underlying
-    volume is case-insensitive. macOS's default APFS/HFS+ volumes *are*
-    case-insensitive (case-preserving), so ``State.db`` and ``state.db`` can
-    be the very same on-disk file there, yet the old ``canonical_db_key``
-    hashed them to two different keys and split admission across two
-    sidecars — the same class of bug ``TestSymlinkAliasSharesLock`` covers
-    for symlinks, just reached through case instead of a link.
-
-    A genuinely case-insensitive volume isn't available on every runner this
-    suite executes on, but the property under test — two spellings that name
-    the same file must canonicalize identically — doesn't require one: a
-    hardlink from a differently-cased name onto the same inode reproduces
-    exactly what a case-insensitive lookup resolves to, without depending on
-    the host filesystem's own case sensitivity. The alias is built with
-    ``str.swapcase()`` (not a single flipped letter) because that is exactly
-    what :func:`hermes_state_lock._is_case_insensitive_fs` probes with —
-    matching it exactly is what lets the hardlink stand in for a real
-    case-insensitive volume, where *every* case spelling of the name
-    (single-letter or fully swapped) would land on the one directory entry.
-    """
-
-    @pytest.mark.skipif(not _HAS_HARDLINK, reason="platform has no os.link")
-    def test_write_lock_path_matches_for_differently_cased_alias(self, tmp_path):
-        real_db = tmp_path / "state.db"
-        real_db.touch()
-        cased_alias = tmp_path / real_db.name.swapcase()
-        os.link(real_db, cased_alias)
-
-        assert write_lock_path(real_db) == write_lock_path(cased_alias)
-        assert canonical_db_key(real_db) == canonical_db_key(cased_alias)
-
-    @pytest.mark.skipif(not _HAS_HARDLINK, reason="platform has no os.link")
-    def test_alias_writer_is_blocked_by_differently_cased_holder(self, tmp_path):
-        real_db = tmp_path / "state.db"
-        real_db.touch()
-        cased_alias = tmp_path / real_db.name.swapcase()
-        os.link(real_db, cased_alias)
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def _hold_real():
-            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
-                assert admitted is True
-                started.set()
-                release.wait(5.0)
-
-        holder = threading.Thread(target=_hold_real)
-        holder.start()
-        try:
-            assert started.wait(2.0)
-            # A different thread going through the differently-cased alias
-            # must see the same admission token as the real path and time
-            # out while it is held.
-            t0 = time.monotonic()
-            with acquire_state_write_lock(cased_alias, timeout_s=0.25) as admitted:
-                assert admitted is False
-            assert time.monotonic() - t0 < 1.5
-        finally:
-            release.set()
-            holder.join(5.0)
-
-        with acquire_state_write_lock(cased_alias, timeout_s=1.0) as admitted:
-            assert admitted is True
-
-    def test_genuinely_distinct_files_differing_only_in_case_are_not_merged(
+    def test_write_lock_path_is_a_pure_function_of_the_lock_root_only(
         self, tmp_path
     ):
-        """The probe must not report false positives: two *separate* files
-        that happen to differ only in case (no hardlink, no symlink between
-        them) must keep separate keys — merging them would let a writer on
-        one file believe it holds admission over the other."""
-        lower_db = tmp_path / "state.db"
-        lower_db.write_bytes(b"lower")
-        upper_db = tmp_path / "State.db"
-        upper_db.write_bytes(b"upper")
-
-        assert not _is_case_insensitive_fs(str(lower_db))
-        assert canonical_db_key(lower_db) != canonical_db_key(upper_db)
-        assert write_lock_path(lower_db) != write_lock_path(upper_db)
-
-    def test_basename_with_no_cased_characters_is_not_probed_as_insensitive(
-        self, tmp_path
-    ):
-        digits_db = tmp_path / "12345.db"
-        digits_db.touch()
-        assert _is_case_insensitive_fs(str(digits_db)) is False
-
-    def test_missing_path_probes_the_parent_directory_instead_of_giving_up(
-        self, tmp_path
-    ):
-        """On this (case-sensitive) test filesystem, probing the existing
-        parent directory of a not-yet-created database still correctly
-        answers "not case-insensitive" — but it now gets there by actually
-        probing ``tmp_path``, not by short-circuiting on ENOENT. See
-        ``TestNewDatabaseCaseInsensitiveAliasConverges`` for the case this
-        distinction exists to fix."""
-        missing = tmp_path / "does-not-exist.db"
-        assert _is_case_insensitive_fs(str(missing)) is False
-
-
-def _make_case_insensitive_lookup(monkeypatch, directory):
-    """Simulate a case-insensitive/case-preserving directory (e.g. default
-    APFS) for *directory* without needing one actually mounted.
-
-    Wraps ``os.lstat`` so that a lookup for a name that doesn't exist
-    verbatim in *directory* falls back to a case-insensitive match among
-    that directory's real entries — exactly what a case-folding filesystem's
-    own lookup does. Every other path (including any name that already
-    exists verbatim, and every path outside *directory*) goes straight to
-    the real ``os.lstat`` untouched, so this cannot affect unrelated tests
-    or unrelated directories running in the same process.
-
-    This targets ``os.lstat`` specifically because that is the only syscall
-    ``_probe_directory_case_folds`` uses to resolve the swapped-case name —
-    the probe file itself is created with its one real, randomly generated
-    name via ``os.open``, so there is exactly one genuine directory entry
-    for the shim to fold onto.
-    """
-    real_lstat = os.lstat
-    directory = os.path.realpath(str(directory))
-
-    def fake_lstat(path, *args, **kwargs):
-        fspath = os.fspath(path)
-        try:
-            return real_lstat(fspath, *args, **kwargs)
-        except FileNotFoundError:
-            parent, name = os.path.split(fspath)
-            if os.path.realpath(parent or ".") != directory:
-                raise
-            try:
-                entries = os.listdir(directory)
-            except OSError:
-                raise
-            for entry in entries:
-                if entry.lower() == name.lower():
-                    return real_lstat(os.path.join(directory, entry), *args, **kwargs)
-            raise
-
-    monkeypatch.setattr(os, "lstat", fake_lstat)
-
-
-@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
-class TestNewDatabaseCaseInsensitiveAliasConverges:
-    """Gate 20260820T125109Z REQUEST_CHANGES: ``_is_case_insensitive_fs``
-    returned ``False`` unconditionally whenever the target database did not
-    exist yet (``ENOENT``). On a genuinely case-insensitive volume that is
-    exactly backwards for the case that matters most — schema init on a
-    brand-new ``state.db`` — because two sibling processes racing to create
-    it through differently-cased spellings (``state.db`` vs ``State.db``)
-    would each probe ENOENT, each conclude "not proven case-insensitive",
-    and each hash to a *different* lock key, so both would believe they hold
-    exclusive admission over what the filesystem resolves to one file.
-
-    A real case-insensitive volume isn't available on every runner this
-    suite executes on, so ``_make_case_insensitive_lookup`` reproduces what
-    such a volume's own lookup does — case-insensitive fallback resolution
-    within one directory — without depending on the host filesystem.
-    """
-
-    def test_canonical_db_key_converges_for_case_alias_of_nonexistent_db(
-        self, tmp_path, monkeypatch
-    ):
-        _make_case_insensitive_lookup(monkeypatch, tmp_path)
-        real_db = tmp_path / "state.db"
-        cased_alias = tmp_path / "State.db"
-
-        assert not real_db.exists()
-        assert not cased_alias.exists()
-        assert canonical_db_key(real_db) == canonical_db_key(cased_alias)
-
-    def test_write_lock_path_converges_for_case_alias_of_nonexistent_db(
-        self, tmp_path, monkeypatch
-    ):
-        _make_case_insensitive_lookup(monkeypatch, tmp_path)
-        real_db = tmp_path / "state.db"
-        cased_alias = tmp_path / "State.db"
-
-        assert write_lock_path(real_db) == write_lock_path(cased_alias)
-
-    def test_concurrent_schema_init_via_case_alias_is_serialized_by_the_lock(
-        self, tmp_path, monkeypatch
-    ):
-        """The actual failure mode this gate exists to close: two "sibling
-        processes" (here, threads) racing schema init on a not-yet-created
-        database through differently-cased spellings must be admitted as one
-        writer at a time, not two — mirrors
-        ``TestCaseInsensitiveAliasSharesLock`` but for a database neither
-        side has created yet."""
-        _make_case_insensitive_lookup(monkeypatch, tmp_path)
-        real_db = tmp_path / "state.db"
-        cased_alias = tmp_path / "State.db"
-        assert not real_db.exists()
-        assert not cased_alias.exists()
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def _hold_real():
-            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
-                assert admitted is True
-                started.set()
-                release.wait(5.0)
-
-        holder = threading.Thread(target=_hold_real)
-        holder.start()
-        try:
-            assert started.wait(2.0)
-            t0 = time.monotonic()
-            with acquire_state_write_lock(cased_alias, timeout_s=0.25) as admitted:
-                assert admitted is False
-            assert time.monotonic() - t0 < 1.5
-        finally:
-            release.set()
-            holder.join(5.0)
-
-        with acquire_state_write_lock(cased_alias, timeout_s=1.0) as admitted:
-            assert admitted is True
-
-    def test_case_sensitive_directory_keeps_nonexistent_aliases_separate(
-        self, tmp_path
-    ):
-        """No shim here: on this (real, case-sensitive) test filesystem, two
-        differently-cased spellings of a database neither side has created
-        yet must keep separate keys and must NOT block each other — folding
-        case on a genuinely case-sensitive filesystem would be the exact
-        false-merge ``test_genuinely_distinct_files_differing_only_in_case_
-        are_not_merged`` guards against, just reached via ENOENT instead of
-        two already-existing files."""
-        real_db = tmp_path / "state.db"
-        cased_alias = tmp_path / "State.db"
-        assert not real_db.exists()
-        assert not cased_alias.exists()
-
-        assert canonical_db_key(real_db) != canonical_db_key(cased_alias)
-        assert write_lock_path(real_db) != write_lock_path(cased_alias)
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def _hold_real():
-            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
-                assert admitted is True
-                started.set()
-                release.wait(5.0)
-
-        holder = threading.Thread(target=_hold_real)
-        holder.start()
-        try:
-            assert started.wait(2.0)
-            # Separate keys: the alias must be admitted immediately, not
-            # time out waiting on the real path's holder.
-            with acquire_state_write_lock(cased_alias, timeout_s=1.0) as admitted:
-                assert admitted is True
-        finally:
-            release.set()
-            holder.join(5.0)
-
-
-@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
-class TestDirectoryCaseProbeHygiene:
-    """``_probe_directory_case_folds`` (the fallback ``_is_case_insensitive_fs``
-    takes when the target database doesn't exist yet) creates a real,
-    if short-lived, file on disk. These tests pin down the safety properties
-    that make that acceptable: it never leaks the probe file, it never
-    touches a name it didn't create itself, and it degrades to "cannot
-    prove" rather than raising or hanging when it can't complete."""
-
-    def test_probe_leaves_no_file_behind_on_a_case_sensitive_directory(
-        self, tmp_path
-    ):
-        before = set(os.listdir(tmp_path))
-        missing = tmp_path / "does-not-exist.db"
-
-        assert _is_case_insensitive_fs(str(missing)) is False
-        assert set(os.listdir(tmp_path)) == before
-
-    def test_probe_leaves_no_file_behind_on_a_case_insensitive_directory(
-        self, tmp_path, monkeypatch
-    ):
-        _make_case_insensitive_lookup(monkeypatch, tmp_path)
-        before = set(os.listdir(tmp_path))
-        missing = tmp_path / "does-not-exist.db"
-
-        assert _is_case_insensitive_fs(str(missing)) is True
-        assert set(os.listdir(tmp_path)) == before
-
-    def test_probe_never_deletes_a_preexisting_swapped_case_file(self, tmp_path):
-        """If a file that happens to collide with a probe's swapped-case
-        name already exists for unrelated reasons, the probe must leave it
-        untouched — it may only ever unlink the exact name it created."""
-        real_lstat = os.lstat
-        swapped_prefix = _CASE_PROBE_PREFIX.swapcase()
-        probe_swapped_names = []
-
-        def spying_lstat(path, *args, **kwargs):
-            fspath = os.fspath(path)
-            name = os.path.basename(fspath)
-            if name.startswith(swapped_prefix):
-                probe_swapped_names.append(fspath)
-            return real_lstat(fspath, *args, **kwargs)
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(os, "lstat", spying_lstat)
-            missing = tmp_path / "does-not-exist.db"
-            assert _is_case_insensitive_fs(str(missing)) is False
-
-        # The probe's swapped-name candidate was looked up (lstat'd)...
-        assert probe_swapped_names
-        # ...but since nothing was ever created under that name, nothing
-        # exists there afterward either.
-        for candidate in probe_swapped_names:
-            assert not os.path.lexists(candidate)
-
-    def test_probe_degrades_to_false_when_every_candidate_name_collides(
-        self, tmp_path, monkeypatch
-    ):
-        """A pathological (astronomically unlikely in practice) run of
-        random-name collisions must not hang or crash the caller — it must
-        give up after a bounded number of attempts and report "cannot
-        prove"."""
-
-        def always_collides(*_args, **_kwargs):
-            raise FileExistsError("simulated collision")
-
-        monkeypatch.setattr(os, "open", always_collides)
-        missing = tmp_path / "does-not-exist.db"
-
-        assert _is_case_insensitive_fs(str(missing)) is False
-
-    def test_probe_degrades_to_false_when_directory_is_unwritable(self, tmp_path):
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            pytest.skip("root bypasses directory write permission checks")
-
-        readonly_dir = tmp_path / "readonly"
-        readonly_dir.mkdir()
-        readonly_dir.chmod(0o500)
-        try:
-            missing = readonly_dir / "does-not-exist.db"
-            assert _is_case_insensitive_fs(str(missing)) is False
-        finally:
-            readonly_dir.chmod(0o700)
-
-    def test_probe_degrades_to_false_when_parent_directory_is_missing(
-        self, tmp_path
-    ):
-        missing = tmp_path / "no-such-parent" / "does-not-exist.db"
-        assert _is_case_insensitive_fs(str(missing)) is False
-
-    def test_probe_uses_swapcase_not_a_fixed_case_conversion(self, tmp_path):
-        """Sanity check on the probe's own naming: ``_CASE_PROBE_PREFIX``
-        must actually contain cased characters, or every probe attempt would
-        degenerate into the swapped==original no-op guard and this whole
-        fallback would be dead code."""
-        assert _CASE_PROBE_PREFIX.swapcase() != _CASE_PROBE_PREFIX
-
-
-@pytest.mark.skipif(not _HAS_HARDLINK, reason="platform has no os.link")
-class TestUnicodeAliasConvergesViaStableIdentity:
-    """Gate 20260820T131955Z REQUEST_CHANGES: ``canonical_db_key()`` folded
-    case with ``real.lower()`` after ``_is_case_insensitive_fs`` proved a
-    filesystem folds case -- but ``str.lower()`` is not the same operation as
-    Unicode caseless matching (``str.casefold()``), and the module never
-    considered Unicode *normalization* equivalence (NFC vs NFD) at all. Two
-    real, non-trivial Unicode aliases of the very same on-disk file could
-    therefore hash to two different sidecars and defeat the mutual exclusion
-    this module exists to provide.
-
-    A genuinely case/normalization-folding volume isn't available on every
-    runner, so — exactly like ``TestCaseInsensitiveAliasSharesLock`` — a
-    hardlink from an alternate spelling onto the same inode reproduces
-    precisely what such a volume's own lookup resolves to, without depending
-    on the host filesystem's own folding behavior.
-    """
-
-    def test_casefold_beyond_ascii_converges_for_an_existing_file(self, tmp_path):
-        """``'ß'.lower() == 'ß'`` (unchanged) but ``'ß'.casefold() == 'ss'``
-        -- the textbook case where ``str.lower()`` is not Unicode caseless
-        matching. A filesystem whose case-fold table merges 'ß' with 'ss'
-        (as APFS's does) would resolve ``strasse.db`` and ``straße.db`` to
-        the same file; the old ``.lower()``-based fold could not converge
-        them even after ``_is_case_insensitive_fs`` proved the location
-        case-insensitive for *some* pair, because folding the sharp-s
-        spelling with ``.lower()`` leaves it unchanged instead of merging it
-        with the double-s spelling."""
-        sharp_s_db = tmp_path / "straße.db"  # "straße.db"
-        sharp_s_db.touch()
-        double_s_alias = tmp_path / "strasse.db"
-        os.link(sharp_s_db, double_s_alias)
-
-        assert canonical_db_key(sharp_s_db) == canonical_db_key(double_s_alias)
-        assert write_lock_path(sharp_s_db) == write_lock_path(double_s_alias)
-
-    def test_nfc_and_nfd_spellings_of_an_existing_file_converge(self, tmp_path):
-        """ "café.db" written with the precomposed 'é' (U+00E9, NFC) and the
-        same visual name spelled with 'e' + a combining acute accent
-        (U+0065 U+0301, NFD) are two different byte sequences. HFS+/APFS's
-        default mode folds normalization on lookup in addition to case, so
-        they can be the very same on-disk file there -- ``canonical_db_key``
-        never considered this axis at all before this fix, regardless of
-        ``.lower()`` vs ``.casefold()``."""
-        nfc_name = unicodedata.normalize("NFC", "café.db")  # "café.db"
-        nfd_name = unicodedata.normalize("NFD", "café.db")  # "café.db"
-        assert nfc_name != nfd_name, "sanity: the two spellings must differ"
-
-        nfc_db = tmp_path / nfc_name
-        nfc_db.touch()
-        nfd_alias = tmp_path / nfd_name
-        os.link(nfc_db, nfd_alias)
-
-        assert canonical_db_key(nfc_db) == canonical_db_key(nfd_alias)
-        assert write_lock_path(nfc_db) == write_lock_path(nfd_alias)
-
-    def test_ligature_alias_converges_even_though_no_probe_constructs_it(
-        self, tmp_path
-    ):
-        """ "file.db" and "ﬁle.db" (U+FB01 LATIN SMALL LIGATURE FI in place of
-        the two letters "fi") are neither a ``swapcase()`` of one another
-        nor NFC/NFD forms of each other -- ``unicodedata.normalize`` treats a
-        compatibility ligature like this as a *compatibility* (NFKC/NFKD)
-        distinction, not a canonical (NFC/NFD) one, so this alias is outside
-        what this module's swapcase- and NFC/NFD-based probes construct or
-        test for. Unicode full case folding (``str.casefold()``) still maps
-        the ligature to "fi", though, so preferring the resolved object's
-        own stable identity over any specific guessed transform converges
-        this alias too -- without this module needing to special-case
-        ligatures, or any other exotic casefold mapping, at all."""
-        ligature_db = tmp_path / "ﬁle.db"  # "ﬁle.db"
-        ligature_db.touch()
-        plain_alias = tmp_path / "file.db"
-        os.link(ligature_db, plain_alias)
-
-        assert canonical_db_key(ligature_db) == canonical_db_key(plain_alias)
-        assert write_lock_path(ligature_db) == write_lock_path(plain_alias)
-
-    def test_alias_writer_is_blocked_by_unicode_normalized_holder(self, tmp_path):
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        nfd_name = unicodedata.normalize("NFD", "café.db")
-        nfc_db = tmp_path / nfc_name
-        nfc_db.touch()
-        nfd_alias = tmp_path / nfd_name
-        os.link(nfc_db, nfd_alias)
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def _hold_real():
-            with acquire_state_write_lock(nfc_db, timeout_s=2.0) as admitted:
-                assert admitted is True
-                started.set()
-                release.wait(5.0)
-
-        holder = threading.Thread(target=_hold_real)
-        holder.start()
-        try:
-            assert started.wait(2.0)
-            t0 = time.monotonic()
-            with acquire_state_write_lock(nfd_alias, timeout_s=0.25) as admitted:
-                assert admitted is False
-            assert time.monotonic() - t0 < 1.5
-        finally:
-            release.set()
-            holder.join(5.0)
-
-        with acquire_state_write_lock(nfd_alias, timeout_s=1.0) as admitted:
-            assert admitted is True
-
-
-class TestGenuinelyDistinctUnicodeFilesAreNotMerged:
-    """Companion control to ``TestUnicodeAliasConvergesViaStableIdentity``:
-    on a normalization- and case-*sensitive* filesystem (this test's real,
-    unmodified ``tmp_path`` -- no hardlink, no shim), two Unicode spellings
-    that merely happen to differ only in normalization form or case, with no
-    hardlink or symlink tying them together, are genuinely different files
-    and must keep separate keys. Converging them would let a writer holding
-    admission on one believe it also covers the other."""
-
-    def test_nfc_and_nfd_spellings_that_are_separate_files_are_not_merged(
-        self, tmp_path
-    ):
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        nfd_name = unicodedata.normalize("NFD", "café.db")
-        nfc_db = tmp_path / nfc_name
-        nfc_db.write_bytes(b"nfc")
-        nfd_db = tmp_path / nfd_name
-        nfd_db.write_bytes(b"nfd")
-
-        assert not _is_normalization_insensitive_fs(str(nfc_db))
-        assert canonical_db_key(nfc_db) != canonical_db_key(nfd_db)
-        assert write_lock_path(nfc_db) != write_lock_path(nfd_db)
-
-    def test_casefold_distinct_spellings_that_are_separate_files_are_not_merged(
-        self, tmp_path
-    ):
-        sharp_s_db = tmp_path / "straße.db"
-        sharp_s_db.write_bytes(b"sharp-s")
-        double_s_db = tmp_path / "strasse.db"
-        double_s_db.write_bytes(b"double-s")
-
-        assert canonical_db_key(sharp_s_db) != canonical_db_key(double_s_db)
-        assert write_lock_path(sharp_s_db) != write_lock_path(double_s_db)
-
-
-def _make_normalization_insensitive_lookup(monkeypatch, directory):
-    """Simulate a filesystem that folds Unicode normalization forms on
-    lookup (as HFS+/APFS's default mode does) for *directory*, the same way
-    ``_make_case_insensitive_lookup`` simulates case-folding: by wrapping
-    ``os.lstat`` so a lookup for a name that doesn't exist verbatim falls
-    back to a normalization-insensitive match among the directory's real
-    entries.
-
-    This targets ``os.lstat`` for the same reason ``_make_case_insensitive_
-    lookup`` does: it is the only syscall ``_probe_directory_normalization_
-    folds`` uses to resolve the alternate-normalization spelling once a
-    fresh probe file has been created via ``os.open``.
-    """
-    real_lstat = os.lstat
-    directory = os.path.realpath(str(directory))
-
-    def fake_lstat(path, *args, **kwargs):
-        fspath = os.fspath(path)
-        try:
-            return real_lstat(fspath, *args, **kwargs)
-        except FileNotFoundError:
-            parent, name = os.path.split(fspath)
-            if os.path.realpath(parent or ".") != directory:
-                raise
-            try:
-                entries = os.listdir(directory)
-            except OSError:
-                raise
-            target = unicodedata.normalize("NFC", name)
-            for entry in entries:
-                if unicodedata.normalize("NFC", entry) == target:
-                    return real_lstat(os.path.join(directory, entry), *args, **kwargs)
-            raise
-
-    monkeypatch.setattr(os, "lstat", fake_lstat)
-
-
-@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
-class TestNewDatabaseNormalizationInsensitiveAliasConverges:
-    """Requirement 3 (Fase C6, 20260820T131955Z): extend the not-yet-created
-    -database probe (used for the schema-init race, two sibling processes
-    racing to create ``state.db`` before either has) to also detect Unicode
-    normalization folding, not just case folding -- mirrors
-    ``TestNewDatabaseCaseInsensitiveAliasConverges`` on the normalization
-    axis."""
-
-    def test_canonical_db_key_converges_for_normalization_alias_of_nonexistent_db(
-        self, tmp_path, monkeypatch
-    ):
-        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        nfd_name = unicodedata.normalize("NFD", "café.db")
-        nfc_db = tmp_path / nfc_name
-        nfd_alias = tmp_path / nfd_name
-
-        assert not nfc_db.exists()
-        assert not nfd_alias.exists()
-        assert canonical_db_key(nfc_db) == canonical_db_key(nfd_alias)
-
-    def test_write_lock_path_converges_for_normalization_alias_of_nonexistent_db(
-        self, tmp_path, monkeypatch
-    ):
-        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        nfd_name = unicodedata.normalize("NFD", "café.db")
-        nfc_db = tmp_path / nfc_name
-        nfd_alias = tmp_path / nfd_name
-
-        assert write_lock_path(nfc_db) == write_lock_path(nfd_alias)
-
-    def test_concurrent_schema_init_via_normalization_alias_is_serialized(
-        self, tmp_path, monkeypatch
-    ):
-        """The actual failure mode this requirement exists to close: two
-        "sibling processes" (here, threads) racing schema init on a
-        not-yet-created database through NFC- and NFD-spelled paths must be
-        admitted as one writer at a time, not two."""
-        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        nfd_name = unicodedata.normalize("NFD", "café.db")
-        nfc_db = tmp_path / nfc_name
-        nfd_alias = tmp_path / nfd_name
-        assert not nfc_db.exists()
-        assert not nfd_alias.exists()
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def _hold_real():
-            with acquire_state_write_lock(nfc_db, timeout_s=2.0) as admitted:
-                assert admitted is True
-                started.set()
-                release.wait(5.0)
-
-        holder = threading.Thread(target=_hold_real)
-        holder.start()
-        try:
-            assert started.wait(2.0)
-            t0 = time.monotonic()
-            with acquire_state_write_lock(nfd_alias, timeout_s=0.25) as admitted:
-                assert admitted is False
-            assert time.monotonic() - t0 < 1.5
-        finally:
-            release.set()
-            holder.join(5.0)
-
-        with acquire_state_write_lock(nfd_alias, timeout_s=1.0) as admitted:
-            assert admitted is True
-
-    def test_normalization_sensitive_directory_keeps_nonexistent_aliases_separate(
-        self, tmp_path
-    ):
-        """No shim here: on this (real, normalization-sensitive) test
-        filesystem, NFC- and NFD-spelled paths neither side has created yet
-        must keep separate keys and must NOT block each other."""
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        nfd_name = unicodedata.normalize("NFD", "café.db")
-        nfc_db = tmp_path / nfc_name
-        nfd_alias = tmp_path / nfd_name
-        assert not nfc_db.exists()
-        assert not nfd_alias.exists()
-
-        assert canonical_db_key(nfc_db) != canonical_db_key(nfd_alias)
-        assert write_lock_path(nfc_db) != write_lock_path(nfd_alias)
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def _hold_real():
-            with acquire_state_write_lock(nfc_db, timeout_s=2.0) as admitted:
-                assert admitted is True
-                started.set()
-                release.wait(5.0)
-
-        holder = threading.Thread(target=_hold_real)
-        holder.start()
-        try:
-            assert started.wait(2.0)
-            with acquire_state_write_lock(nfd_alias, timeout_s=1.0) as admitted:
-                assert admitted is True
-        finally:
-            release.set()
-            holder.join(5.0)
-
-
-@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
-class TestIsNormalizationInsensitiveFsUnit:
-    """Direct unit coverage of ``_is_normalization_insensitive_fs``, mirroring
-    the existing direct coverage of ``_is_case_insensitive_fs``."""
-
-    def test_basename_with_nothing_decomposable_is_not_probed(self, tmp_path):
-        plain_db = tmp_path / "state.db"
-        plain_db.touch()
-        assert _is_normalization_insensitive_fs(str(plain_db)) is False
-
-    def test_missing_path_probes_the_parent_directory_instead_of_giving_up(
-        self, tmp_path
-    ):
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        missing = tmp_path / nfc_name
-        assert _is_normalization_insensitive_fs(str(missing)) is False
-
-    def test_probe_never_deletes_a_preexisting_alternate_normalization_file(
-        self, tmp_path
-    ):
-        """If a file that happens to collide with a probe's alternate-
-        normalization name already exists for unrelated reasons, the probe
-        must leave it untouched."""
-        real_lstat = os.lstat
-        probed_names = []
-
-        def spying_lstat(path, *args, **kwargs):
-            fspath = os.fspath(path)
-            name = os.path.basename(fspath)
-            if name.startswith(_NORM_PROBE_PREFIX):
-                probed_names.append(fspath)
-            return real_lstat(fspath, *args, **kwargs)
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(os, "lstat", spying_lstat)
-            nfc_name = unicodedata.normalize("NFC", "café.db")
-            missing = tmp_path / nfc_name
-            assert _is_normalization_insensitive_fs(str(missing)) is False
-
-        assert probed_names
-        for candidate in probed_names:
-            assert not os.path.lexists(candidate)
-
-    def test_probe_leaves_no_file_behind_on_a_normalization_sensitive_directory(
-        self, tmp_path
-    ):
-        before = set(os.listdir(tmp_path))
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        missing = tmp_path / nfc_name
-
-        assert _is_normalization_insensitive_fs(str(missing)) is False
-        assert set(os.listdir(tmp_path)) == before
-
-    def test_probe_leaves_no_file_behind_on_a_normalization_insensitive_directory(
-        self, tmp_path, monkeypatch
-    ):
-        _make_normalization_insensitive_lookup(monkeypatch, tmp_path)
-        before = set(os.listdir(tmp_path))
-        nfc_name = unicodedata.normalize("NFC", "café.db")
-        missing = tmp_path / nfc_name
-
-        assert _is_normalization_insensitive_fs(str(missing)) is True
-        assert set(os.listdir(tmp_path)) == before
+        assert write_lock_path() == write_lock_path()
+        assert write_lock_path().parent == _lock_root()
+        assert write_lock_path().name == "global.write.lock"
 
 
 class TestLegacyColocationNoLongerMatters:
@@ -1299,7 +697,7 @@ class TestLegacyColocationNoLongerMatters:
         # root the autouse fixture points at for every other test here.
         monkeypatch.delenv("HERMES_STATE_LOCK_ROOT", raising=False)
         db_path = tmp_path / "state.db"
-        lock_path = write_lock_path(db_path)
+        lock_path = write_lock_path()
         assert tmp_path not in lock_path.parents
         assert lock_path.parent != db_path.parent
 
@@ -1315,7 +713,7 @@ class TestSidecarSymlinkSubstitution:
         db_path = tmp_path / "state.db"
         target = tmp_path / "other-process.lock"
         target.write_bytes(b"")
-        lock_path = write_lock_path(db_path)
+        lock_path = write_lock_path()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, lock_path)
 
@@ -1360,7 +758,7 @@ class TestSidecarInodeSubstitutionBypass:
         holder.start()
         try:
             assert started.wait(2.0)
-            lock_path = write_lock_path(db_path)
+            lock_path = write_lock_path()
 
             # Simulate a same-account race swapping the sidecar for a
             # hardlink to an unrelated file while the holder still owns the
@@ -1384,7 +782,7 @@ class TestSidecarInodeSubstitutionBypass:
         # The module must never itself unlink the tampered sidecar (that
         # would just be the same swap performed by trusted code); prove it
         # left the hardlink alone.
-        lock_path = write_lock_path(db_path)
+        lock_path = write_lock_path()
         victim = tmp_path / "victim.lock"
         assert os.path.samefile(lock_path, victim)
 
@@ -1405,7 +803,7 @@ class TestSidecarInodeSubstitutionBypass:
         # disagree with, so it is unaffected by what this process witnessed
         # — bootstrap must keep working for everyone else.
         with pytest.MonkeyPatch.context() as mpatch:
-            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", {})
+            mpatch.setattr(hermes_state_lock, "_known_sidecar_identity", None)
             with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
                 assert admitted is True
 
@@ -1452,14 +850,14 @@ class TestSidecarIdentityContinuity:
             for _ in range(25):
                 with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
                     assert admitted is True
-                    st = os.stat(write_lock_path(db_path))
+                    st = os.stat(write_lock_path())
                     identities.add((st.st_dev, st.st_ino))
 
         assert len(identities) == 1, (
             "the sidecar's identity must not change across cooperative "
             f"release/reacquire cycles, observed: {identities}"
         )
-        lock_path = str(write_lock_path(db_path))
+        lock_path = str(write_lock_path())
         assert lock_path not in unlinked_paths, (
             "acquire_state_write_lock must never unlink its own sidecar"
         )
@@ -1475,7 +873,7 @@ class TestSidecarIdentityContinuity:
         # the same starting identity, not two independent bootstraps.
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        baseline = os.stat(write_lock_path(db_path))
+        baseline = os.stat(write_lock_path())
         baseline_identity = [baseline.st_dev, baseline.st_ino]
 
         ctx = mp.get_context("spawn")
@@ -1511,14 +909,12 @@ class TestSidecarIdentityContinuity:
         self, tmp_path
     ):
         """Requirement 3's condition: the new check must not break the very
-        first acquire on a fresh database, where there is nothing yet to
-        compare against."""
+        first acquire, where there is nothing yet to compare against."""
         db_path = tmp_path / "state.db"
-        key = canonical_db_key(db_path)
-        assert key not in hermes_state_lock._known_sidecar_identity
+        assert hermes_state_lock._known_sidecar_identity is None
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        assert key in hermes_state_lock._known_sidecar_identity
+        assert hermes_state_lock._known_sidecar_identity is not None
 
     def test_plain_unlink_and_recreate_between_cycles_is_rejected(self, tmp_path):
         """RED before the continuity check existed: a plain unlink+recreate
@@ -1534,7 +930,7 @@ class TestSidecarIdentityContinuity:
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
 
-        lock_path = write_lock_path(db_path)
+        lock_path = write_lock_path()
         original = os.stat(lock_path)
         os.unlink(lock_path)
         lock_path.write_bytes(b"")  # ordinary regular file, nlink == 1
@@ -1550,35 +946,31 @@ class TestSidecarIdentityContinuity:
         with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
             assert admitted is False
 
-    def test_matching_identity_on_reacquire_does_not_raise(self, tmp_path):
+    def test_matching_identity_on_reacquire_does_not_raise(self):
         """Sanity check on the mechanism itself, independent of the public
         context-manager API: an unchanged identity across two calls must
         not raise."""
-        db_path = tmp_path / "state.db"
-        key = canonical_db_key(db_path)
         identity = (1, 42)
-        hermes_state_lock._check_sidecar_continuity(key, identity)
-        hermes_state_lock._check_sidecar_continuity(key, identity)  # no raise
+        hermes_state_lock._check_sidecar_continuity(identity)
+        hermes_state_lock._check_sidecar_continuity(identity)  # no raise
 
     def test_differing_identity_on_recheck_raises_and_keeps_original_baseline(
-        self, tmp_path
+        self,
     ):
         """Sanity check on the mechanism itself: a disagreeing identity
         raises, and the *original* identity remains the recorded baseline
         afterward — the mismatch is never "healed" onto the new value,
         which is what keeps a still-live swap from being re-trusted on the
         very next attempt."""
-        db_path = tmp_path / "state.db"
-        key = canonical_db_key(db_path)
         original = (1, 42)
         swapped = (1, 99)
-        hermes_state_lock._check_sidecar_continuity(key, original)
+        hermes_state_lock._check_sidecar_continuity(original)
         with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
-            hermes_state_lock._check_sidecar_continuity(key, swapped)
-        assert hermes_state_lock._known_sidecar_identity[key] == original
+            hermes_state_lock._check_sidecar_continuity(swapped)
+        assert hermes_state_lock._known_sidecar_identity == original
         # And the disagreement keeps being reported, not just the first time.
         with pytest.raises(hermes_state_lock._SidecarIdentitySwapped):
-            hermes_state_lock._check_sidecar_continuity(key, swapped)
+            hermes_state_lock._check_sidecar_continuity(swapped)
 
 
 class TestPrivateLockRootInvariants:
@@ -1595,7 +987,7 @@ class TestPrivateLockRootInvariants:
         db_path = tmp_path / "state.db"
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        root = write_lock_path(db_path).parent
+        root = write_lock_path().parent
         st = os.lstat(root)
         assert not stat.S_ISLNK(st.st_mode)
         assert stat.S_ISDIR(st.st_mode)
@@ -1623,7 +1015,7 @@ class TestPrivateLockRootInvariants:
         db_path = tmp_path / "state.db"
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        root = write_lock_path(db_path).parent
+        root = write_lock_path().parent
         os.chmod(root, 0o755)  # loosen it, simulating drift or tampering
 
         real_chmod = os.chmod
@@ -1642,7 +1034,7 @@ class TestPrivateLockRootInvariants:
         db_path = tmp_path / "state.db"
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        root = write_lock_path(db_path).parent
+        root = write_lock_path().parent
         os.chmod(root, 0o755)
 
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
@@ -1657,7 +1049,7 @@ class TestPrivateLockRootInvariants:
         db_path = tmp_path / "state.db"
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
-        root = write_lock_path(db_path).parent
+        root = write_lock_path().parent
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         shutil.rmtree(root)

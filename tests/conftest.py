@@ -525,6 +525,22 @@ def _hermetic_environment(tmp_path, monkeypatch):
         "HERMES_STATE_LOCK_ROOT", str(fake_hermes_home / "state-locks")
     )
 
+    # 3d. Fase C7 collapsed hermes_state_lock's per-database identity memory
+    #     (keyed by canonical_db_key, so different tests' different db_paths
+    #     never collided) into one process-global ``(st_dev, st_ino)``
+    #     baseline shared by every database under the account. That is
+    #     correct for a real process (the lock root never moves mid-run) but
+    #     breaks across tests in this same pytest process: 3c above points
+    #     each test at a freshly rooted sidecar, so the very next test's
+    #     genuinely different sidecar would disagree with whatever this
+    #     process last trusted and get refused by ``_check_sidecar_
+    #     continuity`` as if it were a same-account swap. Reset the baseline
+    #     alongside the root so each test starts with a clean bootstrap, the
+    #     same as a freshly started process would.
+    hermes_state_lock_mod = sys.modules.get("hermes_state_lock")
+    if hermes_state_lock_mod is not None:
+        monkeypatch.setattr(hermes_state_lock_mod, "_known_sidecar_identity", None)
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")
