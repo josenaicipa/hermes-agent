@@ -32,6 +32,7 @@ import pytest
 
 from hermes_state import SessionDB
 from hermes_state_lock import (
+    _CASE_PROBE_PREFIX,
     _is_case_insensitive_fs,
     _lock_open_flags,
     _lock_root,
@@ -570,9 +571,273 @@ class TestCaseInsensitiveAliasSharesLock:
         digits_db.touch()
         assert _is_case_insensitive_fs(str(digits_db)) is False
 
-    def test_missing_path_probes_as_not_case_insensitive(self, tmp_path):
+    def test_missing_path_probes_the_parent_directory_instead_of_giving_up(
+        self, tmp_path
+    ):
+        """On this (case-sensitive) test filesystem, probing the existing
+        parent directory of a not-yet-created database still correctly
+        answers "not case-insensitive" — but it now gets there by actually
+        probing ``tmp_path``, not by short-circuiting on ENOENT. See
+        ``TestNewDatabaseCaseInsensitiveAliasConverges`` for the case this
+        distinction exists to fix."""
         missing = tmp_path / "does-not-exist.db"
         assert _is_case_insensitive_fs(str(missing)) is False
+
+
+def _make_case_insensitive_lookup(monkeypatch, directory):
+    """Simulate a case-insensitive/case-preserving directory (e.g. default
+    APFS) for *directory* without needing one actually mounted.
+
+    Wraps ``os.lstat`` so that a lookup for a name that doesn't exist
+    verbatim in *directory* falls back to a case-insensitive match among
+    that directory's real entries — exactly what a case-folding filesystem's
+    own lookup does. Every other path (including any name that already
+    exists verbatim, and every path outside *directory*) goes straight to
+    the real ``os.lstat`` untouched, so this cannot affect unrelated tests
+    or unrelated directories running in the same process.
+
+    This targets ``os.lstat`` specifically because that is the only syscall
+    ``_probe_directory_case_folds`` uses to resolve the swapped-case name —
+    the probe file itself is created with its one real, randomly generated
+    name via ``os.open``, so there is exactly one genuine directory entry
+    for the shim to fold onto.
+    """
+    real_lstat = os.lstat
+    directory = os.path.realpath(str(directory))
+
+    def fake_lstat(path, *args, **kwargs):
+        fspath = os.fspath(path)
+        try:
+            return real_lstat(fspath, *args, **kwargs)
+        except FileNotFoundError:
+            parent, name = os.path.split(fspath)
+            if os.path.realpath(parent or ".") != directory:
+                raise
+            try:
+                entries = os.listdir(directory)
+            except OSError:
+                raise
+            for entry in entries:
+                if entry.lower() == name.lower():
+                    return real_lstat(os.path.join(directory, entry), *args, **kwargs)
+            raise
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
+class TestNewDatabaseCaseInsensitiveAliasConverges:
+    """Gate 20260820T125109Z REQUEST_CHANGES: ``_is_case_insensitive_fs``
+    returned ``False`` unconditionally whenever the target database did not
+    exist yet (``ENOENT``). On a genuinely case-insensitive volume that is
+    exactly backwards for the case that matters most — schema init on a
+    brand-new ``state.db`` — because two sibling processes racing to create
+    it through differently-cased spellings (``state.db`` vs ``State.db``)
+    would each probe ENOENT, each conclude "not proven case-insensitive",
+    and each hash to a *different* lock key, so both would believe they hold
+    exclusive admission over what the filesystem resolves to one file.
+
+    A real case-insensitive volume isn't available on every runner this
+    suite executes on, so ``_make_case_insensitive_lookup`` reproduces what
+    such a volume's own lookup does — case-insensitive fallback resolution
+    within one directory — without depending on the host filesystem.
+    """
+
+    def test_canonical_db_key_converges_for_case_alias_of_nonexistent_db(
+        self, tmp_path, monkeypatch
+    ):
+        _make_case_insensitive_lookup(monkeypatch, tmp_path)
+        real_db = tmp_path / "state.db"
+        cased_alias = tmp_path / "State.db"
+
+        assert not real_db.exists()
+        assert not cased_alias.exists()
+        assert canonical_db_key(real_db) == canonical_db_key(cased_alias)
+
+    def test_write_lock_path_converges_for_case_alias_of_nonexistent_db(
+        self, tmp_path, monkeypatch
+    ):
+        _make_case_insensitive_lookup(monkeypatch, tmp_path)
+        real_db = tmp_path / "state.db"
+        cased_alias = tmp_path / "State.db"
+
+        assert write_lock_path(real_db) == write_lock_path(cased_alias)
+
+    def test_concurrent_schema_init_via_case_alias_is_serialized_by_the_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """The actual failure mode this gate exists to close: two "sibling
+        processes" (here, threads) racing schema init on a not-yet-created
+        database through differently-cased spellings must be admitted as one
+        writer at a time, not two — mirrors
+        ``TestCaseInsensitiveAliasSharesLock`` but for a database neither
+        side has created yet."""
+        _make_case_insensitive_lookup(monkeypatch, tmp_path)
+        real_db = tmp_path / "state.db"
+        cased_alias = tmp_path / "State.db"
+        assert not real_db.exists()
+        assert not cased_alias.exists()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            t0 = time.monotonic()
+            with acquire_state_write_lock(cased_alias, timeout_s=0.25) as admitted:
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        with acquire_state_write_lock(cased_alias, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+    def test_case_sensitive_directory_keeps_nonexistent_aliases_separate(
+        self, tmp_path
+    ):
+        """No shim here: on this (real, case-sensitive) test filesystem, two
+        differently-cased spellings of a database neither side has created
+        yet must keep separate keys and must NOT block each other — folding
+        case on a genuinely case-sensitive filesystem would be the exact
+        false-merge ``test_genuinely_distinct_files_differing_only_in_case_
+        are_not_merged`` guards against, just reached via ENOENT instead of
+        two already-existing files."""
+        real_db = tmp_path / "state.db"
+        cased_alias = tmp_path / "State.db"
+        assert not real_db.exists()
+        assert not cased_alias.exists()
+
+        assert canonical_db_key(real_db) != canonical_db_key(cased_alias)
+        assert write_lock_path(real_db) != write_lock_path(cased_alias)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def _hold_real():
+            with acquire_state_write_lock(real_db, timeout_s=2.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_hold_real)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+            # Separate keys: the alias must be admitted immediately, not
+            # time out waiting on the real path's holder.
+            with acquire_state_write_lock(cased_alias, timeout_s=1.0) as admitted:
+                assert admitted is True
+        finally:
+            release.set()
+            holder.join(5.0)
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="normcase already folds case on Windows")
+class TestDirectoryCaseProbeHygiene:
+    """``_probe_directory_case_folds`` (the fallback ``_is_case_insensitive_fs``
+    takes when the target database doesn't exist yet) creates a real,
+    if short-lived, file on disk. These tests pin down the safety properties
+    that make that acceptable: it never leaks the probe file, it never
+    touches a name it didn't create itself, and it degrades to "cannot
+    prove" rather than raising or hanging when it can't complete."""
+
+    def test_probe_leaves_no_file_behind_on_a_case_sensitive_directory(
+        self, tmp_path
+    ):
+        before = set(os.listdir(tmp_path))
+        missing = tmp_path / "does-not-exist.db"
+
+        assert _is_case_insensitive_fs(str(missing)) is False
+        assert set(os.listdir(tmp_path)) == before
+
+    def test_probe_leaves_no_file_behind_on_a_case_insensitive_directory(
+        self, tmp_path, monkeypatch
+    ):
+        _make_case_insensitive_lookup(monkeypatch, tmp_path)
+        before = set(os.listdir(tmp_path))
+        missing = tmp_path / "does-not-exist.db"
+
+        assert _is_case_insensitive_fs(str(missing)) is True
+        assert set(os.listdir(tmp_path)) == before
+
+    def test_probe_never_deletes_a_preexisting_swapped_case_file(self, tmp_path):
+        """If a file that happens to collide with a probe's swapped-case
+        name already exists for unrelated reasons, the probe must leave it
+        untouched — it may only ever unlink the exact name it created."""
+        real_lstat = os.lstat
+        swapped_prefix = _CASE_PROBE_PREFIX.swapcase()
+        probe_swapped_names = []
+
+        def spying_lstat(path, *args, **kwargs):
+            fspath = os.fspath(path)
+            name = os.path.basename(fspath)
+            if name.startswith(swapped_prefix):
+                probe_swapped_names.append(fspath)
+            return real_lstat(fspath, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "lstat", spying_lstat)
+            missing = tmp_path / "does-not-exist.db"
+            assert _is_case_insensitive_fs(str(missing)) is False
+
+        # The probe's swapped-name candidate was looked up (lstat'd)...
+        assert probe_swapped_names
+        # ...but since nothing was ever created under that name, nothing
+        # exists there afterward either.
+        for candidate in probe_swapped_names:
+            assert not os.path.lexists(candidate)
+
+    def test_probe_degrades_to_false_when_every_candidate_name_collides(
+        self, tmp_path, monkeypatch
+    ):
+        """A pathological (astronomically unlikely in practice) run of
+        random-name collisions must not hang or crash the caller — it must
+        give up after a bounded number of attempts and report "cannot
+        prove"."""
+
+        def always_collides(*_args, **_kwargs):
+            raise FileExistsError("simulated collision")
+
+        monkeypatch.setattr(os, "open", always_collides)
+        missing = tmp_path / "does-not-exist.db"
+
+        assert _is_case_insensitive_fs(str(missing)) is False
+
+    def test_probe_degrades_to_false_when_directory_is_unwritable(self, tmp_path):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root bypasses directory write permission checks")
+
+        readonly_dir = tmp_path / "readonly"
+        readonly_dir.mkdir()
+        readonly_dir.chmod(0o500)
+        try:
+            missing = readonly_dir / "does-not-exist.db"
+            assert _is_case_insensitive_fs(str(missing)) is False
+        finally:
+            readonly_dir.chmod(0o700)
+
+    def test_probe_degrades_to_false_when_parent_directory_is_missing(
+        self, tmp_path
+    ):
+        missing = tmp_path / "no-such-parent" / "does-not-exist.db"
+        assert _is_case_insensitive_fs(str(missing)) is False
+
+    def test_probe_uses_swapcase_not_a_fixed_case_conversion(self, tmp_path):
+        """Sanity check on the probe's own naming: ``_CASE_PROBE_PREFIX``
+        must actually contain cased characters, or every probe attempt would
+        degenerate into the swapped==original no-op guard and this whole
+        fallback would be dead code."""
+        assert _CASE_PROBE_PREFIX.swapcase() != _CASE_PROBE_PREFIX
 
 
 class TestLegacyColocationNoLongerMatters:

@@ -106,6 +106,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import secrets
 import stat
 import sys
 import tempfile
@@ -121,6 +122,8 @@ _POLL_S = 0.05
 _WRITE_LOCK_SUFFIX = ".write.lock"
 _LOCK_ROOT_PREFIX = "hermes-state-locks"
 _ROOT_MODE = 0o700
+_CASE_PROBE_PREFIX = "HermesCaseProbe-"
+_CASE_PROBE_ATTEMPTS = 4
 
 # thread ident -> {canonical key: _Hold}.  Depth is per-thread so a nested
 # acquire on the same path does not open a second fd and self-deadlock
@@ -183,11 +186,11 @@ def _is_case_insensitive_fs(real_path: str) -> bool:
     once by its real spelling, once by a case-swapped spelling of just the
     basename. If both stats land on the same ``(st_dev, st_ino)``, the
     filesystem folded the case difference away on lookup — case-insensitive.
-    A mismatch, a missing swapped entry, or any ``OSError`` (including
-    ``ENOENT``, e.g. the db not created yet) means "cannot prove
-    case-insensitive", so callers keep the case as-is rather than fold it —
-    failing toward the existing (already correct) symlink-alias behavior,
-    never toward silently merging two genuinely distinct files.
+    A mismatch, a missing swapped entry, or any non-``ENOENT`` ``OSError``
+    means "cannot prove case-insensitive", so callers keep the case as-is
+    rather than fold it — failing toward the existing (already correct)
+    symlink-alias behavior, never toward silently merging two genuinely
+    distinct files.
 
     ``swapcase`` rather than ``upper``/``lower`` alone so a basename that
     happens to already be all-lowercase (or all-uppercase) still produces a
@@ -195,6 +198,18 @@ def _is_case_insensitive_fs(real_path: str) -> bool:
     characters at all (e.g. ``"12345.db"``) has nothing to swap — folding
     case would be a no-op on it anyway, so returning ``False`` there costs
     nothing.
+
+    ``real_path`` not existing yet (``FileNotFoundError``) is *not* treated
+    as "cannot prove" here — a brand-new ``state.db`` is exactly the case
+    that matters most: two sibling processes racing schema init through
+    differently-cased spellings of a database that neither has created yet.
+    There is no directory entry to stat two ways in that case, so this falls
+    back to :func:`_probe_directory_case_folds`, which answers the same
+    question — does this directory fold case on lookup? — against the
+    parent directory instead, which does exist. Any other ``OSError``
+    (permission denied, a symlink loop, ...) still degrades to ``False``:
+    those are not "not created yet", and probing the parent would not
+    resolve them either.
     """
     directory, name = os.path.split(real_path)
     swapped = name.swapcase()
@@ -202,6 +217,11 @@ def _is_case_insensitive_fs(real_path: str) -> bool:
         return False
     try:
         original_stat = os.stat(real_path)
+    except FileNotFoundError:
+        return _probe_directory_case_folds(directory or ".")
+    except OSError:
+        return False
+    try:
         swapped_stat = os.stat(os.path.join(directory, swapped))
     except OSError:
         return False
@@ -209,6 +229,83 @@ def _is_case_insensitive_fs(real_path: str) -> bool:
         swapped_stat.st_dev,
         swapped_stat.st_ino,
     )
+
+
+def _probe_directory_case_folds(directory: str) -> bool:
+    """Probe whether *directory* (which must already exist) folds case.
+
+    Used when the target database file itself does not exist yet, so there
+    is no real directory entry for :func:`_is_case_insensitive_fs` to stat
+    two ways. Creates a throwaway file with a randomized, collision-resistant
+    name and checks whether a case-swapped spelling of that same name
+    resolves to the identical ``(st_dev, st_ino)`` — the same test
+    :func:`_is_case_insensitive_fs` runs, just against a probe entry this
+    function controls instead of the caller's real (absent) target.
+
+    Safety properties, each load-bearing:
+
+    * **Randomized name, bounded retries** — ``secrets.token_hex`` makes the
+      probe name unpredictable, so two Hermes processes (or two calls racing
+      in the same process) never contend over the *same* probe entry the way
+      a fixed name would. ``O_EXCL`` still guards the astronomically
+      unlikely collision by raising instead of clobbering a pre-existing
+      file; that retries with a fresh name up to ``_CASE_PROBE_ATTEMPTS``
+      times before giving up and returning ``False`` (fail toward "cannot
+      prove", never toward crashing or hanging the caller).
+    * **``O_CREAT | O_EXCL`` (+ ``O_NOFOLLOW`` on POSIX)** — the probe file
+      is never opened if something already exists under that exact name, so
+      this can never overwrite or follow a symlink onto a co-tenant's file.
+    * **Identity from the open fd, not a second path lookup** — ``fstat`` on
+      the fd this call itself just created is authoritative regardless of
+      what happens to the directory afterward; there is no re-``stat``-by-
+      path of the original name that a TOCTOU swap could race.
+    * **The swapped name is only ever ``lstat``-ed, never opened or
+      unlinked** — on a case-sensitive filesystem that name was never
+      created by this probe and, in the rare case it happens to already
+      exist for unrelated reasons, this must not read through it, create it,
+      or delete it. A stat mismatch (or the name being altogether absent) is
+      treated as "cannot prove case-insensitive", same as any other
+      ambiguous result.
+    * **Always cleans up** — the probe file is unlinked in a ``finally``
+      regardless of which branch returns or raises. Only the exact name this
+      call created is ever removed; on a genuinely case-insensitive
+      directory that single directory entry *is* the swapped name too, so
+      nothing is left behind either way.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    if not _IS_WINDOWS:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+
+    for _ in range(_CASE_PROBE_ATTEMPTS):
+        name = f"{_CASE_PROBE_PREFIX}{secrets.token_hex(16)}"
+        swapped = name.swapcase()
+        probe_path = os.path.join(directory, name)
+
+        try:
+            fd = os.open(probe_path, flags, 0o600)
+        except FileExistsError:
+            continue
+        except OSError:
+            return False
+
+        try:
+            try:
+                probe_stat = os.fstat(fd)
+            finally:
+                os.close(fd)
+            try:
+                swapped_stat = os.lstat(os.path.join(directory, swapped))
+            except OSError:
+                return False
+            return (probe_stat.st_dev, probe_stat.st_ino) == (
+                swapped_stat.st_dev,
+                swapped_stat.st_ino,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(probe_path)
+
+    return False
 
 
 def _posix_lock_root() -> Path:
