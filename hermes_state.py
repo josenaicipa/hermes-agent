@@ -4047,10 +4047,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        # Set on each no-more-rows retry, cleared when a later attempt fails
+        # on the lock instead: if the patience deadline expires during a
+        # no-more-rows retry sleep, the top-of-loop admission check must
+        # surface that original transient error — the write lock was never
+        # the problem, so the fabricated "database is locked" message would
+        # send the operator hunting a hold that does not exist.
+        pending_no_more_rows: Optional[sqlite3.Error] = None
+
         while True:
             try:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    if pending_no_more_rows is not None:
+                        raise pending_no_more_rows
                     raise sqlite3.OperationalError(
                         f"database is locked (another Hermes process held the "
                         f"state.db write lock for over {patience_s:.0f}s — "
@@ -4102,12 +4112,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._sleep_before_write_retry(
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
+                    pending_no_more_rows = None
                     continue
                 raise
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     if self._sleep_before_write_retry(deadline, patience_s):
+                        pending_no_more_rows = None
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
@@ -4119,11 +4131,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "process; the database itself is healthy)"
                     ) from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    pending_no_more_rows = exc
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    pending_no_more_rows = exc
                     continue
                 # Runtime connection-corruption self-heal: a connection whose
                 # backing file was replaced/truncated by a sibling process
@@ -4158,6 +4172,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    pending_no_more_rows = exc
                     continue
                 raise
 
