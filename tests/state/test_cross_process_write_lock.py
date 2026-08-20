@@ -431,6 +431,65 @@ class TestSidecarSymlinkSubstitution:
         assert os.readlink(lock_path) == str(target)
 
 
+@pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.link")
+class TestSidecarInodeSubstitutionBypass:
+    """Nemo REQUEST_CHANGES (20260820T114302Z): the sidecar was opened
+    without protecting its identity against unlink+recreate or a hardlink
+    swap. A co-tenant with write access to the directory could replace
+    ``state.db.write.lock`` while a holder still held the flock on the old
+    inode; a second acquirer opened the *new* inode and locked it too,
+    breaking the mutual exclusion this module exists to provide."""
+
+    def test_hardlink_substitution_does_not_grant_concurrent_admission(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "state.db"
+        lock_path = write_lock_path(db_path)
+        started = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            with acquire_state_write_lock(db_path, timeout_s=5.0) as admitted:
+                assert admitted is True
+                started.set()
+                release.wait(5.0)
+
+        holder = threading.Thread(target=_holder)
+        holder.start()
+        try:
+            assert started.wait(2.0)
+
+            # Simulate a co-tenant with write access to the directory
+            # swapping the sidecar for a hardlink to an unrelated file
+            # while the holder still owns the flock on the original inode.
+            victim = tmp_path / "victim.lock"
+            victim.write_bytes(b"")
+            os.unlink(lock_path)
+            os.link(victim, lock_path)
+
+            t0 = time.monotonic()
+            with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
+                # Must NOT admit on the substituted inode while the real
+                # holder is still active — admitting here is the exact
+                # exclusion break Nemo flagged.
+                assert admitted is False
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            release.set()
+            holder.join(5.0)
+
+        # The module must never itself unlink the tampered sidecar (that
+        # would just be the same attack performed by trusted code); prove
+        # it left the hardlink alone.
+        assert os.path.samefile(lock_path, victim)
+
+        # Once the tampering is cleaned up (an operator removing the rogue
+        # entry, as would happen operationally), normal admission resumes.
+        os.unlink(lock_path)
+        with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
+            assert admitted is True
+
+
 class TestLockOpenFlagsPortability:
     def test_posix_adds_nofollow_against_symlink_swap(self):
         flags = _lock_open_flags(is_windows=False)
@@ -444,6 +503,17 @@ class TestLockOpenFlagsPortability:
         # platform split so it can't silently regress into OSError on
         # Windows (O_NOFOLLOW doesn't exist in the os module there either).
         flags = _lock_open_flags(is_windows=True)
+        assert flags == (os.O_RDWR | os.O_CREAT)
+
+    def test_missing_o_nofollow_attribute_degrades_instead_of_crashing(
+        self, monkeypatch
+    ):
+        # os.O_NOFOLLOW is POSIX-only and not guaranteed present on every
+        # POSIX platform; a direct `os.O_NOFOLLOW` reference would raise
+        # AttributeError outside the caller's `except OSError`. Simulate a
+        # platform lacking it and confirm the flag is just omitted.
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        flags = _lock_open_flags(is_windows=False)
         assert flags == (os.O_RDWR | os.O_CREAT)
 
 
