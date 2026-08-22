@@ -157,6 +157,52 @@ def _run_setup_browser(assume_yes: bool = False) -> int:
         return 1
 
 
+# Techos de espera larga, SOLO en el proceso ACP (Jose 2026-08-21).
+#
+# Por qué existe. En una sesión ACP el agente NO puede ser despertado: el aviso
+# de un proceso de fondo se encola en ``process_registry.completion_queue`` y
+# solo lo drenan el gateway, el CLI y el TUI. Y no se puede suplir empujando
+# ``session/update`` fuera de turno: ACP Pro deduce "estoy trabajando" del
+# último evento del log y, en ese estado, el Enter del operador NO se envía
+# (se queda en la cola del webview esperando un fin de turno que nunca llega).
+#
+# Así que en ACP la única forma honesta de no perder una misión es mantener
+# VIVO el turno que la despachó: el agente espera al vigía en primer plano
+# (``cursor-wait-run.sh``, un ``sleep`` de shell: cero tokens mientras la
+# misión corre) y reporta en ese mismo turno. Para eso hay que levantar dos
+# techos que están calibrados para turnos cortos:
+#
+#   - ``TERMINAL_MAX_FOREGROUND_TIMEOUT`` (600 s): el terminal rechaza un
+#     ``timeout`` mayor en primer plano y empuja a segundo plano — que es
+#     justo lo que no sirve aquí. Se lee al IMPORTAR ``tools.terminal_tool``,
+#     por eso esto corre antes de importar el servidor.
+#   - ``HERMES_CONCURRENT_TOOL_TIMEOUT_S`` (420 s): plazo del ejecutor para
+#     UNA llamada de herramienta. Sin esto la espera vuelve como
+#     ``tool_timeout`` a los 7 minutos aunque la misión siga viva.
+#
+# Ambos por encima del techo real de una misión (``CURSOR_TIMEOUT_MS`` = 2 h y
+# el plazo por defecto del vigía, 7500 s), con margen.
+#
+# Qué se pierde a cambio: en ACP el plazo del ejecutor deja de ser una red
+# corta para CUALQUIER herramienta. Es aceptable justamente aquí y no en el
+# gateway: (a) el proceso ACP es el del editor, con un humano delante y un
+# botón Stop que SÍ interrumpe la espera (el bucle de espera sondea la
+# interrupción y mata el grupo de procesos), y (b) la primera red sigue siendo
+# el ``timeout`` que la propia llamada declara (180 s por defecto), no este
+# techo. El gateway corre en otro proceso y no se ve afectado.
+#
+# ``setdefault``: si Jose fija estas variables en la config del editor o en un
+# ``.env``, manda su valor.
+_ACP_FOREGROUND_CEILING_S = "7800"
+_ACP_TOOL_CALL_CEILING_S = "8100"
+
+
+def _apply_acp_long_wait_ceilings() -> None:
+    """Permite esperar una misión completa dentro de un turno ACP vivo."""
+    os.environ.setdefault("TERMINAL_MAX_FOREGROUND_TIMEOUT", _ACP_FOREGROUND_CEILING_S)
+    os.environ.setdefault("HERMES_CONCURRENT_TOOL_TIMEOUT_S", _ACP_TOOL_CALL_CEILING_S)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
     args = _parse_args(argv)
@@ -170,6 +216,8 @@ def main(argv: list[str] | None = None) -> None:
 
     _setup_logging()
     _load_env()
+
+    _apply_acp_long_wait_ceilings()
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")
