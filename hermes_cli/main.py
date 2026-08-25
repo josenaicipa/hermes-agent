@@ -5604,6 +5604,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_network(args):
+    """Independent hybrid agent network (roster, dispatch, credentials)."""
+    from hermes_cli.independent_network.cli import network_command
+
+    return network_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -12759,6 +12766,14 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # network command — independent hybrid agent fleet (NAI-68)
+    # =========================================================================
+    from hermes_cli.independent_network.cli import build_parser as _build_network_parser
+
+    network_parser = _build_network_parser(subparsers)
+    network_parser.set_defaults(func=cmd_network)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
