@@ -711,22 +711,9 @@ class SessionDB(
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
         self._conn = self._open_writer_conn()
-        self._init_schema_under_write_lock()
-
-    def _init_schema_under_write_lock(self, timeout_s: Optional[float] = None) -> None:
-        """Run schema init under the cross-process writer admission lock.
-
-        Schema migrations do not use ``_execute_write`` because they contain
-        multiple statements, but they must be serialized with ordinary
-        writers.  A timeout is surfaced as SQLite's normal retryable lock
-        signal to ``_connect_and_init_with_lock_patience``.
-        """
-        if timeout_s is None:
-            timeout_s = self._WRITE_LOCK_SLICE_S
-        with acquire_state_write_lock(self.db_path, timeout_s=timeout_s) as admitted:
-            if not admitted:
-                raise sqlite3.OperationalError("database is locked")
-            self._init_schema()
+        # Do not hold writer admission while schema init waits on the separate
+        # FTS rebuild lock. The caller already retries SQLite contention.
+        self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
