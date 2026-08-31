@@ -27,6 +27,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
 
+from hermes_state_lock import acquire_state_write_lock
 from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity
 from hermes_state_errors import (
     _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
@@ -413,6 +414,10 @@ class SessionDB(
     # writes (failure aborts the turn) get the long budget; observation-only activity
     # writes sit on the response-critical path and get a sub-second one.
     _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
+    # Brief cross-process admission before SQLite's own write lock.  This
+    # prevents the gateway, dashboard, ACP, and workers from convoying on a
+    # one-second SQLite busy timeout while retaining the existing retry budget.
+    _WRITE_LOCK_SLICE_S = 1.0
     # A live compression lock gets a short wait (compression publishes in seconds), but the lease
     # is a correctness boundary: a writer still locked out afterwards is refused.
     # Observation-only activity heartbeat/label writes (#76354 review S1): these run on (or adjacent to) the
@@ -706,7 +711,22 @@ class SessionDB(
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
         self._conn = self._open_writer_conn()
-        self._init_schema()
+        self._init_schema_under_write_lock()
+
+    def _init_schema_under_write_lock(self, timeout_s: Optional[float] = None) -> None:
+        """Run schema init under the cross-process writer admission lock.
+
+        Schema migrations do not use ``_execute_write`` because they contain
+        multiple statements, but they must be serialized with ordinary
+        writers.  A timeout is surfaced as SQLite's normal retryable lock
+        signal to ``_connect_and_init_with_lock_patience``.
+        """
+        if timeout_s is None:
+            timeout_s = self._WRITE_LOCK_SLICE_S
+        with acquire_state_write_lock(self.db_path, timeout_s=timeout_s) as admitted:
+            if not admitted:
+                raise sqlite3.OperationalError("database is locked")
+            self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
@@ -901,21 +921,35 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
-                    self._raise_if_db_replaced()
-                    if self._conn is None:  # close() raced this writer
-                        self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise sqlite3.OperationalError(
+                        f"database is locked (another Hermes process held the "
+                        f"state.db write lock for over {patience_s:.0f}s — "
+                        "likely a long maintenance operation such as VACUUM, "
+                        "a large WAL checkpoint, or an older pre-update "
+                        "process; the database itself is healthy)"
+                    )
+                with acquire_state_write_lock(
+                    self.db_path, timeout_s=min(self._WRITE_LOCK_SLICE_S, remaining)
+                ) as admitted:
+                    if not admitted:
+                        raise sqlite3.OperationalError("database is locked")
+                    with self._lock:
+                        self._raise_if_db_replaced()
+                        if self._conn is None:  # close() raced this writer
+                            self._reopen_after_close_locked(context="write")
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            fn_started = True
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
