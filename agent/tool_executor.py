@@ -336,6 +336,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         import model_tools
         from tools import tool_search as _ts
         from tools.registry import registry as _registry
+        search_config = _ts.load_config_readonly()
     except Exception:
         return frozenset()
 
@@ -346,6 +347,8 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        search_config.always_visible,
+        search_config.effective_defer_tools,
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:

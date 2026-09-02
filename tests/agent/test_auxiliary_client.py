@@ -2433,6 +2433,201 @@ class TestTransientTransportRetry:
             )
         payment.assert_not_called()
 
+    def test_compression_auto_route_cannot_select_main_fable_when_forbidden(self):
+        from agent.auxiliary_client import _resolve_auto_route
+
+        fallback = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "gpt-5.6-sol", "fallback_chain[0](openai-codex)"),
+            ),
+            patch("agent.auxiliary_client.resolve_provider_client") as main_resolver,
+            patch("agent.auxiliary_client._try_main_fallback_chain") as main_chain,
+            patch("agent.auxiliary_client._get_provider_chain") as discovery,
+        ):
+            client, model, provider = _resolve_auto_route(
+                main_runtime={
+                    "provider": "anthropic",
+                    "model": "claude-fable-5-1",
+                },
+                task="compression",
+            )
+
+        assert client is fallback
+        assert model == "gpt-5.6-sol"
+        assert provider == "openai-codex"
+        main_resolver.assert_not_called()
+        main_chain.assert_not_called()
+        discovery.assert_not_called()
+
+    def test_strict_auto_route_keeps_same_provider_sol_sibling_eligible(self):
+        """Terra and Sol share openai-codex credentials.  Treating the main
+        provider as failed provider-wide would incorrectly skip Sol before a
+        request had even been attempted."""
+        from agent.auxiliary_client import _resolve_auto_route
+
+        fallback = MagicMock()
+        config = {
+            "fallback_chain": [
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            ],
+            "allow_main_model_fallback": False,
+        }
+        with (
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value=config,
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_fallback_entry",
+                return_value=(fallback, "gpt-5.6-sol"),
+            ),
+            patch(
+                "agent.auxiliary_client.get_model_context_length",
+                return_value=1_000_000,
+            ),
+            patch("agent.auxiliary_client.resolve_provider_client") as main_resolver,
+        ):
+            client, model, provider = _resolve_auto_route(
+                main_runtime={
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-terra",
+                },
+                task="compression",
+            )
+
+        assert client is fallback
+        assert model == "gpt-5.6-sol"
+        assert provider == "openai-codex"
+        main_resolver.assert_not_called()
+
+    def test_strict_compression_chain_rejects_auto_entry(self):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        fallback = MagicMock()
+        entries = [
+            {"provider": "auto", "model": "claude-fable-5-1"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        ]
+        config = {
+            "fallback_chain": entries,
+            "allow_main_model_fallback": False,
+        }
+
+        def resolve(entry):
+            assert entry["provider"] != "auto", "strict chain reopened auto routing"
+            return fallback, entry["model"]
+
+        with (
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value=config,
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_fallback_entry",
+                side_effect=resolve,
+            ),
+            patch(
+                "agent.auxiliary_client.get_model_context_length",
+                return_value=1_000_000,
+            ),
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                task="compression",
+                failed_provider="openai-codex",
+                failed_model="gpt-5.6-terra",
+            )
+
+        assert client is fallback
+        assert model == "gpt-5.6-sol"
+        assert label == "fallback_chain[1](openai-codex)"
+
+    @pytest.mark.parametrize("provider", ["openrouter", "custom"])
+    def test_compression_missing_explicit_client_sync_uses_only_chain(
+        self, provider
+    ):
+        fallback = MagicMock()
+        response = {"strict_chain": True}
+        fallback.chat.completions.create.return_value = response
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(provider, "primary-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(None, None),
+            ) as cached,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_for_unavailable_client",
+                return_value=(fallback, "gpt-5.6-sol", "openai-codex"),
+            ),
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda result, _task, **_kw: result,
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result is response
+        assert cached.call_count == 1
+
+    @pytest.mark.parametrize("provider", ["openrouter", "custom"])
+    def test_compression_missing_explicit_client_async_uses_only_chain(
+        self, provider
+    ):
+        fallback_sync = MagicMock()
+        fallback_async = MagicMock()
+        response = {"strict_chain": True}
+        fallback_async.chat.completions.create = AsyncMock(return_value=response)
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(provider, "primary-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(None, None),
+            ) as cached,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_for_unavailable_client",
+                return_value=(fallback_sync, "gpt-5.6-sol", "openai-codex"),
+            ),
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback_async, "gpt-5.6-sol"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda result, _task, **_kw: result,
+            ),
+        ):
+            result = asyncio.run(
+                async_call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            )
+
+        assert result is response
+        assert cached.call_count == 1
+
 
 
 

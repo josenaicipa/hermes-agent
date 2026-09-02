@@ -186,3 +186,25 @@ class TestRestorePrimaryPoolReselect:
 
         assert agent._restore_primary_runtime() is True
         assert agent.reasoning_config is None
+
+    def test_failed_restore_cannot_leave_primary_with_fallback_reasoning(self):
+        """Reasoning restoration is atomic with model identity, even when a
+        later compressor rebuild fails and the restore returns False."""
+        pool = _build_mock_pool([_make_entry("entry-1", "key-1")])
+        agent = self._make_agent(pool)
+        agent._primary_runtime["model"] = "claude-fable-5-1"
+        agent._primary_runtime["provider"] = "anthropic"
+        agent._primary_runtime["reasoning_config"] = {
+            "enabled": True,
+            "effort": "low",
+        }
+        agent.model = "gpt-5.6-terra"
+        agent.provider = "openai-codex"
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        agent.context_compressor.update_model.side_effect = RuntimeError(
+            "compressor rebuild failed"
+        )
+
+        assert agent._restore_primary_runtime() is False
+        assert agent.model == "claude-fable-5-1"
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}

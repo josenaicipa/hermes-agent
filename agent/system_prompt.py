@@ -37,6 +37,19 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
 _GATE_WORDS = {**dict.fromkeys(("true", "always", "yes", "on"), True), **dict.fromkeys(("false", "never", "no", "off"), False)}
 
 
+def _skills_index_contains(skills_prompt: str, skill_name: str) -> bool:
+    """Match an exact skill name in either full or names-only indexes."""
+    for raw_line in (skills_prompt or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("- "):
+            if line[2:].partition(": ")[0].strip() == skill_name:
+                return True
+        elif "[names only]:" in line:
+            if skill_name in {name.strip() for name in line.partition("[names only]:")[2].split(",")}:
+                return True
+    return False
+
+
 def _model_gate(setting: Any, model: Optional[str], default_models) -> bool:
     """Resolve a config gate: True/"true"-ish -> on, False/"false"-ish -> off,
     list -> case-insensitive model-substring match, anything else ("auto") ->
@@ -625,7 +638,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
-    if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
+    if "skill_view" in (agent.valid_tool_names or set()) and _skills_index_contains(skills_prompt, "hermes-agent"):
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Coding posture: the operating brief stays in the stable prefix. The

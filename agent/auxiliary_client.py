@@ -4011,6 +4011,7 @@ def _try_configured_fallback_chain(
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
     if not chain or not isinstance(chain, list):
         return None, None, ""
+    strict_chain = not _task_allows_main_model_fallback(task)
     skip = _failed_backend_skip(
         failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
     tried = []
@@ -4020,6 +4021,9 @@ def _try_configured_fallback_chain(
             continue
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
+            continue
+        if strict_chain and fb_provider.lower() == "auto":
+            tried.append(f"fallback_chain[{i}](auto) (forbidden by strict routing)")
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
@@ -4288,6 +4292,11 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
+    if task and not _task_allows_main_model_fallback(task):
+        client, model, label = _try_configured_fallback_chain(
+            task, main_provider or "auto", reason="main-model fallback disabled",
+            failed_model=main_model or None)
+        return client, model, _fallback_provider_from_label(label) if client is not None else ""
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
@@ -6756,23 +6765,24 @@ def _resolve_call_client(
             # Explicit provider with no credentials: honor the task fallback_chain before
             # raising (fallback entries may use OAuth / credential-pool auth).
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            allow_broad_fallback = _task_allows_main_model_fallback(task)
+            if _explicit and _explicit != "auto":
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit)
-                if fb_client is None:
+                if fb_client is None and _explicit not in {"openrouter", "custom"}:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key was found. "
                         f"Set the {_explicit.upper()}_API_KEY environment variable, or switch to "
                         f"a different provider with `hermes model`.")
                 client, final_model = fb_client, fb_model
-                if async_mode:
+                if async_mode and fb_client is not None:
                     client, final_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision"))
                 resolved_provider = fb_label or resolved_provider
                 effective_provider = resolved_provider
             # Auto/custom with no credentials: walk the full auto chain (not just OpenRouter).
             # model=None so each provider uses its own default.
-            if client is None and not resolved_base_url:
+            if client is None and not resolved_base_url and allow_broad_fallback:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client(

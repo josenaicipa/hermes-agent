@@ -692,6 +692,56 @@ class TestRegression_ToolsetScoping:
         # core tools are never deferrable
         assert "terminal" not in names
 
+    def test_executor_scope_cache_tracks_always_visible(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import model_tools
+        from agent.tool_executor import _tool_search_scoped_names
+        from tools import tool_search
+        from tools.registry import registry
+
+        tool_name = "scope_cache_always_visible_probe"
+        toolset = "scope-cache-always-visible"
+        self._register(tool_name, toolset)
+        registry_generation = registry._generation
+
+        configured_always_visible = set()
+        monkeypatch.setattr(
+            tool_search,
+            "load_config_readonly",
+            lambda: tool_search.ToolSearchConfig.from_raw(
+                {"always_visible": sorted(configured_always_visible)}
+            ),
+        )
+
+        definition_calls = 0
+        real_get_tool_definitions = model_tools.get_tool_definitions
+
+        def _counted_get_tool_definitions(*args, **kwargs):
+            nonlocal definition_calls
+            definition_calls += 1
+            return real_get_tool_definitions(*args, **kwargs)
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            _counted_get_tool_definitions,
+        )
+        agent = SimpleNamespace(
+            enabled_toolsets=[toolset],
+            disabled_toolsets=None,
+        )
+
+        assert tool_name in _tool_search_scoped_names(agent)
+        assert tool_name in _tool_search_scoped_names(agent)
+        assert definition_calls == 1
+
+        configured_always_visible.add(tool_name)
+
+        assert tool_name not in _tool_search_scoped_names(agent)
+        assert definition_calls == 2
+        assert registry._generation == registry_generation
+
 
 # ---------------------------------------------------------------------------
 # Catalog listing (skills-style progressive disclosure)

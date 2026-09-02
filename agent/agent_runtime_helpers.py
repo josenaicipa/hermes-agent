@@ -887,6 +887,9 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     """Copy the identity/transport fields of a ``_primary_runtime`` snapshot onto ``agent``
     (shared by transport recovery and turn-start restore; the caller rebuilds the client)."""
     agent.model = rt["model"]
+    if "reasoning_config" in rt:
+        saved_reasoning = rt["reasoning_config"]
+        agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else None
     agent.provider = rt["provider"]
     agent.requested_provider = rt.get("requested_provider", agent.provider)
     agent.base_url = rt["base_url"]           # setter updates _base_url_lower
@@ -1171,10 +1174,6 @@ def restore_primary_runtime(agent) -> bool:
         _rebind_primary_credential_pool(
             agent, primary_provider, _matches_primary, _load_primary_pool, prefetched_pool, prefetched
         )
-        # Older snapshots have no reasoning_config; keep the current value.
-        if "reasoning_config" in rt:
-            saved_reasoning = rt["reasoning_config"]
-            agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else None
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0

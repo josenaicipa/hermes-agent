@@ -162,6 +162,42 @@ def _init_code_repo(path):
     (path / "main.py").write_text("print('hi')\n")
 
 
+def test_names_only_skills_index_keeps_hermes_agent_help_guidance(monkeypatch):
+    import agent.system_prompt as system_prompt
+
+    agent = _make_agent(
+        valid_tool_names=["skill_view"],
+        _skills_index_mode="names_only",
+    )
+    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "SKILL_HELP")
+    monkeypatch.setattr(
+        system_prompt,
+        "HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS",
+        "DOCS_ONLY_HELP",
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch(
+            "run_agent.build_skills_system_prompt",
+            return_value=(
+                "<available_skills>\n"
+                "  Autonomous AI Agents [names only]: hermes-agent, planner\n"
+                "</available_skills>"
+            ),
+        ),
+        patch(
+            "agent.coding_context.coding_system_prompt_parts",
+            return_value=([], [], []),
+        ),
+    ):
+        stable = build_system_prompt_parts(agent)["stable"]
+
+    assert "SKILL_HELP" in stable
+    assert "DOCS_ONLY_HELP" not in stable
+
+
 class TestCodingContextBlock:
     def test_injected_when_active(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
@@ -834,4 +870,3 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
-
