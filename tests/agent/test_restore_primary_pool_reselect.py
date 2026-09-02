@@ -196,7 +196,7 @@ class TestRestorePrimaryPoolReselect:
         agent._primary_runtime["provider"] = "anthropic"
         agent._primary_runtime["reasoning_config"] = {
             "enabled": True,
-            "effort": "low",
+            "effort": "medium",
         }
         agent.model = "gpt-5.6-terra"
         agent.provider = "openai-codex"
@@ -207,4 +207,4 @@ class TestRestorePrimaryPoolReselect:
 
         assert agent._restore_primary_runtime() is False
         assert agent.model == "claude-fable-5-1"
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
