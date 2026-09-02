@@ -1,5 +1,6 @@
 """Tests for acp_adapter.tools — tool kind mapping and ACP content building."""
 
+import json
 
 import pytest
 
@@ -207,6 +208,37 @@ class TestBuildToolComplete:
         assert isinstance(content_item, ContentToolCallContent)
         assert "total 42" in content_item.content.text
         assert result.raw_output is None
+
+    def test_terminal_json_preserves_foreground_fable_receipt_past_generic_cap(self):
+        receipt = "FABLE_RECEIPT_V1\n" + ("receipt detail\n" * 80) + "RECEIPT_END"
+        assert len(receipt) > 500
+
+        result = build_tool_complete(
+            "tc-fable-receipt",
+            "terminal",
+            json.dumps({"output": receipt, "exit_code": 0}),
+        )
+
+        text = result.content[0].content.text
+        assert receipt in text
+        assert "RECEIPT_END" in text
+        assert "chars total, truncated" not in text
+        assert result.raw_output is None
+
+    def test_terminal_json_receipt_still_obeys_output_cap(self):
+        receipt = "FABLE_RECEIPT_V1\n" + ("x" * 6000) + "RECEIPT_END"
+
+        result = build_tool_complete(
+            "tc-fable-receipt-capped",
+            "terminal",
+            json.dumps({"output": receipt, "exit_code": 0}),
+        )
+
+        text = result.content[0].content.text
+        assert "FABLE_RECEIPT_V1" in text
+        assert "RECEIPT_END" not in text
+        assert "chars total, truncated" in text
+        assert len(text) <= 7000
 
 
 

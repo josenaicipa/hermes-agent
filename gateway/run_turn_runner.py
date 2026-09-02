@@ -1785,7 +1785,8 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": [],
+                    "completed": False, "failed": True, "error": str(exc)}
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config

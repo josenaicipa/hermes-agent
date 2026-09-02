@@ -15,9 +15,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
-from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    resolve_gateway_delivery_receipt,
+)
+from gateway.run import GatewayRunner, _gateway_delivery_receipt_outcome
+from gateway.session import SessionSource, build_session_key
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -94,6 +101,36 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _watch_event(session_id="proc_watch"):
+    return {
+        "type": "watch_match",
+        "session_id": session_id,
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "12345",
+        "thread_id": "678",
+        "pattern": "FABLE_WAKE",
+        "command": "agent-wait-job.sh",
+        "output": "FABLE_WAKE reason=decision",
+        "started_at": 1234.5,
+    }
+
+
+class _ReceiptBaseAdapter(BasePlatformAdapter):
+    async def connect(self, *, is_reconnect: bool = False):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return None
+
+    async def send(self, *args, **kwargs):
+        return SendResult(success=True, message_id="sent")
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
@@ -104,6 +141,413 @@ def _stop_after_sleeps(monkeypatch, runner, count):
             runner._running = False
 
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
+
+
+def test_idle_watcher_delivers_watch_without_new_inbound_turn(
+    monkeypatch, isolated_registry,
+):
+    isolated_registry.completion_queue.put(_watch_event())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert "FABLE_WAKE" in delivered.text
+    assert delivered.source.thread_id == "678"
+    assert isolated_registry.completion_queue.empty()
+
+
+def test_idle_watcher_retries_rejected_watch_delivery(
+    monkeypatch, isolated_registry,
+):
+    event = _watch_event("proc_retry")
+    event["delivery_id"] = "watch:proc_retry:1"
+    event["checkpoint_confirmed"] = True
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+    isolated_registry.completion_queue.put(event)
+    adapter = SimpleNamespace(
+        handle_message=AdmittingHandler(side_effect=[RuntimeError("temporary"), None])
+    )
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    assert isolated_registry.completion_queue.empty()
+    outbox = isolated_registry._watch_outbox_path()
+    assert json.loads(outbox.read_text()) == []
+
+
+def test_delivered_watch_with_unconfirmed_checkpoint_keeps_durable_outbox(
+    monkeypatch, isolated_registry,
+):
+    event = _watch_event("proc_unconfirmed")
+    event["delivery_id"] = "watch:proc_unconfirmed:1"
+    event["checkpoint_confirmed"] = False
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+    isolated_registry.completion_queue.put(event)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    assert isolated_registry.completion_queue.empty()
+    outbox = isolated_registry._watch_outbox_path()
+    assert json.loads(outbox.read_text())[0]["delivery_id"] == event["delivery_id"]
+
+
+def test_receipt_aware_watch_keeps_outbox_until_turn_is_durable(
+    monkeypatch, isolated_registry,
+):
+    """Base adapter RAM admission is not an ACK boundary."""
+    event = _watch_event("proc_receipt")
+    event["delivery_id"] = "watch:proc_receipt:1"
+    event["checkpoint_confirmed"] = True
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+
+    class ReceiptAwareAdapter:
+        supports_async_delivery = True
+        supports_durable_delivery_receipts = True
+
+        def __init__(self):
+            self.accepted = None
+
+        async def handle_message(self, accepted):
+            accepted._gateway_accepted = True
+            self.accepted = accepted
+
+    adapter = ReceiptAwareAdapter()
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+
+    async def _exercise():
+        assert await runner._deliver_watch_events([event]) == []
+        # Simulated SIGKILL window: handle_message returned after only putting
+        # the event in RAM. The producer outbox must still own the wake.
+        outbox = isolated_registry._watch_outbox_path()
+        assert json.loads(outbox.read_text(encoding="utf-8"))
+        assert adapter.accepted.metadata["gateway_process_session_id"] == (
+            event["session_id"]
+        )
+        assert adapter.accepted.metadata["gateway_process_delivery_id"] == (
+            event["delivery_id"]
+        )
+        assert adapter.accepted.message_id == event["delivery_id"]
+
+        resolve_gateway_delivery_receipt(adapter.accepted, "durable")
+        await asyncio.sleep(0)
+        assert json.loads(outbox.read_text(encoding="utf-8")) == []
+
+    asyncio.run(_exercise())
+
+
+def test_receipt_aware_watch_replays_after_volatile_acceptance_crash(
+    monkeypatch, isolated_registry,
+):
+    event = _watch_event("proc_volatile")
+    event["delivery_id"] = "watch:proc_volatile:1"
+    event["checkpoint_confirmed"] = True
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+
+    class VolatileAdapter:
+        supports_async_delivery = True
+        supports_durable_delivery_receipts = True
+
+        async def handle_message(self, _accepted):
+            _accepted._gateway_accepted = True
+            return None
+
+    runner = _runner(VolatileAdapter())
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    assert asyncio.run(runner._deliver_watch_events([event])) == []
+
+    # A fresh registry represents restart before the receipt was resolved.
+    restarted = ProcessRegistry()
+    assert restarted.recover_from_checkpoint() == 0
+    replayed = restarted.completion_queue.get_nowait()
+    assert replayed["delivery_id"] == event["delivery_id"]
+
+
+@pytest.mark.parametrize(
+    "agent_result",
+    [
+        {"failed": True},
+        {"partial": True},
+        {"interrupted": True},
+        {"error": "provider failed"},
+        {"completed": False},
+        {"failed": True, "compression_exhausted": True},
+        {"final_response": "auth failed", "api_calls": 0},
+    ],
+)
+def test_incomplete_agent_result_keeps_control_receipt_retryable(agent_result):
+    assert _gateway_delivery_receipt_outcome(agent_result) == "retry"
+
+
+def test_successful_agent_result_makes_control_receipt_durable():
+    assert _gateway_delivery_receipt_outcome(
+        {"completed": True, "final_response": "handled"}
+    ) == "durable"
+
+
+def test_compression_retry_retargets_same_durable_delivery_to_fresh_session(
+    monkeypatch, isolated_registry,
+):
+    """Auto-reset retry keeps one delivery id and bypasses only its old parent."""
+    event = _watch_event("proc_context_retry")
+    event["delivery_id"] = "watch:proc_context_retry:1"
+    event["checkpoint_confirmed"] = True
+    event["parent_session_id"] = "session-too-large"
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+
+    class ReceiptAwareAdapter:
+        supports_async_delivery = True
+        supports_durable_delivery_receipts = True
+
+        def __init__(self):
+            self.accepted = None
+
+        async def handle_message(self, accepted):
+            accepted._gateway_accepted = True
+            self.accepted = accepted
+
+    adapter = ReceiptAwareAdapter()
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    monkeypatch.setattr(
+        runner,
+        "_classify_completion_target",
+        AsyncMock(return_value="active"),
+    )
+
+    async def _exercise():
+        assert await runner._deliver_watch_events([event]) == []
+        assert isolated_registry.retarget_reliable_watch_event(
+            event["delivery_id"], parent_session_id=""
+        ) is True
+        adapter.accepted.metadata[
+            "gateway_retry_without_parent_session"
+        ] = True
+        resolve_gateway_delivery_receipt(adapter.accepted, "retry")
+        await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+    retried = isolated_registry.completion_queue.get_nowait()
+    assert retried["delivery_id"] == event["delivery_id"]
+    assert retried["parent_session_id"] == ""
+    assert isolated_registry.completion_queue.empty()
+    outbox = json.loads(
+        isolated_registry._watch_outbox_path().read_text(encoding="utf-8")
+    )
+    assert len(outbox) == 1
+    assert outbox[0]["delivery_id"] == event["delivery_id"]
+    assert outbox[0]["parent_session_id"] == ""
+
+
+def test_receipt_event_consumed_after_ram_acceptance_never_starts_turn(
+    monkeypatch, isolated_registry,
+):
+    """A wait/kill racing an idle task wins before model invocation."""
+    event = _watch_event("proc_late_consumed")
+    event["delivery_id"] = "watch:proc_late_consumed:1"
+    event["checkpoint_confirmed"] = True
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+
+    class PausedAdapter:
+        supports_async_delivery = True
+        supports_durable_delivery_receipts = True
+
+        def __init__(self):
+            self.accepted = None
+
+        async def handle_message(self, accepted):
+            accepted._gateway_accepted = True
+            self.accepted = accepted
+
+    adapter = PausedAdapter()
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+
+    async def _exercise():
+        assert await runner._deliver_watch_events([event]) == []
+        isolated_registry._completion_consumed.add(event["session_id"])
+        assert runner._finish_consumed_reliable_watch(adapter.accepted) is True
+        await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+    assert json.loads(
+        isolated_registry._watch_outbox_path().read_text(encoding="utf-8")
+    ) == []
+    assert isolated_registry.completion_queue.empty()
+
+
+def test_receipt_control_wake_never_merges_with_busy_user_pending_text():
+    """Busy-session retry preserves both the receipt and queued user text."""
+    adapter = _ReceiptBaseAdapter(
+        PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM
+    )
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        user_id="7",
+    )
+    control = MessageEvent(
+        text="FABLE_WAKE reason=attention",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        allow_gateway_control=False,
+    )
+    pending_user = MessageEvent(
+        text="keep this user text",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    async def _exercise():
+        receipt = asyncio.get_running_loop().create_future()
+        setattr(control, "_gateway_durable_delivery_receipt", receipt)
+        session_key = build_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._pending_messages[session_key] = pending_user
+        await adapter.handle_message(control)
+        return receipt.result(), session_key
+
+    outcome, session_key = asyncio.run(_exercise())
+    assert outcome == "retry"
+    assert adapter._pending_messages[session_key] is pending_user
+    assert adapter._pending_messages[session_key].text == "keep this user text"
+    adapter._message_handler.assert_not_awaited()
+
+
+def test_fable_control_wake_bypasses_cosmetic_notifications_off(
+    monkeypatch, isolated_registry,
+):
+    isolated_registry.completion_queue.put(_watch_event("proc_control"))
+    isolated_registry.completion_queue.put({
+        **_watch_event("proc_cosmetic"),
+        "pattern": "READY",
+        "output": "READY",
+    })
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "off"
+    )
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    assert "proc_control" in adapter.handle_message.await_args.args[0].text
+    assert isolated_registry.completion_queue.empty()
+
+
+def test_failure_only_process_watcher_stays_silent_after_auto_close(
+    monkeypatch, isolated_registry,
+):
+    session = ProcessSession(
+        id="proc_auto_close",
+        command="agent-wait-job.sh",
+        started_at=1.0,
+        exited=True,
+        exit_code=0,
+        notify_on_failure=True,
+        watch_patterns=["FABLE_WAKE"],
+        _reliable_control_close_seen=True,
+    )
+    isolated_registry._finished[session.id] = session
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_enqueue_process_completion_notification", deliver)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_id": "123",
+        "notify_on_failure": True,
+    }))
+
+    deliver.assert_not_awaited()
+
+
+def test_failure_only_process_watcher_defers_missing_sentinel_to_registry(
+    monkeypatch, isolated_registry,
+):
+    # Reproduce the reader race window: exited is visible immediately before
+    # _move_to_finished reserves the registry-owned durable fallback.
+    session = ProcessSession(
+        id="proc_missing_sentinel",
+        command="agent-wait-job.sh",
+        started_at=1.0,
+        exited=True,
+        exit_code=0,
+        notify_on_failure=True,
+        watch_patterns=["FABLE_WAKE"],
+    )
+    isolated_registry._running[session.id] = session
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    monkeypatch.setattr(
+        runner, "_load_background_notifications_mode", lambda: "concise"
+    )
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_enqueue_process_completion_notification", deliver)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_id": "123",
+        "notify_on_failure": True,
+    }))
+
+    # The per-process watcher must not create a completion turn. The registry
+    # then emits exactly one watch_match when its move path resumes.
+    deliver.assert_not_awaited()
+    isolated_registry._move_to_finished(session)
+    assert isolated_registry.completion_queue.qsize() == 1
+    event = isolated_registry.completion_queue.get_nowait()
+    assert event["type"] == "watch_match"
+    assert event["pattern"] == "FABLE_WAKE"
 
 
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
@@ -228,7 +672,9 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     session.process.pid = 4242
     registry._running[session.id] = session
     monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
-    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(
+        registry, "_write_checkpoint", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(pr_module, "process_registry", registry)
 
     result = registry.kill_process(session.id)

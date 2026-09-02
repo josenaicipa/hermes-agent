@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
+    ProcessNotificationConfig,
+    ProcessCheckpointRecoveryError,
     ProcessRegistry,
     ProcessSession,
     FINISHED_TTL_SECONDS,
@@ -106,6 +108,134 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
             },
         )
     ]
+
+
+def test_kill_started_since_suppresses_missing_control_fallback(
+    registry, tmp_path, monkeypatch
+):
+    """Abandoned-turn cleanup must not revive the work it intentionally kills."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_abandoned", task_id="turn-a")
+    session.pid = 77
+    session.pid_scope = "sandbox"
+    session.env_ref = MagicMock()
+    session.watch_patterns = ["FABLE_WAKE"]
+    session.notify_on_failure = True
+    session.watcher_platform = "telegram"
+    session.watcher_chat_id = "123"
+    registry._running[session.id] = session
+    assert registry._write_checkpoint() is True
+
+    assert registry.kill_started_since(
+        "turn-a", frozenset(), source="gateway_turn_timeout"
+    ) == 1
+
+    session.env_ref.execute.assert_called_once()
+    assert registry.is_completion_consumed(session.id)
+    assert registry.completion_queue.empty()
+    assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+    assert not (tmp_path / "process_notifications.json").exists()
+
+
+def test_kill_started_since_revokes_already_captured_control_wake(
+    registry, tmp_path, monkeypatch
+):
+    """A marker captured just before turn cleanup is not delivered afterward."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_abandoned_marker", task_id="turn-a")
+    session.pid = 88
+    session.pid_scope = "sandbox"
+    session.env_ref = MagicMock()
+    session.watch_patterns = ["FABLE_WAKE"]
+    session.notify_on_failure = True
+    session.watcher_platform = "telegram"
+    session.watcher_chat_id = "123"
+    registry._running[session.id] = session
+    assert registry._write_checkpoint() is True
+    registry._check_watch_patterns(session, "FABLE_WAKE reason=late\n")
+    assert registry.completion_queue.qsize() == 1
+    outbox = tmp_path / "process_notifications.json"
+    assert len(json.loads(outbox.read_text(encoding="utf-8"))) == 1
+
+    assert registry.kill_started_since(
+        "turn-a", frozenset(), source="gateway_turn_timeout"
+    ) == 1
+
+    assert registry.drain_notifications() == []
+    assert registry.completion_queue.empty()
+    assert json.loads(outbox.read_text(encoding="utf-8")) == []
+    assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+
+
+def test_wait_reconcile_marks_consumed_before_missing_control_fallback(
+    registry, tmp_path, monkeypatch
+):
+    """Consumer-driven exit reconciliation cannot enqueue a stale wake."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_wait_reconcile", task_id="turn-a")
+    session.process = MagicMock()
+    session.process.poll.return_value = 0
+    session.process.stdout = None
+    session.pid = 4242
+    session.watch_patterns = ["FABLE_WAKE"]
+    session.notify_on_failure = True
+    session.watcher_platform = "telegram"
+    session.watcher_chat_id = "123"
+    registry._running[session.id] = session
+    assert registry._write_checkpoint() is True
+
+    result = registry.wait(session.id, timeout=1)
+
+    assert result["status"] == "exited"
+    assert registry.is_completion_consumed(session.id)
+    assert registry.completion_queue.empty()
+    assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+    assert not (tmp_path / "process_notifications.json").exists()
+
+
+@pytest.mark.parametrize("consumer", ["wait", "read_log", "kill"])
+def test_detached_terminal_consumers_finalize_without_control_wake(
+    registry, tmp_path, monkeypatch, consumer
+):
+    """Detached refresh folds inline consumption into finalization atomically."""
+    import tools.process_registry as pr_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid=f"proc_detached_{consumer}", task_id="turn-a")
+    session.pid = 999999999
+    session.pid_scope = "host"
+    session.host_start_time = 123
+    session.detached = True
+    session.watch_patterns = ["FABLE_WAKE"]
+    session.notify_on_failure = True
+    session.watcher_platform = "telegram"
+    session.watcher_chat_id = "123"
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: False)
+    assert registry._write_checkpoint() is True
+
+    if consumer == "wait":
+        result = registry.wait(session.id, timeout=1)
+    elif consumer == "read_log":
+        result = registry.read_log(session.id, offset=0)
+    else:
+        result = registry.kill_process(session.id, consume_output=True)
+
+    assert result["status"] in {"exited", "already_exited"}
+    assert registry.is_completion_consumed(session.id)
+    assert registry.completion_queue.empty()
+    assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+    assert not (tmp_path / "process_notifications.json").exists()
 
 
 def test_kill_all_backward_compat_and_exclude_ids(registry):
@@ -702,6 +832,77 @@ class TestPruning:
         total = len(registry._running) + len(registry._finished)
         assert total <= MAX_PROCESSES
 
+    def test_expiry_prune_keeps_consumed_fable_wake_suppressed(
+        self, registry, tmp_path, monkeypatch
+    ):
+        """A queued control wake cannot revive after its process row expires."""
+        import tools.process_registry as pr_module
+
+        monkeypatch.setattr(
+            pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+        )
+        session = _make_session(
+            sid="proc_consumed_expired",
+            exited=True,
+            exit_code=1,
+            started_at=time.time() - FINISHED_TTL_SECONDS - 100,
+        )
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        registry._finished[session.id] = session
+        queued = registry._build_reliable_control_failure_event(session)
+        registry.completion_queue.put(queued)
+
+        registry._consume_completion_result(session)
+        registry._prune_if_needed()
+
+        assert session.id not in registry._finished
+        assert session.id not in registry._completion_consumed
+        assert registry.is_completion_consumed(session.id) is True
+        assert registry.is_notification_consumed(
+            registry.completion_queue.get_nowait()
+        ) is True
+
+    def test_capacity_prune_keeps_consumed_fable_wake_suppressed(
+        self, registry, tmp_path, monkeypatch
+    ):
+        """The MAX_PROCESSES LRU cannot release a queued control fence."""
+        import tools.process_registry as pr_module
+
+        monkeypatch.setattr(
+            pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+        )
+        consumed = _make_session(
+            sid="proc_consumed_oldest",
+            exited=True,
+            exit_code=1,
+            started_at=time.time() - 100,
+        )
+        consumed.watch_patterns = ["FABLE_WAKE"]
+        consumed.notify_on_failure = True
+        consumed.watcher_platform = "telegram"
+        registry._finished[consumed.id] = consumed
+        for i in range(MAX_PROCESSES - 1):
+            session = _make_session(
+                sid=f"proc_capacity_{i}",
+                exited=True,
+                started_at=time.time() - i,
+            )
+            registry._finished[session.id] = session
+        queued = registry._build_reliable_control_failure_event(consumed)
+        registry.completion_queue.put(queued)
+
+        registry._consume_completion_result(consumed)
+        registry._prune_if_needed()
+
+        assert consumed.id not in registry._finished
+        assert consumed.id not in registry._completion_consumed
+        assert registry.is_completion_consumed(consumed.id) is True
+        assert registry.is_notification_consumed(
+            registry.completion_queue.get_nowait()
+        ) is True
+
 
 class TestFinishedHandleRelease:
     """Finished sessions must release their Popen/PTY OS handles immediately.
@@ -819,6 +1020,187 @@ class TestFinishedHandleRelease:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    def test_notification_checkpoint_precedes_local_reader_start(
+        self, registry, tmp_path
+    ):
+        """The reader sees a fully configured, durable, registered session."""
+        checkpoint = tmp_path / "processes.json"
+        observed = {}
+
+        proc = MagicMock()
+        proc.pid = 4321
+        proc.stdout = iter([])
+        proc.stdin = MagicMock()
+        proc.poll.return_value = None
+
+        class InspectingThread:
+            def __init__(self, *, target, args, **_kwargs):
+                # Reader executes through copy_context().run, preserving the
+                # producer profile; its first argument is the reader function.
+                self.session = args[1]
+
+            def start(self):
+                session = self.session
+                assert registry._running.get(session.id) is session
+                persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+                assert persisted == [{
+                    "session_id": session.id,
+                    "checkpoint_owner_id": registry._checkpoint_owner_id,
+                    "command": "printf ready",
+                    "pid": 4321,
+                    "pid_scope": "host",
+                    "host_start_time": None,
+                    "systemd_unit": "",
+                    "cwd": str(tmp_path),
+                    "started_at": session.started_at,
+                    "task_id": "task",
+                    "owner_task_id": "task",
+                    "handoff_note": "",
+                    "session_key": "agent:main:telegram:dm:123",
+                    "watcher_platform": "telegram",
+                    "watcher_chat_id": "123",
+                    "watcher_user_id": "7",
+                    "watcher_user_name": "Ada",
+                    "watcher_thread_id": "42",
+                    "watcher_message_id": "99",
+                    "watcher_interval": 5,
+                    "parent_session_id": "sess-parent",
+                    "notify_on_complete": False,
+                    "notify_on_failure": True,
+                    "watch_patterns": ["FABLE_WAKE"],
+                    "reliable_control_watch_delivered": False,
+                    "reliable_control_close_seen": False,
+                    "reliable_control_delivery_consumed": False,
+                }]
+                assert registry.pending_watchers[0]["session_id"] == session.id
+                assert registry.pending_watchers[0]["notify_on_failure"] is True
+                observed["reader_started"] = True
+
+        notification = ProcessNotificationConfig(
+            watcher_platform="telegram",
+            watcher_chat_id="123",
+            watcher_user_id="7",
+            watcher_user_name="Ada",
+            watcher_thread_id="42",
+            watcher_message_id="99",
+            watcher_interval=5,
+            parent_session_id="sess-parent",
+            notify_on_failure=True,
+            watch_patterns=("FABLE_WAKE",),
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("tools.process_registry.subprocess.Popen", return_value=proc), \
+            patch("tools.process_registry.threading.Thread", InspectingThread), \
+            patch.object(registry, "_safe_host_start_time", return_value=None):
+            session = registry.spawn_local(
+                "printf ready",
+                cwd=str(tmp_path),
+                task_id="task",
+                session_key="agent:main:telegram:dm:123",
+                notification=notification,
+            )
+
+        assert observed == {"reader_started": True}
+        assert session.notify_on_failure is True
+        assert session.watch_patterns == ["FABLE_WAKE"]
+
+    def test_ultrafast_marker_is_captured_once_without_spawn_sleep(
+        self, registry, tmp_path
+    ):
+        """A child may print+exit immediately; the activation barrier suffices."""
+        checkpoint = tmp_path / "processes.json"
+        notification = ProcessNotificationConfig(
+            notify_on_failure=True,
+            watch_patterns=("FABLE_WAKE",),
+        )
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            session = registry.spawn_local(
+                "printf 'FABLE_WAKE ready\\n'",
+                cwd=str(tmp_path),
+                notification=notification,
+            )
+            assert session._completion_event.wait(5), "ultrafast child never reaped"
+
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        matches = [event for event in events if event.get("type") == "watch_match"]
+        completions = [event for event in events if event.get("type") == "completion"]
+        assert len(matches) == 1
+        assert matches[0]["pattern"] == "FABLE_WAKE"
+        assert "FABLE_WAKE ready" in matches[0]["output"]
+        assert completions == [], "the delivered sentinel suppresses failure fallback"
+        assert session.id not in registry._running
+        assert registry._finished.get(session.id) is session
+
+    def test_notification_config_round_trips_through_checkpoint_recovery(
+        self, registry, tmp_path, monkeypatch
+    ):
+        """Every routing/failure field needed after restart is recovered."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        session = ProcessSession(
+            id="proc_roundtrip",
+            command="watcher",
+            pid=4242,
+            pid_scope="host",
+            host_start_time=111,
+            started_at=1234.5,
+            task_id="task",
+            session_key="agent:main:telegram:dm:123:42",
+            watcher_platform="telegram",
+            watcher_chat_id="123",
+            watcher_user_id="7",
+            watcher_user_name="Ada",
+            watcher_thread_id="42",
+            watcher_message_id="99",
+            watcher_interval=5,
+            parent_session_id="sess-parent",
+            notify_on_failure=True,
+            watch_patterns=["FABLE_WAKE"],
+        )
+        registry._running[session.id] = session
+        assert registry._write_checkpoint() is True
+
+        recovered_registry = ProcessRegistry()
+        monkeypatch.setattr(
+            recovered_registry, "_host_pid_is_ours", lambda *_args: True
+        )
+        assert recovered_registry.recover_from_checkpoint() == 1
+        recovered = recovered_registry._running.get(session.id)
+        assert recovered is not None
+        for field in (
+            "session_key",
+            "watcher_platform",
+            "watcher_chat_id",
+            "watcher_user_id",
+            "watcher_user_name",
+            "watcher_thread_id",
+            "watcher_message_id",
+            "watcher_interval",
+            "parent_session_id",
+            "notify_on_failure",
+            "watch_patterns",
+        ):
+            assert getattr(recovered, field) == getattr(session, field)
+        assert recovered_registry.pending_watchers == [{
+            "session_id": session.id,
+            "check_interval": 5,
+            "session_key": session.session_key,
+            "platform": "telegram",
+            "chat_id": "123",
+            "user_id": "7",
+            "user_name": "Ada",
+            "thread_id": "42",
+            "message_id": "99",
+            "notify_on_complete": False,
+            "notify_on_failure": True,
+            "parent_session_id": "sess-parent",
+        }]
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
@@ -1230,6 +1612,1173 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_checkpoint_merges_disjoint_process_owners(self, tmp_path):
+        """Gateway and CLI snapshots sharing HERMES_HOME never erase each other."""
+        checkpoint = tmp_path / "procs.json"
+        first = ProcessRegistry()
+        second = ProcessRegistry()
+        first_session = _make_session(sid="proc_first")
+        second_session = _make_session(sid="proc_second")
+        first_session.pid = os.getpid()
+        second_session.pid = os.getpid()
+        first._running[first_session.id] = first_session
+        second._running[second_session.id] = second_session
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert first._write_checkpoint() is True
+            assert second._write_checkpoint() is True
+            entries = json.loads(checkpoint.read_text(encoding="utf-8"))
+            assert {entry["session_id"] for entry in entries} == {
+                "proc_first", "proc_second",
+            }
+            assert len({entry["checkpoint_owner_id"] for entry in entries}) == 2
+
+            first._running.clear()
+            assert first._write_checkpoint() is True
+            entries = json.loads(checkpoint.read_text(encoding="utf-8"))
+            assert [entry["session_id"] for entry in entries] == ["proc_second"]
+
+    def test_checkpoint_file_lock_serializes_disjoint_registry_writers(
+        self, tmp_path
+    ):
+        """Independent registries cannot overlap snapshot replacement."""
+        from utils import atomic_json_write as real_atomic_json_write
+
+        checkpoint = tmp_path / "procs.json"
+        first = ProcessRegistry()
+        second = ProcessRegistry()
+        first._running["proc_first"] = _make_session(sid="proc_first")
+        second._running["proc_second"] = _make_session(sid="proc_second")
+        first._running["proc_first"].pid = os.getpid()
+        second._running["proc_second"].pid = os.getpid()
+        start = threading.Barrier(2)
+        counter_lock = threading.Lock()
+        active_writes = 0
+        max_active_writes = 0
+        results = []
+
+        def slow_atomic_write(path, data):
+            nonlocal active_writes, max_active_writes
+            with counter_lock:
+                active_writes += 1
+                max_active_writes = max(max_active_writes, active_writes)
+            try:
+                time.sleep(0.05)
+                real_atomic_json_write(path, data)
+            finally:
+                with counter_lock:
+                    active_writes -= 1
+
+        def publish(registry):
+            start.wait()
+            results.append(registry._write_checkpoint())
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), patch(
+            "utils.atomic_json_write", side_effect=slow_atomic_write
+        ):
+            threads = [
+                threading.Thread(target=publish, args=(first,)),
+                threading.Thread(target=publish, args=(second,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert results == [True, True]
+        assert max_active_writes == 1
+        entries = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert {entry["session_id"] for entry in entries} == {
+            "proc_first", "proc_second",
+        }
+
+    def test_checkpoint_write_never_replaces_corrupt_shared_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """Unknown existing state cannot be treated as an empty owner set."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        checkpoint.write_text("{corrupt shared state", encoding="utf-8")
+        registry = ProcessRegistry()
+        session = _make_session(sid="proc_would_overwrite")
+        registry._running[session.id] = session
+
+        assert registry._write_checkpoint() is False
+        assert checkpoint.read_text(encoding="utf-8") == "{corrupt shared state"
+
+    def test_recovery_refuses_corrupt_checkpoint(self, tmp_path, monkeypatch):
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        checkpoint.write_text("{corrupt", encoding="utf-8")
+
+        with pytest.raises(ProcessCheckpointRecoveryError):
+            ProcessRegistry().recover_from_checkpoint()
+
+    def test_recovery_refuses_unreadable_checkpoint(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        checkpoint.write_text("[]", encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def unreadable_checkpoint(path, *args, **kwargs):
+            if path == checkpoint:
+                raise PermissionError("simulated checkpoint permission error")
+            return original_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", unreadable_checkpoint):
+            with pytest.raises(ProcessCheckpointRecoveryError):
+                ProcessRegistry().recover_from_checkpoint()
+
+    def test_recovery_read_waits_for_checkpoint_file_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """Recovery and snapshot replace share one inter-process lock."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        checkpoint.write_text("[]", encoding="utf-8")
+        lock_path = checkpoint.with_name(f"{checkpoint.name}.lock")
+        registry = ProcessRegistry()
+        entered = threading.Event()
+        finished = threading.Event()
+        result = []
+
+        def recover():
+            entered.set()
+            result.append(registry.recover_from_checkpoint())
+            finished.set()
+
+        thread = threading.Thread(target=recover)
+        from tools.process_registry_control import _CheckpointFileLock
+        with _CheckpointFileLock(lock_path):
+            thread.start()
+            assert entered.wait(5)
+            assert finished.wait(0.1) is False
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert finished.is_set()
+        assert result == [0]
+
+    def test_reliable_watch_outbox_round_trips_until_ack(
+        self, tmp_path, monkeypatch
+    ):
+        """A captured marker survives gateway death and is removed only on ack."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_durable", started_at=1234.5)
+        session.pid = os.getpid()
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        session.session_key = "agent:main:telegram:dm:123"
+        session.parent_session_id = "sess-parent"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        # Simulate a crash window where the outbox fsync succeeded but the
+        # companion process snapshot did not. Recovery must repair that
+        # half-transaction before the event becomes acknowledgeable.
+        with patch.object(producer, "_write_checkpoint", return_value=False):
+            producer._check_watch_patterns(
+                session, "FABLE_WAKE reason=decision\n"
+            )
+        live_event = producer.completion_queue.get_nowait()
+        assert live_event["checkpoint_confirmed"] is False
+        assert json.loads(checkpoint.read_text())[0][
+            "reliable_control_watch_delivered"
+        ] is False
+        outbox = tmp_path / "process_notifications.json"
+        assert [item["delivery_id"] for item in json.loads(outbox.read_text())] == [
+            live_event["delivery_id"]
+        ]
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: True)
+        assert restarted.recover_from_checkpoint() == 1
+        restored_event = restarted.completion_queue.get_nowait()
+        assert restored_event["delivery_id"] == live_event["delivery_id"]
+        assert restored_event["restored"] is True
+        assert restored_event["checkpoint_confirmed"] is True
+        assert json.loads(checkpoint.read_text())[0][
+            "reliable_control_watch_delivered"
+        ] is True
+        restored_session = restarted.get(session.id)
+        assert restored_session._reliable_control_watch_delivered is True
+        assert restored_session._reliable_control_watch_persisted is True
+
+        assert restarted.acknowledge_watch_event(restored_event) is True
+        assert json.loads(outbox.read_text()) == []
+        after_ack = ProcessRegistry()
+        monkeypatch.setattr(after_ack, "_host_pid_is_ours", lambda *_args: True)
+        assert after_ack.recover_from_checkpoint() == 1
+        assert after_ack.completion_queue.empty()
+
+    def test_live_recovered_fable_watcher_wakes_when_stream_is_unrecoverable(
+        self, tmp_path, monkeypatch
+    ):
+        """A surviving PID without a reattachable reader fails closed now."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_live_unobservable", started_at=2222.0)
+        session.pid = 4242
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        session.parent_session_id = "sess-parent"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: True)
+        assert restarted.recover_from_checkpoint() == 1
+
+        recovered = restarted._running[session.id]
+        assert recovered.detached is True
+        assert recovered._reliable_control_watch_delivered is True
+        event = restarted.completion_queue.get_nowait()
+        assert event["pattern"] == "FABLE_WAKE"
+        assert event["control_reason"] == "output_stream_unrecoverable"
+        assert event["termination_source"] == (
+            "checkpoint_output_stream_unrecoverable"
+        )
+        assert event["checkpoint_confirmed"] is True
+        assert restarted.completion_queue.empty()
+        persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert persisted[0]["reliable_control_watch_delivered"] is True
+
+    def test_live_recovery_deduplicates_existing_fable_outbox_event(
+        self, tmp_path, monkeypatch
+    ):
+        """An outbox half-transaction is restored, not replaced by fallback."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_live_outbox", started_at=3333.0)
+        session.pid = 4242
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+        existing = producer._build_reliable_control_failure_event(
+            session,
+            control_reason="primary_captured_before_restart",
+        )
+        assert producer._persist_reliable_watch_event(existing) is True
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: True)
+        assert restarted.recover_from_checkpoint() == 1
+
+        restored = restarted.completion_queue.get_nowait()
+        assert restored["delivery_id"] == existing["delivery_id"]
+        assert restored["control_reason"] == "primary_captured_before_restart"
+        assert restarted.completion_queue.empty()
+        outbox = tmp_path / "process_notifications.json"
+        assert [
+            item["delivery_id"]
+            for item in json.loads(outbox.read_text(encoding="utf-8"))
+        ] == [existing["delivery_id"]]
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))[0][
+            "reliable_control_watch_delivered"
+        ] is True
+
+    def test_live_recovered_scope_retains_cleanup_row_when_reap_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """Later wrapper death cannot orphan an unreaped recovered scope."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_live_scope", started_at=4444.0)
+        session.pid = 4242
+        session.host_start_time = 111
+        session.systemd_unit = "hermes-worker-proc_live_scope.scope"
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: True)
+        assert restarted.recover_from_checkpoint() == 1
+        recovered = restarted._running[session.id]
+        assert restarted.completion_queue.qsize() == 1
+
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: False)
+        with patch(
+            "tools.process_registry._stop_systemd_unit", return_value=False
+        ) as stop_unit:
+            restarted._refresh_detached_session(recovered)
+
+        stop_unit.assert_called_once_with(session.systemd_unit)
+        assert recovered.exited is True
+        assert recovered.completion_reason == "lost"
+        assert recovered.termination_source == "checkpoint_scope_reap_failed"
+        assert recovered.id in restarted._finished
+        assert restarted.completion_queue.qsize() == 1
+        retained = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert retained[0]["session_id"] == session.id
+        assert retained[0]["systemd_unit"] == session.systemd_unit
+        assert retained[0]["reliable_control_watch_delivered"] is True
+
+    def test_consumed_watch_tombstone_prevents_restart_revival_when_delete_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """Inline consumption is durable even if its outbox delete loses I/O."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_consumed_io_fail", started_at=4321.5)
+        session.pid = 999999999
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+        producer._check_watch_patterns(session, "FABLE_WAKE reason=attention\n")
+        producer.completion_queue.get_nowait()
+
+        session.exited = True
+        with patch.object(
+            producer,
+            "discard_reliable_watch_events_for_session",
+            return_value=False,
+        ):
+            producer._consume_completion_result(session)
+
+        persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert persisted[0]["reliable_control_delivery_consumed"] is True
+        outbox = tmp_path / "process_notifications.json"
+        assert json.loads(outbox.read_text(encoding="utf-8"))
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(restarted, "_is_host_pid_alive", lambda *_args: False)
+        assert restarted.recover_from_checkpoint() == 0
+        assert restarted.completion_queue.empty()
+        assert json.loads(outbox.read_text(encoding="utf-8")) == []
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+
+    def test_corrupt_outbox_cannot_falsely_ack_consumed_tombstone(
+        self, tmp_path, monkeypatch
+    ):
+        """Unreadable outbox aborts startup without clearing consumption."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_consumed_corrupt", started_at=8765.5)
+        session.pid = 999999999
+        session.host_start_time = 111
+        session.exited = True
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        event = producer._build_reliable_control_failure_event(session)
+        assert producer._persist_reliable_watch_event(event) is True
+        producer._completion_consumed.add(session.id)
+        consumed_entry = producer._checkpoint_entry_for_session(session)
+        assert producer._write_checkpoint(extra_entries=[consumed_entry]) is True
+
+        outbox = tmp_path / "process_notifications.json"
+        valid_outbox = outbox.read_text(encoding="utf-8")
+        outbox.write_text("{corrupt", encoding="utf-8")
+
+        first_restart = ProcessRegistry()
+        monkeypatch.setattr(
+            first_restart, "_host_pid_is_ours", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            first_restart, "_is_host_pid_alive", lambda *_args: False
+        )
+        with pytest.raises(ProcessCheckpointRecoveryError):
+            first_restart.recover_from_checkpoint()
+        assert first_restart.completion_queue.empty()
+        retained = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert retained[0]["reliable_control_delivery_consumed"] is True
+
+        # Once storage becomes readable, recovery deletes the stale event and
+        # only then prunes the consume tombstone. It never exposes a wake.
+        outbox.write_text(valid_outbox, encoding="utf-8")
+        second_restart = ProcessRegistry()
+        monkeypatch.setattr(
+            second_restart, "_host_pid_is_ours", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            second_restart, "_is_host_pid_alive", lambda *_args: False
+        )
+        assert second_restart.recover_from_checkpoint() == 0
+        assert second_restart.completion_queue.empty()
+        assert json.loads(outbox.read_text(encoding="utf-8")) == []
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+
+    def test_dead_delivered_checkpoint_fails_closed_when_outbox_is_corrupt(
+        self, tmp_path, monkeypatch
+    ):
+        """Corrupt durable wake storage aborts startup until repaired."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_delivered_corrupt", started_at=7777.0)
+        session.pid = 999999999
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+        producer._check_watch_patterns(session, "FABLE_WAKE reason=attention\n")
+        primary = producer.completion_queue.get_nowait()
+        outbox = tmp_path / "process_notifications.json"
+        valid_outbox = outbox.read_text(encoding="utf-8")
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))[0][
+            "reliable_control_watch_delivered"
+        ] is True
+        outbox.write_text("{corrupt", encoding="utf-8")
+
+        first_restart = ProcessRegistry()
+        monkeypatch.setattr(
+            first_restart, "_host_pid_is_ours", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            first_restart, "_is_host_pid_alive", lambda *_args: False
+        )
+        with pytest.raises(ProcessCheckpointRecoveryError):
+            first_restart.recover_from_checkpoint()
+        assert first_restart.completion_queue.empty()
+        retained = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert retained[0]["session_id"] == session.id
+
+        # Once storage is repaired, the original durable marker is restored
+        # exactly as-is; startup never served while its state was unknown.
+        outbox.write_text(valid_outbox, encoding="utf-8")
+        second_restart = ProcessRegistry()
+        monkeypatch.setattr(
+            second_restart, "_host_pid_is_ours", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            second_restart, "_is_host_pid_alive", lambda *_args: False
+        )
+        assert second_restart.recover_from_checkpoint() == 0
+        restored = second_restart.completion_queue.get_nowait()
+        assert restored["delivery_id"] == primary["delivery_id"]
+        assert second_restart.completion_queue.empty()
+
+    def test_live_delivered_checkpoint_fails_closed_on_outbox_read_error(
+        self, tmp_path, monkeypatch
+    ):
+        """A permission/read failure aborts before adopting a live watcher."""
+        from pathlib import Path
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_delivered_unreadable", started_at=8888.0)
+        session.pid = 4242
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+        producer._check_watch_patterns(session, "FABLE_WAKE reason=attention\n")
+        primary = producer.completion_queue.get_nowait()
+        outbox = tmp_path / "process_notifications.json"
+
+        original_read_text = Path.read_text
+
+        def unreadable_outbox(path, *args, **kwargs):
+            if path == outbox:
+                raise PermissionError("simulated unreadable outbox")
+            return original_read_text(path, *args, **kwargs)
+
+        first_restart = ProcessRegistry()
+        monkeypatch.setattr(
+            first_restart, "_host_pid_is_ours", lambda *_args: True
+        )
+        with patch.object(Path, "read_text", unreadable_outbox):
+            with pytest.raises(ProcessCheckpointRecoveryError):
+                first_restart.recover_from_checkpoint()
+
+        assert first_restart.completion_queue.empty()
+        assert first_restart._running == {}
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))[0][
+            "reliable_control_watch_delivered"
+        ] is True
+
+        second_restart = ProcessRegistry()
+        monkeypatch.setattr(
+            second_restart, "_host_pid_is_ours", lambda *_args: True
+        )
+        assert second_restart.recover_from_checkpoint() == 1
+        restored = second_restart.completion_queue.get_nowait()
+        assert restored["delivery_id"] == primary["delivery_id"]
+        assert second_restart.completion_queue.empty()
+
+    def test_outbox_only_corruption_aborts_recovery(self, tmp_path, monkeypatch):
+        """Outbox-only is a valid crash state and cannot degrade to empty."""
+        import tools.process_registry as pr_module
+
+        monkeypatch.setattr(
+            pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+        )
+        (tmp_path / "process_notifications.json").write_text(
+            "{corrupt", encoding="utf-8"
+        )
+
+        restarted = ProcessRegistry()
+        with pytest.raises(ProcessCheckpointRecoveryError):
+            restarted.recover_from_checkpoint()
+        assert restarted.completion_queue.empty()
+
+    def test_outbox_only_read_error_aborts_recovery(self, tmp_path, monkeypatch):
+        """A permission failure cannot let an outbox-only wake disappear."""
+        from pathlib import Path
+        import tools.process_registry as pr_module
+
+        monkeypatch.setattr(
+            pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+        )
+        outbox = tmp_path / "process_notifications.json"
+        outbox.write_text("[]", encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def unreadable_outbox(path, *args, **kwargs):
+            if path == outbox:
+                raise PermissionError("simulated unreadable outbox")
+            return original_read_text(path, *args, **kwargs)
+
+        restarted = ProcessRegistry()
+        with patch.object(Path, "read_text", unreadable_outbox):
+            with pytest.raises(ProcessCheckpointRecoveryError):
+                restarted.recover_from_checkpoint()
+        assert restarted.completion_queue.empty()
+
+    @pytest.mark.parametrize(
+        "pid",
+        [os.getpid(), 999999999],
+        ids=["live-checkpoint", "dead-checkpoint"],
+    )
+    def test_semantically_invalid_outbox_aborts_before_recovery_mutation(
+        self, tmp_path, monkeypatch, pid
+    ):
+        """A JSON object that is not a FABLE event is corruption, not noise."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid=f"proc_bad_event_{pid}", started_at=8890.0)
+        session.pid = pid
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+        producer._check_watch_patterns(session, "FABLE_WAKE reason=attention\n")
+        producer.completion_queue.get_nowait()
+
+        outbox = tmp_path / "process_notifications.json"
+        malformed = json.loads(outbox.read_text(encoding="utf-8"))
+        malformed[0].pop("pattern")
+        outbox.write_text(json.dumps(malformed), encoding="utf-8")
+        checkpoint_before = checkpoint.read_text(encoding="utf-8")
+
+        restarted = ProcessRegistry()
+        with pytest.raises(ProcessCheckpointRecoveryError):
+            restarted.recover_from_checkpoint()
+
+        assert restarted.completion_queue.empty()
+        assert restarted._running == {}
+        assert checkpoint.read_text(encoding="utf-8") == checkpoint_before
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {
+                "session_id": "proc_missing_pid",
+                "command": "sleep 1",
+            },
+            {
+                "session_id": "proc_zero_pid",
+                "command": "sleep 1",
+                "pid": 0,
+            },
+            {
+                "session_id": "proc_bad_fable_state",
+                "command": "agent-wait-job.sh",
+                "pid": 123,
+                "watch_patterns": ["FABLE_WAKE"],
+                "reliable_control_watch_delivered": "yes",
+            },
+            {
+                "session_id": "proc_bad_tombstone",
+                "command": "agent-wait-job.sh",
+                "reliable_control_delivery_consumed": True,
+                "watch_patterns": [],
+            },
+        ],
+        ids=["missing-pid", "zero-pid", "bad-bool", "bad-tombstone"],
+    )
+    def test_semantically_invalid_checkpoint_aborts_without_rewrite(
+        self, tmp_path, monkeypatch, entry
+    ):
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        raw = json.dumps([entry])
+        checkpoint.write_text(raw, encoding="utf-8")
+
+        restarted = ProcessRegistry()
+        with pytest.raises(ProcessCheckpointRecoveryError):
+            restarted.recover_from_checkpoint()
+
+        assert checkpoint.read_text(encoding="utf-8") == raw
+        assert restarted.completion_queue.empty()
+        assert restarted._running == {}
+
+    def test_consumed_control_tombstone_may_omit_pid(self, tmp_path, monkeypatch):
+        """The explicit suppression row is state, not a process to adopt."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        checkpoint.write_text(
+            json.dumps(
+                [
+                    {
+                        "session_id": "proc_consumed_tombstone",
+                        "command": "agent-wait-job.sh",
+                        "watch_patterns": ["FABLE_WAKE"],
+                        "reliable_control_delivery_consumed": True,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        restarted = ProcessRegistry()
+        assert restarted.recover_from_checkpoint() == 0
+        assert restarted.completion_queue.empty()
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+
+    def test_failed_primary_outbox_write_keeps_one_ram_wake_and_recovery_tombstone(
+        self, tmp_path, monkeypatch
+    ):
+        """A captured marker is not durable until its outbox row exists."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_primary_io_fail", started_at=2468.0)
+        session.pid = 999999999
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        session.session_key = "agent:main:telegram:dm:123"
+        session.parent_session_id = "sess-parent"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        with patch.object(
+            producer, "_persist_reliable_watch_event", return_value=False
+        ):
+            producer._check_watch_patterns(
+                session, "FABLE_WAKE reason=needs_attention\n"
+            )
+            session.exited = True
+            session.exit_code = 0
+            producer._move_to_finished(session)
+
+        # The primary marker remains the only live event; completion must not
+        # add a second fallback turn in this gateway lifecycle.
+        assert producer.completion_queue.qsize() == 1
+        primary = producer.completion_queue.get_nowait()
+        assert primary["type"] == "watch_match"
+        assert primary["pattern"] == "FABLE_WAKE"
+        assert primary["checkpoint_confirmed"] is False
+        assert session._reliable_control_watch_delivered is True
+        assert session._reliable_control_watch_persisted is False
+
+        persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert [item["session_id"] for item in persisted] == [session.id]
+        assert persisted[0]["reliable_control_watch_delivered"] is False
+
+        # An unrelated later snapshot from this same registry cannot erase the
+        # last recovery source.
+        assert producer._write_checkpoint() is True
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))[0][
+            "session_id"
+        ] == session.id
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(restarted, "_is_host_pid_alive", lambda *_args: False)
+        assert restarted.recover_from_checkpoint() == 0
+        fallback = restarted.completion_queue.get_nowait()
+        assert fallback["type"] == "watch_match"
+        assert fallback["control_reason"] == "missing_reliable_control_sentinel"
+        assert fallback["checkpoint_confirmed"] is True
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+
+    def test_second_move_cannot_erase_checkpoint_before_fallback_persists(
+        self, tmp_path, monkeypatch
+    ):
+        """A racing idempotent finalizer cannot publish an empty snapshot."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        registry = ProcessRegistry()
+        session = _make_session(sid="proc_move_race", started_at=7654.0)
+        session.pid = os.getpid()
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        registry._running[session.id] = session
+        assert registry._write_checkpoint() is True
+
+        persist_entered = threading.Event()
+        allow_persist = threading.Event()
+        real_persist = registry._persist_reliable_watch_event
+
+        def blocked_persist(event):
+            persist_entered.set()
+            assert allow_persist.wait(5)
+            return real_persist(event)
+
+        session.exited = True
+        session.exit_code = 0
+        mover = threading.Thread(target=registry._move_to_finished, args=(session,))
+        second_started = threading.Event()
+        second_done = threading.Event()
+
+        def second_move():
+            second_started.set()
+            registry._move_to_finished(session)
+            second_done.set()
+
+        second_mover = threading.Thread(target=second_move)
+        with patch.object(
+            registry, "_persist_reliable_watch_event", side_effect=blocked_persist
+        ):
+            mover.start()
+            try:
+                assert persist_entered.wait(5)
+                second_mover.start()
+                assert second_started.wait(5)
+                # The first mover has not committed its outbox yet. The second
+                # call must be a true serialized no-op and leave the original
+                # recovery row on disk.
+                persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+                assert [item["session_id"] for item in persisted] == [session.id]
+                assert not second_done.is_set()
+            finally:
+                allow_persist.set()
+                mover.join(timeout=5)
+                second_mover.join(timeout=5)
+
+        assert not mover.is_alive()
+        assert not second_mover.is_alive()
+        assert second_done.is_set()
+        assert registry.completion_queue.qsize() == 1
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+        outbox = tmp_path / "process_notifications.json"
+        assert len(json.loads(outbox.read_text(encoding="utf-8"))) == 1
+
+    def test_unrelated_checkpoint_cannot_erase_exited_session_mid_finalization(
+        self, tmp_path, monkeypatch
+    ):
+        """The process row survives until fallback durability is committed."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        registry = ProcessRegistry()
+        exiting = _make_session(sid="proc_finalizing", started_at=8766.0)
+        exiting.pid = os.getpid()
+        exiting.watch_patterns = ["FABLE_WAKE"]
+        exiting.notify_on_failure = True
+        exiting.watcher_platform = "telegram"
+        exiting.watcher_chat_id = "123"
+        unrelated = _make_session(sid="proc_unrelated", started_at=8767.0)
+        unrelated.pid = os.getpid()
+        registry._running[exiting.id] = exiting
+        registry._running[unrelated.id] = unrelated
+        assert registry._write_checkpoint() is True
+
+        persist_entered = threading.Event()
+        allow_persist = threading.Event()
+        real_persist = registry._persist_reliable_watch_event
+
+        def blocked_persist(event):
+            persist_entered.set()
+            assert allow_persist.wait(5)
+            return real_persist(event)
+
+        exiting.exited = True
+        exiting.exit_code = 0
+        mover = threading.Thread(
+            target=registry._move_to_finished,
+            args=(exiting,),
+        )
+        with patch.object(
+            registry, "_persist_reliable_watch_event", side_effect=blocked_persist
+        ):
+            mover.start()
+            try:
+                assert persist_entered.wait(5)
+                # Simulate a spawn/checkpoint for another session while A is
+                # between exit observation and its durable outbox commit.
+                assert registry._write_checkpoint() is True
+                crash_snapshot = json.loads(checkpoint.read_text(encoding="utf-8"))
+                assert {item["session_id"] for item in crash_snapshot} == {
+                    exiting.id,
+                    unrelated.id,
+                }
+                assert not (tmp_path / "process_notifications.json").exists()
+            finally:
+                allow_persist.set()
+                mover.join(timeout=5)
+
+        assert not mover.is_alive()
+        assert {item["session_id"] for item in json.loads(
+            checkpoint.read_text(encoding="utf-8")
+        )} == {unrelated.id}
+        assert len(json.loads(
+            (tmp_path / "process_notifications.json").read_text(encoding="utf-8")
+        )) == 1
+
+    def test_checkpoint_writer_cannot_reinsert_clean_close_after_remove_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """Terminal checkpoint removal atomically transfers running ownership."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        registry = ProcessRegistry()
+        closing = _make_session(sid="proc_clean_close", started_at=8768.0)
+        closing.pid = os.getpid()
+        closing.watch_patterns = ["FABLE_WAKE"]
+        closing.notify_on_failure = True
+        closing.watcher_platform = "telegram"
+        closing.watcher_chat_id = "123"
+        closing._reliable_control_close_seen = True
+        unrelated = _make_session(sid="proc_after_commit", started_at=8769.0)
+        unrelated.pid = os.getpid()
+        registry._running[closing.id] = closing
+        registry._running[unrelated.id] = unrelated
+        assert registry._write_checkpoint() is True
+
+        remove_committed = threading.Event()
+        allow_finalizer = threading.Event()
+        real_write = registry._write_checkpoint
+
+        def pause_after_remove_commit(*args, **kwargs):
+            result = real_write(*args, **kwargs)
+            if kwargs.get("remove_session_ids") == {closing.id}:
+                remove_committed.set()
+                assert allow_finalizer.wait(5)
+            return result
+
+        closing.exited = True
+        closing.exit_code = 0
+        mover = threading.Thread(
+            target=registry._move_to_finished,
+            args=(closing,),
+        )
+        with patch.object(
+            registry, "_write_checkpoint", side_effect=pause_after_remove_commit
+        ):
+            mover.start()
+            try:
+                assert remove_committed.wait(5)
+                assert closing.id not in registry._running
+                # A later writer observes the atomic ownership transfer and
+                # cannot resurrect the clean terminal row.
+                assert real_write() is True
+                persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+                assert {item["session_id"] for item in persisted} == {
+                    unrelated.id
+                }
+            finally:
+                allow_finalizer.set()
+                mover.join(timeout=5)
+
+        assert not mover.is_alive()
+        assert registry.completion_queue.empty()
+        assert not (tmp_path / "process_notifications.json").exists()
+
+    def test_primary_persist_serializes_with_consumption_before_outbox_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Consume cannot clear its tombstone ahead of an in-flight producer."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        registry = ProcessRegistry()
+        session = _make_session(sid="proc_primary_race", started_at=8765.0)
+        session.pid = os.getpid()
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        registry._running[session.id] = session
+        assert registry._write_checkpoint() is True
+
+        persist_entered = threading.Event()
+        allow_persist = threading.Event()
+        real_persist = registry._persist_reliable_watch_event
+
+        def pause_then_persist(event):
+            persist_entered.set()
+            assert allow_persist.wait(5)
+            return real_persist(event)
+
+        scanner = threading.Thread(
+            target=registry._check_watch_patterns,
+            args=(session, "FABLE_WAKE reason=attention\n"),
+        )
+        consume_done = threading.Event()
+
+        def consume_exit():
+            registry._move_to_finished(session, consume_output=True)
+            consume_done.set()
+
+        consumer = threading.Thread(target=consume_exit)
+        with patch.object(
+            registry, "_persist_reliable_watch_event", side_effect=pause_then_persist
+        ):
+            scanner.start()
+            try:
+                assert persist_entered.wait(5)
+                session.exited = True
+                session.exit_code = 0
+                consumer.start()
+                # Primary persistence owns session._lock across its durable
+                # transaction. Consumption cannot observe an empty outbox and
+                # clear its tombstone while that producer is paused.
+                assert consume_done.wait(0.1) is False
+            finally:
+                allow_persist.set()
+                scanner.join(timeout=5)
+                consumer.join(timeout=5)
+
+        assert not scanner.is_alive()
+        assert not consumer.is_alive()
+        assert consume_done.is_set()
+        assert registry.is_completion_consumed(session.id) is True
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+        outbox = tmp_path / "process_notifications.json"
+        assert json.loads(outbox.read_text(encoding="utf-8")) == []
+        while not registry.completion_queue.empty():
+            assert registry.is_notification_consumed(
+                registry.completion_queue.get_nowait()
+            ) is True
+
+        restarted = ProcessRegistry()
+        assert restarted.recover_from_checkpoint() == 0
+        assert restarted.completion_queue.empty()
+
+    def test_dead_pid_without_sentinel_recovers_as_durable_control_wake(
+        self, tmp_path, monkeypatch
+    ):
+        """Gateway-down process exit cannot erase the selective fail-safe."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_lost", started_at=4321.0)
+        session.pid = 999999999
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        session.session_key = "agent:main:telegram:dm:123"
+        session.parent_session_id = "sess-parent"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(restarted, "_is_host_pid_alive", lambda *_args: False)
+        assert restarted.recover_from_checkpoint() == 0
+        event = restarted.completion_queue.get_nowait()
+        assert event["type"] == "watch_match"
+        assert event["pattern"] == "FABLE_WAKE"
+        assert event["control_reason"] == "missing_reliable_control_sentinel"
+        assert event["parent_session_id"] == "sess-parent"
+        assert event["checkpoint_confirmed"] is True
+        assert json.loads(checkpoint.read_text()) == []
+
+        # Crash again before adapter acceptance: the outbox alone replays it.
+        replay = ProcessRegistry()
+        assert replay.recover_from_checkpoint() == 0
+        replayed = replay.completion_queue.get_nowait()
+        assert replayed["delivery_id"] == event["delivery_id"]
+        assert replayed["checkpoint_confirmed"] is True
+
+    def test_unrecoverable_sandbox_watcher_generates_durable_control_wake(
+        self, tmp_path, monkeypatch
+    ):
+        """A sandbox-local PID is unobservable after restart, not disposable."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_sandbox_lost", started_at=5555.0)
+        session.pid = 77
+        session.pid_scope = "sandbox"
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        session.session_key = "agent:main:telegram:dm:123"
+        session.parent_session_id = "sess-parent"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(
+            restarted,
+            "_host_pid_is_ours",
+            lambda *_args: pytest.fail("sandbox PID must not be probed on host"),
+        )
+        assert restarted.recover_from_checkpoint() == 0
+
+        event = restarted.completion_queue.get_nowait()
+        assert event["type"] == "watch_match"
+        assert event["pattern"] == "FABLE_WAKE"
+        assert event["control_reason"] == "missing_reliable_control_sentinel"
+        assert event["parent_session_id"] == "sess-parent"
+        assert event["checkpoint_confirmed"] is True
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+        outbox = tmp_path / "process_notifications.json"
+        assert json.loads(outbox.read_text(encoding="utf-8"))[0][
+            "delivery_id"
+        ] == event["delivery_id"]
+
+    def test_sandbox_fallback_persist_failure_retains_checkpoint_tombstone(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_sandbox_retry", started_at=6666.0)
+        session.pid = 88
+        session.pid_scope = "sandbox"
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        restarted = ProcessRegistry()
+        with patch.object(
+            restarted, "_persist_reliable_watch_event", return_value=False
+        ), patch.object(
+            restarted,
+            "_host_pid_is_ours",
+            side_effect=AssertionError("sandbox PID ownership probe"),
+        ):
+            assert restarted.recover_from_checkpoint() == 0
+
+        event = restarted.completion_queue.get_nowait()
+        assert event["checkpoint_confirmed"] is False
+        persisted = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert [item["session_id"] for item in persisted] == [session.id]
+        assert persisted[0]["reliable_control_watch_delivered"] is False
+
+        # Tombstone is registry state, not a one-write extra that disappears on
+        # the next checkpoint publication.
+        assert restarted._write_checkpoint() is True
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))[0][
+            "session_id"
+        ] == session.id
+
+    def test_dead_pid_after_auto_close_wakes_when_exit_status_was_lost(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        producer = ProcessRegistry()
+        session = _make_session(sid="proc_closed", started_at=9876.0)
+        session.pid = 999999999
+        session.host_start_time = 111
+        session.watch_patterns = ["FABLE_WAKE"]
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        session._reliable_control_close_seen = True
+        producer._running[session.id] = session
+        assert producer._write_checkpoint() is True
+
+        restarted = ProcessRegistry()
+        monkeypatch.setattr(restarted, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(restarted, "_is_host_pid_alive", lambda *_args: False)
+        assert restarted.recover_from_checkpoint() == 0
+        event = restarted.completion_queue.get_nowait()
+        assert event["pattern"] == "FABLE_WAKE"
+        assert event["control_reason"] == "checkpoint_exit_status_unavailable"
+        assert event["checkpoint_confirmed"] is True
+        assert json.loads(checkpoint.read_text()) == []
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
@@ -1264,7 +2813,71 @@ class TestCheckpoint:
             assert registry.recover_from_checkpoint() == 0
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
-        assert json.loads(checkpoint.read_text()) == [entry]
+        retained = json.loads(checkpoint.read_text())
+        assert len(retained) == 1
+        assert {
+            key: value
+            for key, value in retained[0].items()
+            if key != "checkpoint_owner_id"
+        } == entry
+        assert retained[0]["checkpoint_owner_id"] == registry._checkpoint_owner_id
+
+    def test_unreaped_systemd_scope_emits_one_durable_failure_wake(
+        self, tmp_path, monkeypatch
+    ):
+        """Scope cleanup failure wakes once, even after a clean sentinel."""
+        import tools.process_registry as pr_module
+
+        checkpoint = tmp_path / "procs.json"
+        monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+        entry = {
+            "session_id": "proc_dead_fable_scope",
+            "command": "agent-wait-job.sh",
+            "pid": 999999999,
+            "pid_scope": "host",
+            "host_start_time": 123.0,
+            "systemd_unit": "hermes-worker-proc_dead_fable_scope.scope",
+            "started_at": 9999.0,
+            "watcher_platform": "telegram",
+            "watcher_chat_id": "123",
+            "notify_on_failure": True,
+            "watch_patterns": ["FABLE_WAKE"],
+            "reliable_control_watch_delivered": False,
+            "reliable_control_close_seen": True,
+        }
+        checkpoint.write_text(json.dumps([entry]))
+
+        first = ProcessRegistry()
+        monkeypatch.setattr(first, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(first, "_is_host_pid_alive", lambda *_args: False)
+        with patch(
+            "tools.process_registry._stop_systemd_unit", return_value=False
+        ) as stop_unit:
+            assert first.recover_from_checkpoint() == 0
+        stop_unit.assert_called_once_with(entry["systemd_unit"])
+
+        event = first.completion_queue.get_nowait()
+        assert event["pattern"] == "FABLE_WAKE"
+        assert event["control_reason"] == "checkpoint_scope_reap_failed"
+        assert event["checkpoint_confirmed"] is True
+        retained = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert retained[0]["reliable_control_watch_delivered"] is True
+        assert retained[0]["reliable_control_close_seen"] is True
+        assert first.acknowledge_watch_event(event) is True
+
+        # The cleanup row remains retryable, but the acknowledged control edge
+        # must not fire again on every startup while systemctl remains broken.
+        second = ProcessRegistry()
+        monkeypatch.setattr(second, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(second, "_is_host_pid_alive", lambda *_args: False)
+        with patch(
+            "tools.process_registry._stop_systemd_unit", return_value=False
+        ):
+            assert second.recover_from_checkpoint() == 0
+        assert second.completion_queue.empty()
+        assert json.loads(checkpoint.read_text(encoding="utf-8"))[0][
+            "reliable_control_watch_delivered"
+        ] is True
 
     def test_recover_dead_wrapper_drops_reaped_systemd_scope(
         self, registry, tmp_path, monkeypatch

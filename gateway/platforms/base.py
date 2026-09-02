@@ -385,6 +385,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.event_receipts import has_gateway_delivery_receipt, resolve_gateway_delivery_receipt
 from gateway.session import SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
@@ -1762,6 +1763,7 @@ _strip_media_directives = _strip_media_tag_directives
 
 
 class BasePlatformAdapter(ABC):
+    supports_durable_delivery_receipts = True
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -3635,6 +3637,7 @@ class BasePlatformAdapter(ABC):
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
         if not self._message_handler:
+            resolve_gateway_delivery_receipt(event, "retry")
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
             # say so once per adapter (#102260).
             if not getattr(self, "_no_message_handler_logged", False):
@@ -3659,15 +3662,21 @@ class BasePlatformAdapter(ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            resolve_gateway_delivery_receipt(event, "retry")
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
+            if has_gateway_delivery_receipt(event):
+                resolve_gateway_delivery_receipt(event, "retry")
+                return
             await self._handle_message_while_active(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+        if not event._gateway_accepted:
+            resolve_gateway_delivery_receipt(event, "retry")
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
@@ -4192,6 +4201,7 @@ class BasePlatformAdapter(ABC):
                 raise
         finally:
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
+            resolve_gateway_delivery_receipt(event, "retry")
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
             await self._fire_post_delivery_callback(session_key, interrupt_event)

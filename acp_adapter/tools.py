@@ -588,7 +588,8 @@ _PRIORITY_KEYS = (
 )
 
 
-def _format_generic_structured_result(tool_name: str, result: Optional[str], *, fallback_to_text: bool = True) -> Optional[str]:
+def _format_generic_structured_result(tool_name: str, result: Optional[str], *, fallback_to_text: bool = True,
+                                      expanded_text_fields: Optional[Dict[str, int]] = None) -> Optional[str]:
     data = _json_loads_maybe(result)
     if not isinstance(data, (dict, list)):
         return _nonempty(result) if fallback_to_text else None
@@ -609,7 +610,11 @@ def _format_generic_structured_result(tool_name: str, result: Optional[str], *, 
     for key, value in data.items():
         if key in seen or key in {"success", "raw", "content", "entries"} or value in _EMPTYISH:
             continue
-        lines.extend(_format_structured_value(str(key), value, indent=0, max_depth=3, max_items=8))
+        expanded_limit = (expanded_text_fields or {}).get(key)
+        if expanded_limit is not None and isinstance(value, str):
+            lines.extend([f"- **{key}:**", _truncate_text(value, limit=expanded_limit)])
+        else:
+            lines.extend(_format_structured_value(str(key), value, indent=0, max_depth=3, max_items=8))
         if len(lines) >= 40:
             lines.append("- ... more fields truncated")
             break
@@ -625,6 +630,8 @@ _COMPLETION_FORMATTERS: Dict[str, _Formatter] = {
     "patch": _format_edit_result,
     "search_files": _format_search_files_result,
     "execute_code": _format_execute_code_result,
+    "terminal": lambda name, result, args: _format_generic_structured_result(
+        name, result, expanded_text_fields={"output": 5000}),
     "process": _format_process_result,
     "delegate_task": _format_delegate_result,
     "session_search": _format_session_search_result,

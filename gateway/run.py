@@ -3101,20 +3101,9 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return agent_result.get("completed") is not False
 
 
-def _preserve_queued_followup_history_offset(
-    current_result: dict, followup_result: dict) -> dict:
-    """Carry the outer history offset through queued follow-up drains.
-    Each recursive ``_run_agent()`` advances ``history_offset``; uncorrected, the outer persistence
-    step sees only the *last* queued turn as "new" and drops earlier ones."""
-    if not isinstance(followup_result, dict) or not isinstance(current_result, dict):
-        return followup_result
-    current_offset = current_result.get("history_offset")
-    followup_offset = followup_result.get("history_offset")
-    if not isinstance(current_offset, int):
-        return followup_result
-    if isinstance(followup_offset, int) and followup_offset <= current_offset:
-        return followup_result
-    return {**followup_result, "history_offset": current_offset}
+from gateway.run_reliable_watch import (
+    _gateway_delivery_receipt_outcome, _preserve_queued_followup_history_offset,
+)
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:

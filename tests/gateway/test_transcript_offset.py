@@ -13,7 +13,10 @@ to ``_run_agent``'s return dict and uses it for the slice.
 """
 
 
-from gateway.run import _preserve_queued_followup_history_offset
+from gateway.run import (
+    _gateway_delivery_receipt_outcome,
+    _preserve_queued_followup_history_offset,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -166,3 +169,20 @@ class TestTranscriptHistoryOffset:
         persisted = merged["messages"][merged["history_offset"]:]
         assert persisted == first_followup_turn + second_followup_turn
 
+    def test_failed_owner_turn_stays_retryable_after_successful_followup(self):
+        merged = _preserve_queued_followup_history_offset(
+            {"completed": False, "failed": True},
+            {"completed": True, "final_response": "follow-up handled"},
+        )
+
+        assert merged["completed"] is True
+        assert _gateway_delivery_receipt_outcome(merged) == "retry"
+
+    def test_successful_owner_turn_stays_durable_after_failed_followup(self):
+        merged = _preserve_queued_followup_history_offset(
+            {"completed": True, "final_response": "wake handled"},
+            {"completed": False, "failed": True},
+        )
+
+        assert merged["completed"] is False
+        assert _gateway_delivery_receipt_outcome(merged) == "durable"

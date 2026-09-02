@@ -23,6 +23,8 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
+from gateway.platforms.event_receipts import has_gateway_delivery_receipt, resolve_gateway_delivery_receipt
+from gateway.run_reliable_watch import _gateway_delivery_receipt_outcome
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -1598,7 +1600,7 @@ class GatewayTurnMixin:
         return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
 
     async def _hmwa_compression_exhaustion_reset(
-        self, agent_result, response, session_entry, session_key, source,
+        self, agent_result, response, session_entry, session_key, source, event=None,
     ):
         """Auto-reset a permanently oversized session so the next message starts fresh instead of
         replaying the oversized context forever. Never on a lock-contended defer — that is the
@@ -1615,6 +1617,15 @@ class GatewayTurnMixin:
                 session_entry.session_id if session_entry else "?",
             )
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
+            if event is not None and has_gateway_delivery_receipt(event):
+                from tools.process_registry import process_registry
+                delivery_id = str((event.metadata or {}).get("gateway_process_delivery_id") or "")
+                if not await asyncio.to_thread(
+                    process_registry.retarget_reliable_watch_event, delivery_id, parent_session_id="",
+                ):
+                    logger.warning("Deferring compression reset: reliable watch route rewrite failed")
+                    return response, session_entry
+                event.metadata["gateway_retry_without_parent_session"] = True
             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
             new_entry = await self.async_session_store.reset_session(session_key)
             self._evict_cached_agent(session_key)
@@ -2003,6 +2014,8 @@ class GatewayTurnMixin:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
+            if self._finish_consumed_reliable_watch(event):
+                return None
 
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).
@@ -2060,7 +2073,7 @@ class GatewayTurnMixin:
             if agent_failed_early and not is_context_overflow_failure:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
-                agent_result, response, session_entry, session_key, source,
+                agent_result, response, session_entry, session_key, source, event=event,
             )
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
@@ -2069,15 +2082,18 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
-            return await self._hmwa_deliver_turn_response(
+            delivered_response = await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
+            resolve_gateway_delivery_receipt(event, _gateway_delivery_receipt_outcome(agent_result))
+            return delivered_response
 
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
+            resolve_gateway_delivery_receipt(event, "retry")
             self._clear_session_env(_session_env_tokens)
 
     def _profile_scope_for_source(self, source: SessionSource):
@@ -2478,8 +2494,9 @@ class GatewayTurnMixin:
         return _run_still_current
 
     @staticmethod
-    def _proxy_error_result(text: str) -> Dict[str, Any]:
-        return {"final_response": text, "messages": [], "api_calls": 0, "tools": []}
+    def _proxy_error_result(text: str, error: Optional[str] = None) -> Dict[str, Any]:
+        return {"final_response": text, "messages": [], "api_calls": 0, "tools": [],
+                "completed": False, "failed": True, "error": error if error is not None else text}
 
     def _proxy_stream_consumer(self, source: "SessionSource", event_message_id, _thread_metadata, _run_still_current):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
@@ -2557,6 +2574,7 @@ class GatewayTurnMixin:
             return {
                 "final_response": "", "messages": [], "api_calls": 0, "tools": [],
                 "history_offset": len(history), "session_id": session_id, "response_previewed": False,
+                "completed": False, "interrupted": True, "error": "stale_proxy_generation",
             }
 
         # OpenAI chat format. The remote keeps continuity via X-Hermes-Session-Id; send the current
@@ -2587,6 +2605,7 @@ class GatewayTurnMixin:
         full_response = ""
         _start = time.time()
         saw_done = False
+        proxy_error = None
 
         def _consume_sse_line(line: str) -> bool:
             """Parse one SSE line into full_response; True when the terminal ``[DONE]`` was seen.
@@ -2644,6 +2663,7 @@ class GatewayTurnMixin:
                         saw_done = _consume_sse_line(buffer)
                     if not saw_done:
                         # Clean EOF without [DONE] — the upstream dropped the response
+                        proxy_error = "proxy_stream_ended_without_done"
                         # mid-stream. Keep any partial text but say so instead of
                         # presenting the truncation as a complete answer.
                         logger.warning(
@@ -2651,15 +2671,18 @@ class GatewayTurnMixin:
                             "(%d chars received)", proxy_url, len(full_response),
                         )
                         if not full_response:
-                            return self._proxy_error_result(
-                                "⚠️ Proxy connection closed before the response completed")
+                            result = self._proxy_error_result(
+                                "⚠️ Proxy connection closed before the response completed", proxy_error)
+                            result["partial"] = True
+                            return result
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error("Proxy connection error to %s: %s", proxy_url, e)
             if not full_response:
-                return self._proxy_error_result(f"⚠️ Proxy connection error: {e}")
+                return self._proxy_error_result(f"⚠️ Proxy connection error: {e}", str(e))
             # Partial response — return what we got
+            proxy_error = str(e)
         finally:
             if _stream_consumer:
                 _stream_consumer.finish()
@@ -2687,6 +2710,9 @@ class GatewayTurnMixin:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "completed": proxy_error is None and saw_done,
+            "partial": proxy_error is not None,
+            "error": proxy_error,
         }
 
     async def _run_agent(

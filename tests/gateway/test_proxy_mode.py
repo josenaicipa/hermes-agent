@@ -1,12 +1,13 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import resolve_proxy_url
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _gateway_delivery_receipt_outcome
 from gateway.session import SessionSource
 
 
@@ -169,6 +170,129 @@ class TestRunAgentProxyDispatch:
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
 
+    def test_proxy_success_receipt_acks_once(self, monkeypatch):
+        """A real successful proxy shape crosses the strict receipt gate."""
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        source = _make_source()
+        response = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                b'data: {"choices":[{"delta":{"content":"handled"}}]}\n\n'
+                b'data: [DONE]\n\n'
+            ],
+        )
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(_FakeSession(response)):
+                with patch("aiohttp.ClientTimeout"):
+                    result = asyncio.run(
+                        runner._run_agent_via_proxy(
+                            message="wake",
+                            context_prompt="",
+                            history=[],
+                            source=source,
+                            session_id="test",
+                        )
+                    )
+
+        event = {
+            "delivery_id": "watch:proxy-success:1",
+            "checkpoint_confirmed": True,
+        }
+        with patch("tools.process_registry.process_registry") as registry:
+            registry.acknowledge_watch_event.return_value = True
+            runner._settle_reliable_watch_receipt(
+                event, _gateway_delivery_receipt_outcome(result)
+            )
+
+        assert result["completed"] is True
+        registry.acknowledge_watch_event.assert_called_once_with(event)
+        registry.completion_queue.put.assert_not_called()
+
+    def test_proxy_failure_receipt_requeues_once(self, monkeypatch):
+        """A real proxy failure cannot ACK the durable executive wake."""
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://unreachable:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        source = _make_source()
+
+        class _ErrorSession:
+            def post(self, *args, **kwargs):
+                raise ConnectionError("Connection refused")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with patch("aiohttp.ClientSession", return_value=_ErrorSession()):
+                with patch("aiohttp.ClientTimeout"):
+                    result = asyncio.run(
+                        runner._run_agent_via_proxy(
+                            message="wake",
+                            context_prompt="",
+                            history=[],
+                            source=source,
+                            session_id="test",
+                        )
+                    )
+
+        event = {
+            "delivery_id": "watch:proxy-failure:1",
+            "checkpoint_confirmed": True,
+        }
+        with patch("tools.process_registry.process_registry") as registry:
+            runner._settle_reliable_watch_receipt(
+                event, _gateway_delivery_receipt_outcome(result)
+            )
+
+        assert result["completed"] is False
+        registry.acknowledge_watch_event.assert_not_called()
+        registry.completion_queue.put.assert_called_once_with(event)
+
+    @pytest.mark.parametrize(
+        ("chunks", "expected_response"),
+        [
+            ([], "⚠️ Proxy connection closed before the response completed"),
+            (
+                [b'data: {"choices":[{"delta":{"content":"prefix"}}]}\n\n'],
+                "prefix",
+            ),
+        ],
+    )
+    def test_proxy_eof_without_done_is_partial_and_retryable(
+        self, monkeypatch, chunks, expected_response
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        source = _make_source()
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(
+                _FakeSession(_FakeSSEResponse(status=200, sse_chunks=chunks))
+            ):
+                with patch("aiohttp.ClientTimeout"):
+                    result = asyncio.run(
+                        runner._run_agent_via_proxy(
+                            message="wake",
+                            context_prompt="",
+                            history=[],
+                            source=source,
+                            session_id="test",
+                        )
+                    )
+
+        assert result["final_response"] == expected_response
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["error"] == "proxy_stream_ended_without_done"
+        assert _gateway_delivery_receipt_outcome(result) == "retry"
+
     @pytest.mark.asyncio
     async def test_builds_correct_request(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
@@ -221,6 +345,19 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+        assert result["completed"] is True
+        assert result["partial"] is False
+        assert result["error"] is None
+        assert _gateway_delivery_receipt_outcome(result) == "durable"
+
+        event = {"delivery_id": "watch:proxy-success:1", "checkpoint_confirmed": True}
+        with patch("tools.process_registry.process_registry") as registry:
+            registry.acknowledge_watch_event.return_value = True
+            runner._settle_reliable_watch_receipt(
+                event, _gateway_delivery_receipt_outcome(result)
+            )
+        registry.acknowledge_watch_event.assert_called_once_with(event)
+        registry.completion_queue.put.assert_not_called()
 
 
     @pytest.mark.asyncio
@@ -252,6 +389,49 @@ class TestRunAgentViaProxy:
                     )
 
         assert "Proxy connection error" in result["final_response"]
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["error"] == "Connection refused"
+        assert _gateway_delivery_receipt_outcome(result) == "retry"
+
+        event = {"delivery_id": "watch:proxy-failure:1", "checkpoint_confirmed": True}
+        with patch("tools.process_registry.process_registry") as registry:
+            runner._settle_reliable_watch_receipt(
+                event, _gateway_delivery_receipt_outcome(result)
+            )
+        registry.acknowledge_watch_event.assert_not_called()
+        registry.completion_queue.put.assert_called_once_with(event)
+
+
+    @pytest.mark.asyncio
+    async def test_partial_proxy_stream_is_explicitly_incomplete(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        source = _make_source()
+
+        class _PartialSSEResponse(_FakeSSEResponse):
+            async def iter_any(self):
+                yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                raise ConnectionError("stream dropped")
+
+        session = _FakeSession(_PartialSSEResponse(status=200))
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="hi",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="test",
+                    )
+
+        assert result["final_response"] == "partial"
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["error"] == "stream dropped"
 
 
     @pytest.mark.asyncio
@@ -485,4 +665,3 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
-

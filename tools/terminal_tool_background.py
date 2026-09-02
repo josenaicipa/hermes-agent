@@ -85,10 +85,62 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
         setattr(proc_session, attr, get_session_env(var, ""))
 
 
+def _prepare_background_notification(
+    *,
+    notify_on_complete: bool,
+    notify_on_failure: bool,
+    watch_patterns,
+):
+    """Resolve and snapshot all notification state before process launch.
+
+    Returns ``(config, conflict_note, unsupported)``.  ``config`` is immutable
+    and is installed by ``ProcessRegistry`` before its output reader/poller can
+    run, closing the post-spawn metadata race.
+    """
+    from tools.process_registry import ProcessNotificationConfig
+    from tools.terminal_tool import _resolve_notification_flag_conflict
+
+    if not (notify_on_complete or notify_on_failure or watch_patterns):
+        return None, "", False
+
+    from gateway.session_context import (
+        async_delivery_supported as _async_ok,
+        get_session_env as _gse,
+    )
+
+    # Preserve the existing capability contract: finite/stateless sessions
+    # cannot promise any notification after their turn ends.
+    if not _async_ok():
+        return ProcessNotificationConfig(), "", True
+
+    resolved_patterns, conflict_note = _resolve_notification_flag_conflict(
+        notify_on_complete=bool(notify_on_complete),
+        watch_patterns=watch_patterns,
+        background=True,
+    )
+    platform = _gse("HERMES_SESSION_PLATFORM", "")
+    has_completion_watcher = bool(notify_on_complete or notify_on_failure)
+    return ProcessNotificationConfig(
+        watcher_platform=platform,
+        watcher_chat_id=_gse("HERMES_SESSION_CHAT_ID", "") if platform else "",
+        watcher_user_id=_gse("HERMES_SESSION_USER_ID", "") if platform else "",
+        watcher_user_name=_gse("HERMES_SESSION_USER_NAME", "") if platform else "",
+        watcher_thread_id=_gse("HERMES_SESSION_THREAD_ID", "") if platform else "",
+        watcher_message_id=_gse("HERMES_SESSION_MESSAGE_ID", "") if platform else "",
+        watcher_interval=5 if platform and has_completion_watcher else 0,
+        parent_session_id=_gse("HERMES_SESSION_ID", "") if platform else "",
+        notify_on_complete=bool(notify_on_complete),
+        notify_on_failure=bool(notify_on_failure),
+        watch_patterns=tuple(resolved_patterns or ()),
+    ), conflict_note, False
+
+
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty):
+           session_key, effective_pty, notification=None):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key)
+    if notification is not None:
+        common['notification'] = notification
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
@@ -131,6 +183,7 @@ def spawn_background_process(
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
     notify_on_complete: bool, watch_patterns: Optional[List[str]], approval_note: Optional[str],
     pty_disabled_reason: Optional[str],
+    notify_on_failure: bool = False,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -139,17 +192,21 @@ def spawn_background_process(
     """
     from tools.process_registry import process_registry
     from tools.terminal_tool import (
-        _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
+        _redact_terminal_error_text, _resolve_command_cwd,
     )
 
     effective_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
     )
+    notification, conflict_note, notify_unsupported = _prepare_background_notification(
+        notify_on_complete=bool(notify_on_complete), notify_on_failure=bool(notify_on_failure),
+        watch_patterns=list(watch_patterns) if watch_patterns else None,
+    )
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty,
+            effective_pty=effective_pty, notification=notification,
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
@@ -157,33 +214,32 @@ def spawn_background_process(
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
-        if not notify_on_complete and not watch_patterns:
+        if not notify_on_complete and not notify_on_failure and not watch_patterns:
             result_data["hint"] = _SILENT_BACKGROUND_HINT
         if command and _looks_like_homebrew_ci_poller(command):
             existing = result_data.get("hint", "")
             result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
                                    else _HOMEBREW_CI_POLLER_HINT)
 
-        notify_on_complete, watch_patterns = _apply_async_support(
-            proc_session, result_data, notify_on_complete, watch_patterns)
-        watch_patterns, conflict_note = _resolve_notification_flag_conflict(
-            notify_on_complete=bool(notify_on_complete), watch_patterns=watch_patterns, background=True,
-        )
         if conflict_note:
             logger.warning("background proc %s: %s", proc_session.id, conflict_note)
             result_data["watch_patterns_ignored"] = conflict_note
-        if notify_on_complete:
-            proc_session.notify_on_complete = True
-            result_data["notify_on_complete"] = True
-            if proc_session.watcher_platform:
-                _register_completion_watcher(process_registry, proc_session, session_key)
+        if notify_unsupported:
+            result_data["notify_on_complete"] = False
+            if notify_on_failure:
+                result_data["notify_on_failure"] = False
+            result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE
+        elif notification is not None:
+            if notification.notify_on_complete:
+                result_data["notify_on_complete"] = True
+            if notification.notify_on_failure:
+                result_data["notify_on_failure"] = True
+            if notification.watch_patterns:
+                result_data["watch_patterns"] = list(notification.watch_patterns)
             from agent.delegation_context import is_delegated_child_context
             if is_delegated_child_context():
                 result_data["notify_on_complete"] = False
                 result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
-        if watch_patterns:
-            proc_session.watch_patterns = list(watch_patterns)
-            result_data["watch_patterns"] = proc_session.watch_patterns
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
         return json.dumps({

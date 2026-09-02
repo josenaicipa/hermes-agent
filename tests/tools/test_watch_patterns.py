@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+import os
 import time
 import pytest
 from unittest.mock import patch
@@ -18,8 +19,10 @@ from unittest.mock import patch
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
+    RELIABLE_CONTROL_WATCH_PATTERN,
     WATCH_STRIKE_LIMIT,
     WATCH_GLOBAL_MAX_PER_WINDOW,
+    should_notify_process_completion,
 )
 
 
@@ -67,6 +70,165 @@ class TestProcessSessionField:
 # =========================================================================
 
 class TestCheckWatchPatterns:
+    def test_pattern_split_across_reader_chunks_matches_once(self, registry):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+
+        registry._check_watch_patterns(session, "status FABLE_")
+        assert registry.completion_queue.empty()
+        registry._check_watch_patterns(session, "WAKE reason=ambiguous\n")
+
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "watch_match"
+        assert event["pattern"] == RELIABLE_CONTROL_WATCH_PATTERN
+        assert "FABLE_WAKE reason=ambiguous" in event["output"]
+        assert registry.completion_queue.empty()
+        assert session._reliable_control_watch_delivered is True
+
+    def test_auto_close_split_across_chunks_suppresses_clean_exit_fallback(
+        self, registry
+    ):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.notify_on_failure = True
+
+        registry._check_watch_patterns(session, "FABLE_AUTO_")
+        registry._check_watch_patterns(session, "CLOSE reason=routine\n")
+        session.exit_code = 0
+        session.completion_reason = "exited"
+
+        assert session._reliable_control_close_seen is True
+        assert registry.completion_queue.empty()
+        assert should_notify_process_completion(session) is False
+
+    def test_clean_exit_without_control_sentinel_uses_failure_fallback(self, registry):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.notify_on_failure = True
+        session.exit_code = 0
+        session.completion_reason = "exited"
+
+        assert should_notify_process_completion(session) is True
+
+    def test_abnormal_exit_wakes_even_after_auto_close(self, registry):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.notify_on_failure = True
+        registry._check_watch_patterns(session, "FABLE_AUTO_CLOSE\n")
+        session.exit_code = -9
+        session.completion_reason = "killed"
+
+        assert should_notify_process_completion(session) is True
+
+    def test_wake_marker_then_nonzero_exit_does_not_double_notify(self, registry):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.notify_on_failure = True
+        registry._check_watch_patterns(session, "FABLE_WAKE reason=failed\n")
+        session.exit_code = 3
+        session.completion_reason = "exited"
+
+        assert should_notify_process_completion(session) is False
+        assert registry.completion_queue.qsize() == 1
+
+    def test_registered_marker_then_nonzero_exit_queues_only_one_wake(
+        self, registry, tmp_path
+    ):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.pid = os.getpid()
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        registry._running[session.id] = session
+        with patch(
+            "tools.process_registry.CHECKPOINT_PATH",
+            tmp_path / "processes.json",
+        ):
+            assert registry._write_checkpoint() is True
+            registry._check_watch_patterns(
+                session, "FABLE_WAKE reason=failed\n"
+            )
+            session.exited = True
+            session.exit_code = 3
+            registry._move_to_finished(session)
+
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        assert [event["type"] for event in events] == ["watch_match"]
+        assert events[0]["pattern"] == RELIABLE_CONTROL_WATCH_PATTERN
+        assert events[0]["checkpoint_confirmed"] is True
+
+    def test_registered_clean_auto_close_is_silent(
+        self, registry, tmp_path
+    ):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.pid = os.getpid()
+        session.notify_on_failure = True
+        registry._running[session.id] = session
+        with patch(
+            "tools.process_registry.CHECKPOINT_PATH",
+            tmp_path / "processes.json",
+        ):
+            assert registry._write_checkpoint() is True
+            registry._check_watch_patterns(session, "FABLE_AUTO_CLOSE\n")
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+
+        assert registry.completion_queue.empty()
+
+    def test_registered_missing_sentinel_queues_live_durable_fallback(
+        self, registry, tmp_path
+    ):
+        """Reserving the fallback must not look like a failed primary write."""
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.pid = os.getpid()
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        registry._running[session.id] = session
+        checkpoint = tmp_path / "processes.json"
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry._write_checkpoint() is True
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "watch_match"
+        assert event["pattern"] == RELIABLE_CONTROL_WATCH_PATTERN
+        assert event["control_reason"] == "missing_reliable_control_sentinel"
+        assert event["checkpoint_confirmed"] is True
+        assert registry.completion_queue.empty()
+        assert json.loads(checkpoint.read_text(encoding="utf-8")) == []
+        outbox = tmp_path / "process_notifications.json"
+        assert json.loads(outbox.read_text(encoding="utf-8"))[0][
+            "delivery_id"
+        ] == event["delivery_id"]
+
+    def test_registered_abnormal_exit_after_auto_close_uses_one_durable_wake(
+        self, registry, tmp_path
+    ):
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+        session.pid = os.getpid()
+        session.notify_on_failure = True
+        session.watcher_platform = "telegram"
+        session.watcher_chat_id = "123"
+        registry._running[session.id] = session
+        checkpoint = tmp_path / "processes.json"
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry._write_checkpoint() is True
+            registry._check_watch_patterns(session, "FABLE_AUTO_CLOSE\n")
+            session.exited = True
+            session.exit_code = -9
+            session.completion_reason = "killed"
+            registry._move_to_finished(session)
+
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "watch_match"
+        assert event["pattern"] == RELIABLE_CONTROL_WATCH_PATTERN
+        assert event["control_reason"] == "missing_reliable_control_sentinel"
+        assert event["checkpoint_confirmed"] is True
+        assert registry.completion_queue.empty()
+        outbox = tmp_path / "process_notifications.json"
+        assert json.loads(outbox.read_text())[0]["delivery_id"] == event["delivery_id"]
+
     def test_no_patterns_no_notification(self, registry):
         """No watch_patterns → no notifications."""
         session = _make_session(watch_patterns=[])
@@ -232,6 +394,7 @@ class TestCheckpointPersistence:
     def test_watch_patterns_in_checkpoint(self, registry):
         """watch_patterns is included in checkpoint data."""
         session = _make_session(watch_patterns=["ERROR", "FAIL"])
+        session.pid = os.getpid()
         with registry._lock:
             registry._running[session.id] = session
 
@@ -377,6 +540,26 @@ class TestMutualExclusion:
 # =========================================================================
 
 class TestGlobalCircuitBreaker:
+    def test_singleton_fable_wake_is_admitted_once_while_breaker_is_saturated(
+        self, registry
+    ):
+        registry._global_watch_tripped_until = time.time() + 60
+        registry._global_watch_suppressed_during_trip = 12
+        session = _make_session(watch_patterns=[RELIABLE_CONTROL_WATCH_PATTERN])
+
+        registry._check_watch_patterns(session, "FABLE_WAKE reason=decision\n")
+        registry._check_watch_patterns(session, "FABLE_WAKE reason=duplicate\n")
+
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        matches = [event for event in events if event.get("type") == "watch_match"]
+        assert len(matches) == 1
+        assert matches[0]["output"] == "FABLE_WAKE reason=decision"
+        assert session._watch_disabled is True
+        # The closed exemption never mutates/releases the unrelated breaker.
+        assert registry._global_watch_suppressed_during_trip == 12
+
     def test_trips_after_global_threshold(self, registry):
         """When >N matches fire across sessions in the window, breaker trips."""
         sessions = [

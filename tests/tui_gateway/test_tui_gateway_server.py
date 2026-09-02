@@ -18436,6 +18436,48 @@ def test_notification_poller_skips_consumed(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_skips_consumed_fable_control_wake(monkeypatch):
+    """TUI treats the failure-only watch event as consumed completion output."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    turns = []
+    sess = _session()
+    server._sessions["sid_skip_fable"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text: turns.append(text),
+    )
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.add("proc_fable_consumed")
+    isolated_queue.put({
+        "type": "watch_match",
+        "pattern": "FABLE_WAKE",
+        "session_id": "proc_fable_consumed",
+        "command": "agent-wait-job.sh",
+        "output": "FABLE_WAKE reason=attention",
+    })
+
+    # A pre-set stop executes the shutdown drain, which shares the same
+    # consumed-event predicate as the live poller path.
+    stop = threading.Event()
+    stop.set()
+    try:
+        server._notification_poller_loop(stop, "sid_skip_fable", sess)
+        assert turns == []
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid_skip_fable", None)
+        process_registry._completion_consumed.discard("proc_fable_consumed")
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def test_notification_poller_requeues_when_busy(monkeypatch):
     """When the agent is busy, the poller requeues the event."""
     import queue as _queue_mod

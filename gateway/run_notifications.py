@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional, cast
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event_receipts import resolve_gateway_delivery_receipt
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _log_suppressed, _notice_target_key, _send_error, _send_failed
 
@@ -51,7 +52,10 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
-class GatewayNotificationsMixin:
+from gateway.run_reliable_watch import GatewayReliableWatchMixin
+
+
+class GatewayNotificationsMixin(GatewayReliableWatchMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
@@ -954,31 +958,9 @@ class GatewayNotificationsMixin:
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
-        """Consume queued watch events and inject them when notifications are enabled.
-
-        The queue is ALWAYS drained (so watch events don't rot or requeue-spin) but injection is
-        skipped when the OWNING profile's ``display.background_process_notifications`` is ``off``
-        — one shared queue carries every served profile's events, so the gate is evaluated per
-        event inside its profile scope, never once for the ambient (launch) profile.
-
-        See #9290.
-        """
-        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
-        for evt in watch_events:
-            async with self._completion_event_scope(evt):
-                if self._load_background_notifications_mode() == "off":
-                    continue
-                synth_text = _format_gateway_process_notification(evt)
-                if not synth_text:
-                    continue
-                try:
-                    delivered = await self._inject_watch_notification(synth_text, evt)
-                except Exception:
-                    logger.exception("Watch notification injection error")
-                    delivered = False
-            if delivered is False:
-                completion_queue.put(evt)
+        from gateway.run import _drain_gateway_watch_events
+        for evt in await self._deliver_watch_events(_drain_gateway_watch_events(completion_queue)):
+            completion_queue.put(evt)
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
@@ -1035,7 +1017,7 @@ class GatewayNotificationsMixin:
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
-    ) -> Optional[bool]:
+    ) -> Optional[bool | str]:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing comes from the queued event, never the active foreground message. Returns
@@ -1078,10 +1060,18 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            delivery_id = str(evt.get("delivery_id") or "").strip()
+            process_session_id = str(evt.get("session_id") or "").strip()
+            if delivery_id:
+                metadata["gateway_process_delivery_id"] = delivery_id
+            if process_session_id:
+                metadata["gateway_process_session_id"] = process_session_id
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
+                allow_gateway_control=False,
+                message_id=str(evt.get("message_id") or "").strip() or delivery_id or None, metadata=metadata,
             )
+            receipt = self._prepare_reliable_watch_receipt(synth_event, evt, adapter)
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
@@ -1091,8 +1081,14 @@ class GatewayNotificationsMixin:
             _prime = getattr(adapter, "prime_routing_cache", None)
             if callable(_prime):
                 _prime(synth_event)
-            await admit_internal_event(adapter, synth_event)
-            return True
+            try:
+                await admit_internal_event(adapter, synth_event)
+            except BaseException:
+                if receipt is not None:
+                    resolve_gateway_delivery_receipt(synth_event, "retry")
+                    return "deferred"
+                raise
+            return "deferred" if receipt is not None else True
         except WakeNotAccepted:
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
@@ -1738,7 +1734,9 @@ class GatewayNotificationsMixin:
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
-        agent_notify = watcher.get("notify_on_complete", False)
+        notify_on_complete = bool(watcher.get("notify_on_complete", False))
+        notify_on_failure = bool(watcher.get("notify_on_failure", False))
+        agent_notify = notify_on_complete or notify_on_failure
         # The mode belongs to the profile that started the process; recovered watchers run in the
         # root context, so resolve it under the owning profile's scope (no-op for the default).
         async with self._completion_event_scope(watcher):
@@ -1763,7 +1761,13 @@ class GatewayNotificationsMixin:
             if session.exited:
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
-                if agent_notify and not process_registry.is_completion_consumed(session_id):
+                from tools.process_registry import RELIABLE_CONTROL_WATCH_PATTERN, should_notify_process_completion
+                if (notify_on_failure and not notify_on_complete
+                        and getattr(session, "watch_patterns", []) == [RELIABLE_CONTROL_WATCH_PATTERN]):
+                    break  # The registry alone produces this durable failure wake.
+                notify_this_exit = should_notify_process_completion(
+                    session, notify_on_complete=notify_on_complete, notify_on_failure=notify_on_failure)
+                if notify_this_exit and not process_registry.is_completion_consumed(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
@@ -1773,6 +1777,8 @@ class GatewayNotificationsMixin:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result.
                         continue
+                    break
+                if notify_on_failure and not notify_on_complete:
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).

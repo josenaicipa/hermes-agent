@@ -20,6 +20,7 @@ from contextlib import suppress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event_receipts import has_gateway_delivery_receipt, resolve_gateway_delivery_receipt
 from gateway.run_common import _UNSET
 from gateway.session import (
     SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
@@ -151,6 +152,8 @@ class GatewayInboundMixin:
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
+        if is_internal and self._finish_consumed_reliable_watch(event):
+            return None
 
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
@@ -1218,6 +1221,9 @@ class GatewayInboundMixin:
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
+            if has_gateway_delivery_receipt(event):
+                resolve_gateway_delivery_receipt(event, "retry")
+                return None
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
@@ -1246,6 +1252,8 @@ class GatewayInboundMixin:
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
+        if self._finish_consumed_reliable_watch(event):
+            return None
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)

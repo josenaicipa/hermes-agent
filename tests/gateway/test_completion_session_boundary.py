@@ -129,6 +129,24 @@ def _completion_evt(parent_session_id=None, session_id="proc_x"):
     return evt
 
 
+def _watch_evt(parent_session_id, session_id="proc_watch_boundary"):
+    return {
+        "type": "watch_match",
+        "pattern": "FABLE_WAKE",
+        "session_id": session_id,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "started_at": 1234.5,
+        "parent_session_id": parent_session_id,
+        "command": "agent-wait-job.sh",
+        "output": "FABLE_WAKE reason=decision",
+        "delivery_id": f"watch:{session_id}:1234.5",
+        "checkpoint_confirmed": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # The stamp is threaded from the watcher into the completion event
 # ---------------------------------------------------------------------------
@@ -276,6 +294,42 @@ def test_terminal_verdict_returns_none_without_injection():
 
     assert result is None
     adapter.handle_message.assert_not_awaited()
+
+
+def test_watch_from_user_closed_session_is_durably_dropped(
+    isolated_registry,
+):
+    event = _watch_evt("sess-closed")
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, session_db=_SessionDB(None))
+    runner._load_background_notifications_mode = lambda: "concise"
+
+    retry = asyncio.run(runner._deliver_watch_events([event]))
+
+    assert retry == []
+    adapter.handle_message.assert_not_awaited()
+    assert json.loads(
+        isolated_registry._watch_outbox_path().read_text()
+    ) == []
+
+
+def test_watch_session_boundary_uncertainty_retries(
+    isolated_registry,
+):
+    event = _watch_evt("sess-uncertain")
+    assert isolated_registry._persist_reliable_watch_event(event) is True
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, session_db=None)
+    runner._load_background_notifications_mode = lambda: "concise"
+
+    retry = asyncio.run(runner._deliver_watch_events([event]))
+
+    assert retry == [event]
+    adapter.handle_message.assert_not_awaited()
+    assert json.loads(
+        isolated_registry._watch_outbox_path().read_text()
+    )[0]["delivery_id"] == event["delivery_id"]
 
 
 # ---------------------------------------------------------------------------

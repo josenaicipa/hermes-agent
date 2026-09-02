@@ -139,6 +139,7 @@ class TestCheckpointNotify:
     def test_checkpoint_includes_notify(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session(notify_on_complete=True)
+            s.pid = os.getpid()
             registry._running[s.id] = s
             registry._write_checkpoint()
 
@@ -180,6 +181,7 @@ class TestTerminalSchema:
         assert types == {"boolean", "array"}
         assert "notify_on_complete" not in props
         assert "watch_patterns" not in props
+        assert props["notify_on_failure"]["type"] == "boolean"
 
     def test_handler_passes_notify(self):
         """_handle_terminal passes notify_on_complete to terminal_tool."""
@@ -192,6 +194,23 @@ class TestTerminalSchema:
             _, kwargs = mock_tt.call_args
             assert kwargs["notify_on_complete"] is True
 
+    def test_handler_passes_notify_on_failure(self):
+        from tools.terminal_tool import _handle_terminal
+
+        with patch(
+            "tools.terminal_tool.terminal_tool", return_value='{"ok":true}'
+        ) as mock_tt:
+            _handle_terminal(
+                {
+                    "command": "echo hi",
+                    "background": True,
+                    "notify_on_failure": True,
+                },
+                task_id="t1",
+            )
+
+        assert mock_tt.call_args.kwargs["notify_on_failure"] is True
+
 
 # =========================================================================
 # Code execution blocked params
@@ -201,6 +220,7 @@ class TestCodeExecutionBlocked:
     def test_notify_on_complete_blocked_in_sandbox(self):
         from tools.code_execution_rpc import _TERMINAL_BLOCKED_PARAMS
         assert "notify_on_complete" in _TERMINAL_BLOCKED_PARAMS
+        assert "notify_on_failure" in _TERMINAL_BLOCKED_PARAMS
 
 
 # =========================================================================
@@ -374,6 +394,68 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
     )
     assert result.get("notify_on_complete") is True
+
+
+def test_terminal_passes_frozen_failure_watch_config_before_spawn(
+    monkeypatch, tmp_path
+):
+    """Routing + selective policy cross the registry boundary in one value."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from gateway import session_context
+    from tools import process_registry as process_registry_module
+    from types import SimpleNamespace
+
+    route = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "123",
+        "HERMES_SESSION_USER_ID": "7",
+        "HERMES_SESSION_USER_NAME": "Ada",
+        "HERMES_SESSION_THREAD_ID": "42",
+        "HERMES_SESSION_MESSAGE_ID": "99",
+        "HERMES_SESSION_ID": "sess-parent",
+    }
+    captured = {}
+
+    def fake_spawn_local(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id="proc_configured", pid=4242)
+
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": route.get(key, default),
+    )
+    monkeypatch.setattr(
+        process_registry_module.process_registry,
+        "spawn_local",
+        fake_spawn_local,
+    )
+    try:
+        result = json.loads(tt.terminal_tool(
+            command="agent-wait-job.sh",
+            background=True,
+            notify_on_failure=True,
+            watch_patterns=["FABLE_WAKE"],
+        ))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    config = captured["notification"]
+    assert config.notify_on_complete is False
+    assert config.notify_on_failure is True
+    assert config.watch_patterns == ("FABLE_WAKE",)
+    assert config.watcher_platform == "telegram"
+    assert config.watcher_chat_id == "123"
+    assert config.watcher_thread_id == "42"
+    assert config.parent_session_id == "sess-parent"
+    assert config.watcher_interval == 5
+    with pytest.raises(AttributeError):
+        config.notify_on_failure = False
+    assert result["notify_on_failure"] is True
+    assert result["watch_patterns"] == ["FABLE_WAKE"]
+    assert "hint" not in result
 
 
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):

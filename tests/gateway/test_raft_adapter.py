@@ -11,6 +11,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
 from plugins.platforms.raft.adapter import (
     ACTIVITY_DRAIN_SCHEMA,
     ACTIVITY_EVENT_SCHEMA,
@@ -66,6 +67,73 @@ def _create_app(adapter: RaftAdapter) -> web.Application:
     app.router.add_post("/activity", adapter._handle_activity)
     app.router.add_get("/activity/drain", adapter._handle_activity_drain)
     return app
+
+
+def _receipt_event(adapter: RaftAdapter) -> MessageEvent:
+    return MessageEvent(
+        text="FABLE_WAKE reason=attention",
+        message_type=MessageType.TEXT,
+        source=adapter.build_source(
+            chat_id="default",
+            chat_name="Raft channel",
+            chat_type="dm",
+            user_id="raft-bridge",
+            user_name="Raft Bridge",
+        ),
+        internal=True,
+        allow_gateway_control=False,
+    )
+
+class TestRaftReliableReceipt:
+    def test_no_handler_resolves_receipt_for_retry(self):
+        adapter = _make_adapter()
+
+        async def exercise():
+            event = _receipt_event(adapter)
+            receipt = asyncio.get_running_loop().create_future()
+            setattr(event, "_gateway_durable_delivery_receipt", receipt)
+            await adapter.handle_message(event)
+            return receipt.result()
+
+        assert asyncio.run(exercise()) == "retry"
+
+    def test_busy_receipt_retries_without_merging_pending_user_text(self):
+        adapter = _make_adapter()
+        handler = AsyncMock(return_value=None)
+        adapter.set_message_handler(handler)
+
+        async def exercise():
+            control = _receipt_event(adapter)
+            receipt = asyncio.get_running_loop().create_future()
+            setattr(control, "_gateway_durable_delivery_receipt", receipt)
+            session_key = build_session_key(
+                control.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=adapter._session_key_profile(control.source),
+            )
+            user_event = MessageEvent(
+                text="keep this user message",
+                message_type=MessageType.TEXT,
+                source=control.source,
+            )
+            adapter._active_sessions[session_key] = asyncio.Event()
+            adapter._pending_messages[session_key] = user_event
+
+            await adapter.handle_message(control)
+            return receipt.result(), session_key, user_event
+
+        outcome, session_key, user_event = asyncio.run(exercise())
+        assert outcome == "retry"
+        assert adapter._pending_messages[session_key] is user_event
+        assert adapter._pending_messages[session_key].text == (
+            "keep this user message"
+        )
+        handler.assert_not_awaited()
 
 
 def _activity_event(event_id: str, **overrides):

@@ -1190,6 +1190,7 @@ def terminal_tool(
     workdir: Optional[str] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
+    notify_on_failure: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
 ) -> str:
@@ -1235,6 +1236,7 @@ def terminal_tool(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
+                notify_on_failure=notify_on_failure,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
             )
@@ -1303,6 +1305,11 @@ TERMINAL_SCHEMA = {
                     {"type": "array", "items": {"type": "string"}}
                 ]
             }
+            , "notify_on_failure": {
+                "type": "boolean",
+                "description": "With background=true: wake only on abnormal exit. Combine with notify=['FABLE_WAKE'] for reliable selective control; FABLE_AUTO_CLOSE plus exit 0 stays silent.",
+                "default": False,
+            }
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
             # them in the dispatch wrapper; explicit notify wins on conflict.
@@ -1327,9 +1334,10 @@ def _handle_terminal(args, **kw):
     # with the corrected call instead of being silently ignored.
     notify = args.get("notify")
     notify_on_complete = args.get("notify_on_complete", False)
+    notify_on_failure = args.get("notify_on_failure", False)
     watch_patterns = args.get("watch_patterns")
     if not args.get("background", False):
-        if notify or watch_patterns or notify_on_complete:
+        if notify or watch_patterns or notify_on_complete or notify_on_failure:
             return tool_error(
                 "notify only applies to background commands (foreground "
                 "results return directly). Either drop notify, or run as "
@@ -1363,6 +1371,7 @@ def _handle_terminal(args, **kw):
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
+        notify_on_failure=notify_on_failure,
         watch_patterns=watch_patterns,
     )
 

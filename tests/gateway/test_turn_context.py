@@ -69,6 +69,34 @@ class TestTurnRunner:
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
 
+    def test_runtime_resolution_failure_is_explicitly_incomplete(self):
+        gateway_runner = MagicMock()
+        gateway_runner._get_system_prompt_for_channel.return_value = None
+        gateway_runner._resolve_session_agent_runtime.side_effect = RuntimeError(
+            "missing credentials"
+        )
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="test-chat",
+            user_id="test-user",
+        )
+        ctx = TurnContext(
+            source=source,
+            message="continue",
+            history=[],
+            session_id="test-session",
+            session_key="test-session-key",
+            user_config={},
+        )
+
+        from gateway.run import TurnRunner
+
+        result = TurnRunner(gateway_runner, ctx).run_sync()
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["error"] == "missing credentials"
+
     def test_normal_response_preserves_compression_exhausted(self):
         """A non-empty exhaustion response must still reach auto-reset consumers."""
 

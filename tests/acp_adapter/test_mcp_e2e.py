@@ -7,6 +7,8 @@ Exercises the full flow through the ACP server layer:
     session_update events arrive at the mock client
 """
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -178,6 +180,69 @@ class TestMcpRegistrationE2E:
         # Completion should contain human-readable output rather than forcing raw JSON panes.
         assert complete_event.content
         assert "hello" in complete_event.content[0].content.text
+        assert complete_event.raw_output is None
+
+    def test_foreground_fable_receipt_reaches_tool_call_update(
+        self, acp_agent, mock_manager
+    ):
+        """Exercise the complete prompt/callback/ACP path with a long receipt."""
+        receipt = "FABLE_RECEIPT_V1\n" + ("domain result line\n" * 60) + "RECEIPT_END"
+        assert len(receipt) > 500
+
+        async def run_scenario():
+            resp = await acp_agent.new_session(cwd="/tmp")
+            session_id = resp.session_id
+            state = mock_manager.get_session(session_id)
+
+            mock_conn = MagicMock(spec=acp.Client)
+            mock_conn.session_update = AsyncMock()
+            mock_conn.request_permission = AsyncMock()
+            acp_agent._conn = mock_conn
+
+            def mock_run_conversation(
+                user_message, conversation_history=None, task_id=None, **kwargs
+            ):
+                agent = state.agent
+                agent.tool_progress_callback(
+                    "tool.started",
+                    "terminal",
+                    "$ ./agent-wait-job.sh",
+                    {"command": "./agent-wait-job.sh"},
+                )
+                agent.step_callback(1, [{
+                    "name": "terminal",
+                    "result": json.dumps({"output": receipt, "exit_code": 0}),
+                }])
+                return {
+                    "final_response": "Receipt delivered.",
+                    "messages": [
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": "Receipt delivered."},
+                    ],
+                }
+
+            state.agent.run_conversation = mock_run_conversation
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text="wait for the job")],
+                session_id=session_id,
+            )
+            assert response.stop_reason == "end_turn"
+            return [
+                call.kwargs.get("update") or call.args[1]
+                for call in mock_conn.session_update.call_args_list
+            ]
+
+        updates = asyncio.run(run_scenario())
+        completions = [
+            update
+            for update in updates
+            if getattr(update, "session_update", None) == "tool_call_update"
+        ]
+        assert len(completions) == 1
+        complete_event = completions[0]
+        assert isinstance(complete_event, ToolCallProgress)
+        assert receipt in complete_event.content[0].content.text
+        assert "RECEIPT_END" in complete_event.content[0].content.text
         assert complete_event.raw_output is None
 
     def test_patch_mode_tool_start_defers_diff_to_edit_approval_prompt(self):
