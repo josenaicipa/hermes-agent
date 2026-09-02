@@ -756,7 +756,16 @@ def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
 # 2.5% of the context window, clamped; floor keeps small models workable.
 LEAN_TAIL_FLOOR_TOKENS = 10_000
 LEAN_TAIL_CAP_TOKENS = 25_000
-# Newest-first budget, straddler truncated; lives inside the single summary message.
+# Message-count ceiling for the lean verbatim tail. The token budget alone
+# cannot bound recency once tool results have been pruned to stubs: hundreds
+# of cheap Discord turns then fit inside 25K estimated tokens, the walk
+# protects the whole transcript, the summarizer is left a ~4-message (or
+# empty) middle, and the ineffective breaker trips while real usage stays
+# over threshold.
+LEAN_TAIL_MAX_MESSAGES = 32
+# Verbatim user messages embedded in the summary (newest-first budget,
+# straddler truncated — codex's retained-messages rule, adapted to live
+# inside our single summary message so role alternation is preserved).
 _LEAN_USER_MESSAGES_BUDGET_CHARS = 24_000  # ~6K tokens
 _LEAN_USER_MESSAGE_MAX_CHARS = 4_000
 _LEAN_USER_MESSAGES_HEADING = "## User Messages (verbatim, newest first)"
@@ -4260,6 +4269,19 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Small conversations: force a cut after the head so compression still removes something.
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
+
+        # Lean tail is a recency window, not a hoard. After tool-result
+        # pruning, individually cheap messages all fit in the 25K budget, so
+        # the walk above would protect the entire transcript. Cap the tail
+        # by message count so a compressible middle remains for the
+        # summarizer. Short sessions (n <= cap) are unchanged.
+        if (
+            getattr(self, "tail_mode", "lean") == "lean"
+            and n > LEAN_TAIL_MAX_MESSAGES
+        ):
+            cut_idx = max(cut_idx, n - LEAN_TAIL_MAX_MESSAGES)
+
+        # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
         # Latest user message must stay in the tail (active task). Latest assistant reply must stay too;
         # anchors only walk backward, so chaining is monotonic.
