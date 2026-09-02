@@ -61,6 +61,13 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_always_visible_names_are_normalized(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "always_visible": ["agent_router", "", " agent_router "],
+        })
+        assert cfg.always_visible == frozenset({"agent_router"})
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -221,6 +228,37 @@ class TestClassification:
         names = {(td.get("function") or {}).get("name") for td in visible}
         assert "xx_unknown_tool" in names
         assert deferrable == []
+
+    def test_configured_plugin_tool_stays_direct(self):
+        from tools.registry import registry
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        router_name = "test_always_visible_router"
+        deferred_name = "test_deferred_catalog_tool"
+        for name in (router_name, deferred_name):
+            registry.register(
+                name=name,
+                handler=lambda args, **kw: "{}",
+                schema=_td(name, f"Plugin {name}")["function"],
+                toolset="test-plugin-toolset",
+            )
+
+        assembled = assemble_tool_defs(
+            [_td(router_name), _td(deferred_name)],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({
+                "enabled": "on",
+                "always_visible": [router_name],
+            }),
+        )
+        names = {td["function"]["name"] for td in assembled.tool_defs}
+        assert router_name in names
+        assert deferred_name not in names
+        assert BRIDGE_TOOL_NAMES <= names
 
 
 # ---------------------------------------------------------------------------

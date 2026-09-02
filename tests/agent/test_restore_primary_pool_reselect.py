@@ -165,3 +165,24 @@ class TestRestorePrimaryPoolReselect:
         assert result is True
         assert "custom-endpoint.example.com" in agent.base_url
         assert "custom-endpoint.example.com" in agent._client_kwargs["base_url"]
+
+    def test_restore_reinstates_primary_model_reasoning(self):
+        pool = _build_mock_pool([_make_entry("entry-1", "key-1")])
+        agent = self._make_agent(pool)
+        agent._primary_runtime["reasoning_config"] = {
+            "enabled": True,
+            "effort": "low",
+        }
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        assert agent._restore_primary_runtime() is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+
+    def test_restore_can_clear_fallback_reasoning(self):
+        pool = _build_mock_pool([_make_entry("entry-1", "key-1")])
+        agent = self._make_agent(pool)
+        agent._primary_runtime["reasoning_config"] = None
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        assert agent._restore_primary_runtime() is True
+        assert agent.reasoning_config is None

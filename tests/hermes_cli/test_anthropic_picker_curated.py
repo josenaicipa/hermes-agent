@@ -3,7 +3,7 @@
 Bug — newly-routed curated aliases vanished on a native Anthropic setup
     ``provider_model_ids("anthropic")`` returned the live ``/v1/models`` dump
     verbatim whenever Anthropic credentials were configured. Anthropic's API
-    lags behind freshly-routed aliases (e.g. ``claude-fable-5``, which is
+    lags behind freshly-routed aliases (e.g. ``claude-fable-5-1``, which is
     reachable on Anthropic before the models endpoint enumerates it), so the
     curated entry disappeared from the picker. The picker now merges the
     curated ``_PROVIDER_MODELS["anthropic"]`` list with the live catalog —
@@ -36,7 +36,7 @@ def test_anthropic_curated_alias_survives_when_live_omits_it():
     """A curated alias missing from /v1/models still surfaces (first)."""
     curated = M._PROVIDER_MODELS["anthropic"]
     assert "claude-fable-5.1" in curated  # sanity: newest Fable alias is curated
-    assert "claude-fable-5" in curated  # sanity: the alias is curated
+    assert "claude-fable-5-1" in curated  # sanity: the alias is curated
     assert "claude-opus-5" in curated  # sanity: native flagship matches aggregators
     assert "claude-sonnet-5" in curated  # newest Sonnet alias is curated
 

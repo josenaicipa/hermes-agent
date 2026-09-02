@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
     _is_connection_error,
+    _task_allows_main_model_fallback,
     aux_interrupt_protection,
     call_llm,
     extract_content_or_reasoning,
@@ -3201,8 +3202,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             prev_end = end
         return "".join(parts)
 
-    def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
+    def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> bool:
         """Fall back from a separate ``summary_model`` to the main model: record the aux failure, clear model + cooldown."""
+        if not _task_allows_main_model_fallback("compression"):
+            logger.warning("Main-model fallback disabled for compression; preserving context (%s)", e)
+            return False
         self._summary_model_fallen_back = True
         logger.warning(
             "Summary model '%s' %s (%s). Falling back to main model '%s' for compression.",
@@ -3216,6 +3220,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
+        return True
 
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
         """Issue the single aux summary call; return validated content text.
@@ -3518,9 +3523,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         # A distinct summary model gets ONE main-model retry: a specific reason for known transient classes,
         # else a best-effort "failed" retry — losing N turns is worse than one extra summary attempt.
         if self.summary_model and self.summary_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
-            self._fallback_to_main_for_compression(e, kind.fallback_reason())
-            # Retry immediately on the main model.
-            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+            if self._fallback_to_main_for_compression(e, kind.fallback_reason()):
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed. Timeouts escalate
         # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung.

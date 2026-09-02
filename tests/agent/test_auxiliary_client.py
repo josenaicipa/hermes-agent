@@ -1,5 +1,6 @@
 """Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -2303,6 +2304,134 @@ class TestTransientTransportRetry:
             "A timeout is model-specific — the failed model must be forwarded "
             "so a same-provider sibling can be tried, not skipped wholesale."
         )
+
+    def test_compression_can_forbid_sync_main_model_fallback(self):
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://api.example.invalid/v1"
+        primary.chat.completions.create.side_effect = _Timeout("timed out")
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+            ) as mock_main,
+            pytest.raises(_Timeout),
+        ):
+            call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        mock_main.assert_not_called()
+
+    def test_compression_can_forbid_async_main_model_fallback(self):
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://api.example.invalid/v1"
+        primary.chat.completions.create = AsyncMock(side_effect=_Timeout("timed out"))
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+            ) as mock_main,
+            pytest.raises(_Timeout),
+        ):
+            asyncio.run(
+                async_call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            )
+        mock_main.assert_not_called()
+
+    def test_compression_stale_sync_chain_cannot_escape_to_provider_discovery(self):
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://api.example.invalid/v1"
+        primary.chat.completions.create.side_effect = _Timeout("timed out")
+        fallback = MagicMock()
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "gpt-5.6-sol", "fallback_chain[0](openai-codex)"),
+            ),
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._call_fallback_candidate_sync",
+                return_value=None,
+            ),
+            patch("agent.auxiliary_client._try_payment_fallback") as payment,
+            pytest.raises(_Timeout),
+        ):
+            call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        payment.assert_not_called()
+
+    def test_compression_stale_async_chain_cannot_escape_to_provider_discovery(self):
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://api.example.invalid/v1"
+        primary.chat.completions.create = AsyncMock(side_effect=_Timeout("timed out"))
+        fallback = MagicMock()
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback, "gpt-5.6-sol", "fallback_chain[0](openai-codex)"),
+            ),
+            patch(
+                "agent.auxiliary_client._task_allows_main_model_fallback",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "gpt-5.6-sol"),
+            ),
+            patch(
+                "agent.auxiliary_client._call_fallback_candidate_async",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("agent.auxiliary_client._try_payment_fallback") as payment,
+            pytest.raises(_Timeout),
+        ):
+            asyncio.run(
+                async_call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            )
+        payment.assert_not_called()
 
 
 

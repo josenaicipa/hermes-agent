@@ -345,6 +345,30 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_names_only_index_mode_demotes_every_category_and_separates_cache(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, name, description in (
+            ("operations", "route-work", "Route operational work"),
+            ("writing", "draft-copy", "Draft marketing copy"),
+        ):
+            d = tmp_path / "skills" / category / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        compact = build_skills_system_prompt(index_mode="names_only")
+        assert "route-work" in compact
+        assert "draft-copy" in compact
+        assert "Route operational work" not in compact
+        assert "Draft marketing copy" not in compact
+
+        full = build_skills_system_prompt(index_mode="full")
+        assert "Route operational work" in full
+        assert "Draft marketing copy" in full
+
 
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
@@ -1174,7 +1198,6 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
 
 

@@ -5761,6 +5761,24 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+def _task_allows_main_model_fallback(task: Optional[str]) -> bool:
+    """Return whether an auxiliary task may use broad recovery fallbacks.
+
+    The historical default is permissive so existing installations keep their
+    current availability behavior. A task can opt out with
+    ``auxiliary.<task>.allow_main_model_fallback: false`` when model separation
+    is a hard requirement. Opting out restricts recovery to that task's
+    explicit ``fallback_chain``: neither the main model nor payment/provider
+    autodiscovery may escape it (for example, compression stays Terra -> Sol).
+    """
+    raw = _get_auxiliary_task_config(task or "").get(
+        "allow_main_model_fallback", True
+    )
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
 class CompressionFastLane(NamedTuple):
     """Explicit, non-reasoning compression route."""
 
@@ -7044,14 +7062,15 @@ def _next_fallback_after_quarantine(
     """Next candidate after a fallback entry was quarantined mid-request: remaining configured
     entries (task chain, then main chain on auto) before the discovery chain."""
     reason = "stale fallback credential"
+    allow_broad_fallback = _task_allows_main_model_fallback(task)
     fb = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
         failed_base_url=route.base_info, failure_scope=failure_scope)
-    if fb[0] is None and is_auto:
+    if fb[0] is None and is_auto and allow_broad_fallback:
         fb = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
             failed_base_url=route.base_info, failure_scope=failure_scope)
-    if fb[0] is None:
+    if fb[0] is None and allow_broad_fallback:
         fb = _try_payment_fallback(
             resolved_provider, task, reason=reason, failed_base_url=route.base_info,
             failure_scope=failure_scope, main_runtime=route.main_runtime)
@@ -7065,6 +7084,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     response) bypass the explicit-provider gate — the provider cannot serve this request
     regardless of user intent. Auth errors only fall back in auto mode."""
     task, tag, resolved_provider = route.task, route.tag, route.resolved_provider
+    allow_broad_fallback = _task_allows_main_model_fallback(task)
     # Respect explicit provider choice for transient errors (auth, request validation, etc.) but allow
     # fallback when the provider clearly cannot serve the request due to capacity: payment/quota exhaustion
     # and connection failures are capacity problems, not request constraints. See #26803: daily token quota
@@ -7098,7 +7118,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
-    if fb_client is None and is_auto:
+    if fb_client is None and is_auto and allow_broad_fallback:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
@@ -7106,7 +7126,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None:
+    elif fb_client is None and allow_broad_fallback:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)

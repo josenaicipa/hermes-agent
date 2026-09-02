@@ -130,3 +130,25 @@ def test_non_timeout_transient_errors_keep_flat_cooldown():
     assert getattr(c, "_consecutive_timeout_failures", 0) == 0
 
 
+def test_disabled_main_fallback_preserves_compression_route():
+    """Terra/Sol exhaustion must not silently retry on the chat model."""
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        c = ContextCompressor(
+            model="claude-fable-5-1",
+            summary_model_override="gpt-5.6-terra",
+            quiet_mode=True,
+        )
+
+    with patch(
+        "agent.context_compressor.call_llm",
+        side_effect=TimeoutError("Request timed out."),
+    ) as call, patch(
+        "agent.context_compressor._task_allows_main_model_fallback",
+        return_value=False,
+    ):
+        assert c._generate_summary(_msgs()) is None
+
+    assert call.call_count == 1
+    assert c.summary_model == "gpt-5.6-terra"
+    assert not getattr(c, "_summary_model_fallen_back", False)
+

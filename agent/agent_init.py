@@ -1299,8 +1299,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
 def _apply_agent_section(agent, _agent_cfg):
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
+    agent._skills_index_mode = "full"
     with suppress(Exception):
         agent._skill_nudge_interval = int(_agent_cfg.get("skills", {}).get("creation_nudge_interval", 10))
+        mode = str(_agent_cfg.get("skills", {}).get("index_mode", "full")).strip().lower()
+        if mode in {"full", "names_only"}:
+            agent._skills_index_mode = mode
 
     _agent_section = _cfg_dict(_agent_cfg, "agent")
     agent.budget_warning_ratio = normalize_budget_warning_ratio(
@@ -2089,6 +2093,8 @@ def _snapshot_primary_runtime(agent):
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
+        "reasoning_config": (dict(agent.reasoning_config)
+                             if getattr(agent, "reasoning_config", None) is not None else None),
         # Engine state _try_activate_fallback() overwrites (getattr: plugin engines may lack them).
         "compressor_model": getattr(_cc, "model", agent.model),
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url),
