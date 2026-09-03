@@ -918,10 +918,17 @@ def _build_no_backend_setup_message() -> str:
 
 
 def check_image_generation_requirements() -> bool:
-    """True if any image gen backend is available.
+    """True if any image gen backend is available *or explicitly configured*.
 
     Providers are considered in this order:
 
+    0. A backend the user explicitly selected — ``image_gen.provider``, or
+       the plugin whose catalog owns ``image_gen.model``. This returns True
+       even when the backend's credentials are missing, so the call
+       surfaces a precise "OPENAI_API_KEY is not set, run `hermes tools`"
+       error instead of the tool silently vanishing from the agent's
+       schema list. Mirrors the availability semantics documented on
+       :func:`agent.image_gen_registry.get_active_provider`.
     1. The in-tree FAL backend (FAL_KEY or managed gateway).
     2. Any plugin-registered provider whose ``is_available()`` returns True.
 
@@ -930,6 +937,12 @@ def check_image_generation_requirements() -> bool:
     should still expose the tool. The active selection among ready
     providers is resolved per-call by ``image_gen.provider``.
     """
+    try:
+        if _resolve_image_provider_name():
+            return True
+    except Exception:
+        pass
+
     try:
         if check_fal_api_key():
             # Trigger the lazy fal_client import here as the SDK presence
@@ -1069,6 +1082,55 @@ def _read_configured_image_provider():
     return None
 
 
+def _provider_owning_model(model_id: str):
+    """Return the name of the plugin whose catalog contains *model_id*, or None.
+
+    Consulted only when ``image_gen.provider`` is unset. In-tree FAL model
+    IDs are excluded so the historical "unset provider = in-tree FAL" path
+    is preserved for FAL models.
+
+    This closes the split-brain case behind issue reports of the shape
+    "asked for gpt-image-2-high, nothing ran": a config carrying
+    ``image_gen.model: gpt-image-2-high`` without ``image_gen.provider``
+    used to fall through to the FAL path, where ``_resolve_fal_model()``
+    does not recognise the ID and silently swaps in the FAL default —
+    a different backend and a different model than the user picked.
+    """
+    if not model_id or model_id in FAL_MODELS:
+        return None
+    try:
+        from agent.image_gen_registry import list_providers
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        providers = list_providers()
+    except Exception as exc:
+        logger.debug("image_gen model->provider lookup skipped: %s", exc)
+        return None
+
+    for provider in providers:
+        try:
+            models = provider.list_models() or []
+        except Exception:
+            continue
+        for entry in models:
+            if isinstance(entry, dict) and entry.get("id") == model_id:
+                return provider.name
+    return None
+
+
+def _resolve_image_provider_name():
+    """Resolve the active image gen backend name, or None for in-tree FAL.
+
+    ``image_gen.provider`` wins; otherwise the plugin that owns
+    ``image_gen.model`` (see :func:`_provider_owning_model`).
+    """
+    configured = _read_configured_image_provider()
+    if configured:
+        return configured
+    return _provider_owning_model(_read_configured_image_model() or "")
+
+
 def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
     """Route the call to a plugin-registered provider when one is selected.
 
@@ -1082,11 +1144,16 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
     direct call, just routed through the registry).
     """
     configured = _read_configured_image_provider()
+    # Also read configured model so we can pass it to the plugin — and so an
+    # unset ``image_gen.provider`` can still be resolved from the model the
+    # user actually picked in ``hermes tools``.
+    configured_model = _read_configured_image_model()
+    inferred_from_model = False
+    if not configured:
+        configured = _provider_owning_model(configured_model or "")
+        inferred_from_model = bool(configured)
     if not configured:
         return None
-
-    # Also read configured model so we can pass it to the plugin
-    configured_model = _read_configured_image_model()
 
     try:
         # Import locally so plugin discovery isn't triggered just by
@@ -1111,14 +1178,24 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
             logger.debug("image_gen plugin force-refresh skipped: %s", exc)
 
     if provider is None:
-        return json.dumps({
-            "success": False,
-            "image": None,
-            "error": (
+        if inferred_from_model:
+            message = (
+                f"image_gen.model='{configured_model}' belongs to the "
+                f"'{configured}' backend, but no plugin registered that "
+                f"name. Run `hermes plugins list` to see available image "
+                f"gen backends, or `hermes tools` -> Image Generation to "
+                f"pick one that is installed."
+            )
+        else:
+            message = (
                 f"image_gen.provider='{configured}' is set but no plugin "
                 f"registered that name. Run `hermes plugins list` to see "
                 f"available image gen backends."
-            ),
+            )
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": message,
             "error_type": "provider_not_registered",
         })
 

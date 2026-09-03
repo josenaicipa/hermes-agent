@@ -5427,6 +5427,7 @@ def save_config(config: Dict[str, Any]):
         )
         _secure_file(config_path)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+    _invalidate_tool_availability_cache()
 
 
 def load_env() -> Dict[str, str]:
@@ -5504,6 +5505,26 @@ def invalidate_env_cache() -> None:
     """
     global _env_cache
     _env_cache = None
+    _invalidate_tool_availability_cache()
+
+
+def _invalidate_tool_availability_cache() -> None:
+    """Drop the tool registry's ``check_fn`` TTL cache.
+
+    Tool availability probes (``check_image_generation_requirements`` and
+    friends) read config.yaml and .env, and their results are cached for
+    ~30s in :mod:`tools.registry`. Without this hook, a key added through
+    ``hermes tools`` could leave the just-enabled tool missing from the
+    agent's schema list for the rest of the turn. Imported lazily and
+    best-effort: ``tools`` is a heavy import and config must stay usable
+    in contexts where it isn't installed.
+    """
+    try:
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+    except Exception:
+        pass
 
 
 def _sanitize_env_lines(lines: list) -> list:

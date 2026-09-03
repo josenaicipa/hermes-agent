@@ -818,6 +818,25 @@ and logs — avoids shell-escaping backslashes in bash.
 2. Some tools need env vars (check `.env`)
 3. `/reset` after enabling tools
 
+### `image_generate` missing or "no image tool"
+The tool is gated on an image backend being reachable, so a missing key
+makes it disappear from the schema rather than fail loudly.
+1. `hermes tools` → Image Generation — pick a backend and enter its key.
+   This writes both `image_gen.provider` and `image_gen.model`; a config
+   with only `image_gen.model` set (e.g. `gpt-image-2-high` with no
+   `provider`) is resolved back to the owning backend, but writing both
+   is the supported path.
+2. Verify the key actually landed: `hermes config` (look for the
+   `image_gen` section) and check `.env` for `OPENAI_API_KEY` / `FAL_KEY`,
+   whichever the backend needs.
+3. `hermes plugins list` — confirm the backend's plugin is present.
+4. `/reset` to pick up the new toolset.
+
+A backend that is configured but missing credentials keeps `image_generate`
+exposed on purpose: calling it returns the exact key to set instead of the
+tool silently vanishing. If the tool is absent entirely, nothing is
+configured yet — step 1.
+
 ### Model/provider issues
 1. `hermes doctor` — check config and dependencies
 2. `hermes auth` — re-authenticate OAuth providers (or `hermes auth add <provider>`)
