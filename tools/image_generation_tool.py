@@ -1095,6 +1095,15 @@ def _provider_owning_model(model_id: str):
     used to fall through to the FAL path, where ``_resolve_fal_model()``
     does not recognise the ID and silently swaps in the FAL default —
     a different backend and a different model than the user picked.
+
+    A model ID can be claimed by more than one backend: ``gpt-image-2-*``
+    belongs to both ``openai`` (needs ``OPENAI_API_KEY``) and
+    ``openai-codex`` (same models over ChatGPT/Codex OAuth, no API key).
+    Picking by registry order would hand a Codex-authenticated user the
+    key-only backend and tell them to buy a key they don't need, so an
+    available claimant always wins. With none available the first claimant
+    is returned, which keeps the downstream error pointed at a real
+    backend instead of falling through to FAL.
     """
     if not model_id or model_id in FAL_MODELS:
         return None
@@ -1108,15 +1117,31 @@ def _provider_owning_model(model_id: str):
         logger.debug("image_gen model->provider lookup skipped: %s", exc)
         return None
 
+    claimants = []
     for provider in providers:
         try:
             models = provider.list_models() or []
         except Exception:
             continue
-        for entry in models:
-            if isinstance(entry, dict) and entry.get("id") == model_id:
+        if any(
+            isinstance(entry, dict) and entry.get("id") == model_id
+            for entry in models
+        ):
+            claimants.append(provider)
+
+    if not claimants:
+        return None
+
+    for provider in claimants:
+        try:
+            if provider.is_available():
                 return provider.name
-    return None
+        except Exception as exc:  # noqa: BLE001 — a broken probe must not decide
+            logger.debug(
+                "image_gen provider %s.is_available() raised %s",
+                provider.name, exc,
+            )
+    return claimants[0].name
 
 
 def _resolve_image_provider_name():

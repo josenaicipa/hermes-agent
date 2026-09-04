@@ -334,3 +334,112 @@ class TestToolStaysExposed:
         _config(provider=None, model=None)
 
         assert image_generation_tool.check_image_generation_requirements() is True
+
+
+class _FakeCodexImageProvider(ImageGenProvider):
+    """Stands in for ``plugins/image_gen/openai-codex``.
+
+    Shares the ``gpt-image-2-*`` catalog with ``_FakeOpenAIProvider`` and
+    sorts after it by name, so it only ever wins on availability.
+    """
+
+    def __init__(self, available: bool = True):
+        self._available = available
+
+    @property
+    def name(self) -> str:
+        return "openai-codex"
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def list_models(self):
+        return [
+            {"id": "gpt-image-2-low", "display": "GPT Image 2 (Low)"},
+            {"id": "gpt-image-2-medium", "display": "GPT Image 2 (Medium)"},
+            {"id": "gpt-image-2-high", "display": "GPT Image 2 (High)"},
+        ]
+
+    def default_model(self):
+        return "gpt-image-2-medium"
+
+    def generate(self, prompt, aspect_ratio="landscape", **kwargs):
+        return {
+            "success": True,
+            "image": "/tmp/codex-image-test.png",
+            "model": "gpt-image-2-high",
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "provider": "openai-codex",
+        }
+
+
+class TestAmbiguousModelPrefersAvailable:
+    """``gpt-image-2-*`` is claimed by both ``openai`` and ``openai-codex``.
+
+    ``openai`` needs a paid ``OPENAI_API_KEY``; ``openai-codex`` serves the
+    same models over ChatGPT/Codex OAuth with no key. Resolving by registry
+    order picks ``openai`` (it sorts first), which would tell a
+    Codex-authenticated user to buy a key they do not need.
+    """
+
+    def test_available_claimant_wins_over_registry_order(self, _stub_discovery):
+        from tools import image_generation_tool
+
+        image_gen_registry.register_provider(_FakeOpenAIProvider(available=False))
+        image_gen_registry.register_provider(_FakeCodexImageProvider(available=True))
+
+        assert (
+            image_generation_tool._provider_owning_model("gpt-image-2-high")
+            == "openai-codex"
+        )
+
+    def test_first_claimant_when_none_available(self, _stub_discovery):
+        """No credentials anywhere still names a real backend, not FAL."""
+        from tools import image_generation_tool
+
+        image_gen_registry.register_provider(_FakeOpenAIProvider(available=False))
+        image_gen_registry.register_provider(_FakeCodexImageProvider(available=False))
+
+        assert (
+            image_generation_tool._provider_owning_model("gpt-image-2-high")
+            == "openai"
+        )
+
+    def test_available_openai_still_wins_when_it_is_the_available_one(
+        self, _stub_discovery
+    ):
+        from tools import image_generation_tool
+
+        image_gen_registry.register_provider(_FakeOpenAIProvider(available=True))
+        image_gen_registry.register_provider(_FakeCodexImageProvider(available=False))
+
+        assert (
+            image_generation_tool._provider_owning_model("gpt-image-2-high")
+            == "openai"
+        )
+
+    def test_dispatch_routes_codex_user_to_codex_backend(
+        self, _config, _stub_discovery, monkeypatch
+    ):
+        """End to end: model-only config + Codex auth reaches the free backend."""
+        from tools import image_generation_tool
+        from agent import image_gen_registry as registry_module
+
+        image_gen_registry.register_provider(_FakeOpenAIProvider(available=False))
+        image_gen_registry.register_provider(_FakeCodexImageProvider(available=True))
+        _config(provider=None, model="gpt-image-2-high")
+        monkeypatch.setattr(
+            registry_module,
+            "get_provider",
+            lambda name: _FakeCodexImageProvider()
+            if name == "openai-codex"
+            else None,
+        )
+
+        payload = json.loads(
+            image_generation_tool._dispatch_to_plugin_provider("un gato", "square")
+        )
+        assert payload["success"] is True
+        assert payload["provider"] == "openai-codex"
+        assert payload["model"] == "gpt-image-2-high"
