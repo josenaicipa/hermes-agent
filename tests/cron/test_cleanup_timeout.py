@@ -50,6 +50,33 @@ class HangingAgent:
         self.release.wait()
 
 
+class TitleHangingSessionDB:
+    """Realistic store surface whose title write never returns."""
+
+    def __init__(self, release: threading.Event):
+        self.release = release
+        self.title_entered = threading.Event()
+
+    def get_compression_tip(self, _session_id):
+        return None
+
+    def set_session_title(self, *_args, **_kwargs):
+        self.title_entered.set()
+        self.release.wait()
+
+    def get_next_title_in_lineage(self, base):
+        return f"{base} #2"
+
+    def session_lifecycle_statuses(self, session_ids):
+        return {session_ids[0]: "complete"}
+
+    def end_session(self, *_args, **_kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
 def test_run_job_bounds_sessiondb_finalization(tmp_path):
     release = threading.Event()
     fake_db = HangingSessionDB(release)
@@ -79,6 +106,59 @@ def test_run_job_bounds_sessiondb_finalization(tmp_path):
         assert error is None
     finally:
         release.set()
+
+
+def test_title_timeout_cannot_replace_completed_run_result(tmp_path):
+    """A timed-out title write must not escape through fallback title lookup."""
+    release = threading.Event()
+    fake_db = TitleHangingSessionDB(release)
+    job = {"id": "cleanup-title-hang", "name": "test", "prompt": "hello"}
+
+    try:
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.02):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert fake_db.title_entered.wait(timeout=0.5)
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+    finally:
+        release.set()
+
+
+def test_cron_session_store_is_scoped_to_active_hermes_home(tmp_path):
+    """Profile cron runs must never fall back to the shared default state.db."""
+    fake_db = MagicMock()
+    job = {"id": "profile-db-scope", "name": "test", "prompt": "hello"}
+
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state.SessionDB", return_value=fake_db) as session_db_cls, \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
+         patch("run_agent.AIAgent") as mock_agent_cls:
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent_cls.return_value = mock_agent
+
+        success, _output, final_response, error = run_job(job)
+
+    session_db_cls.assert_called_once_with(db_path=tmp_path / "state.db")
+    assert success is True
+    assert final_response == "ok"
+    assert error is None
 
 
 def test_agent_teardown_is_bounded():

@@ -1621,13 +1621,14 @@ def _open_cron_session_db(job: dict):
     try:
         from hermes_state_registry import acquire
 
+        db_path = _get_hermes_home() / "state.db"
         if _session_db_timeout <= 0:
-            return acquire()
+            return acquire(db_path=db_path)
         _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Copy the context so a profile run resolves ITS OWN home/state.db on the worker thread
         # instead of the process-global default.
         _session_db_context = contextvars.copy_context()
-        _session_db_future = _session_db_pool.submit(_session_db_context.run, acquire)
+        _session_db_future = _session_db_pool.submit(_session_db_context.run, acquire, db_path=db_path)
         try:
             return _session_db_future.result(timeout=_session_db_timeout)
         except concurrent.futures.TimeoutError:
@@ -1882,9 +1883,15 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
         # Never leave the session untitled.
         # Try the next free title in the lineage, then a bare id-stamped title. See #50535.
-        for _fallback in (
-            getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(f"cron {job_id}"),
-            f"cron {job_id} {_final_cron_session_id[-6:]}"):
+        _fallbacks = []
+        try:
+            _next_title = _session_db.get_next_title_in_lineage(f"cron {job_id}")
+            if _next_title:
+                _fallbacks.append(_next_title)
+        except (Exception, KeyboardInterrupt):
+            pass
+        _fallbacks.append(f"cron {job_id} {_final_cron_session_id[-6:]}")
+        for _fallback in _fallbacks:
             try:
                 if _set_cron_session_title(_session_db, _final_cron_session_id, _fallback):
                     break

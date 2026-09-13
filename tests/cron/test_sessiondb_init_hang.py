@@ -344,7 +344,7 @@ class TestLateSessionDbClosedAfterTimeout:
         never_set = threading.Event()
         late_db_holder = []  # captures the SessionDB returned by the late init
 
-        def _hanging_then_capture():
+        def _hanging_then_capture(**_kwargs):
             never_set.wait(timeout=30)
             db = MagicMock()
             late_db_holder.append(db)
