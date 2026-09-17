@@ -189,7 +189,7 @@ class SessionSearchMixin:
             # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
             # scrambling — may escape and make the caller replay an ambiguous, possibly-durable write
             # (#90734, #85079).
-            logger.warning("FTS incremental merge failed after commit: %s", exc)
+            logger.warning("FTS incremental merge failed after commit: %s", exc, exc_info=True)
 
     # ── Deferred rebuild engine (base + CJK backfills) ─────────────────────
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -13,6 +14,46 @@ import pytest
 import hermes_state
 from hermes_state import SessionDB
 from hermes_state_errors import SessionTurnLeaseLostError
+
+
+def test_turn_lease_acquire_survives_post_commit_fts_system_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Best-effort FTS maintenance cannot orphan a committed turn lease.
+
+    The lease INSERT commits before the periodic merge runs.  Production saw
+    ``sqlite3.Connection.execute`` surface a CPython ``SystemError`` from that
+    merge; letting it escape made acquisition look failed even though the row
+    existed, so the caller never registered the holder for release and every
+    retry waited for the full TTL.
+    """
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    db._FTS_MERGE_EVERY_N_WRITES = 1
+
+    def fail_post_commit_merge(*, max_pages):
+        raise SystemError("connection returned NULL without setting an exception")
+
+    monkeypatch.setattr(db, "_merge_fts_incrementally", fail_post_commit_merge)
+    holder = f"pid={os.getpid()}:turn=owner"
+
+    with caplog.at_level(logging.WARNING):
+        assert db.try_acquire_session_turn_lease(
+            "shared", holder, ttl_seconds=300
+        )
+
+    contender = f"pid={os.getpid()}:turn=contender"
+    assert not db.try_acquire_session_turn_lease(
+        "shared", contender, ttl_seconds=300
+    )
+    db.release_session_turn_lease("shared", holder)
+    assert db.try_acquire_session_turn_lease(
+        "shared", contender, ttl_seconds=300
+    )
+    assert any(
+        "FTS incremental merge failed" in record.message
+        for record in caplog.records
+    )
 
 
 def test_turn_lease_serializes_separate_session_db_instances(tmp_path):
