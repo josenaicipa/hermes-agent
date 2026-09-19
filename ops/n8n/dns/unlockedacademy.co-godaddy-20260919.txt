@@ -1,0 +1,31 @@
+# unlockedacademy.co — inventario DNS previo a migración Cloudflare
+# Fecha: 2026-09-19
+# Fuente autoritativa: ns41.domaincontrol.com (GoDaddy)
+# Método: dig directo al autoritativo; TTLs tal como devolvió el servidor.
+#
+# Registros existentes confirmados
+unlockedacademy.co.          30    IN A      162.159.142.17
+unlockedacademy.co.          30    IN A      172.66.2.13
+unlockedacademy.co.        3600    IN MX     10 mxa.us.mailgun.org.
+unlockedacademy.co.        3600    IN TXT    "lw=68dc04362e776ced248cac8e"
+unlockedacademy.co.        3600    IN TXT    "unlockedacademy.co"
+unlockedacademy.co.        3600    IN NS     ns41.domaincontrol.com.
+unlockedacademy.co.        3600    IN NS     ns42.domaincontrol.com.
+unlockedacademy.co.        3600    IN SOA    ns41.domaincontrol.com. dns.jomax.net. 2026051300 28800 7200 604800 600
+www.unlockedacademy.co.    3600    IN CNAME  cname.learnworlds.com.
+n8n.unlockedacademy.co.      30    IN A      72.61.7.174
+_dmarc.unlockedacademy.co. 3600    IN TXT    "v=DMARC1; p=none"
+
+# Sin registro de datos (NODATA): apex AAAA, apex CAA, n8n AAAA/CNAME.
+# Consultas que devolvieron NXDOMAIN para A/AAAA/CNAME o TXT según correspondía:
+# mail, autodiscover, api, app, academy, cursos, go,
+# default._domainkey, selector1._domainkey, selector2._domainkey,
+# google._domainkey.
+# www devolvió el CNAME anterior al preguntar A/AAAA/CNAME.
+
+# Transferencia de zona: AXFR contra ns41.domaincontrol.com falló (EOF / no
+# servers could be reached); GoDaddy no permite AXFR público. La comparación
+# posterior con el escaneo/listado de Cloudflare es obligatoria antes del corte.
+
+# Conteo de registros migrables (sin NS/SOA gestionados por el proveedor):
+# A=3, MX=1, TXT=3, CNAME=1. n8n A será sustituido por CNAME proxied al túnel.
