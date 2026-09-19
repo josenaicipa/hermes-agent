@@ -130,3 +130,12 @@ el ingress de n8n y no se reinició `cloudflared-agentes`.
 `ops/n8n/docker-compose.yml` ya contenía los valores requeridos de
 `N8N_HOST`, `WEBHOOK_URL` y `N8N_EDITOR_BASE_URL`, todos apuntando a
 `https://n8n.unlockedacademy.co`; no necesitó modificación.
+
+## Cutover ejecutado — 2026-09-19 ~10:05 ET
+
+- GoDaddy: nameservers cambiados a `maisie.ns.cloudflare.com` / `troy.ns.cloudflare.com` (verificación SMS Level Up completada).
+- Cloudflare: zona `unlockedacademy.co` pasó `pending → active`; Universal SSL emitido.
+- Hallazgo: el tunnel `b1ea5480…` es **remotely-managed** (config versionada en Cloudflare, `Updated to new configuration` en logs); el ingress del `config.yml` local NO aplica. Se añadió `n8n.unlockedacademy.co → http://127.0.0.1:5678` vía API `PUT /cfd_tunnel/{id}/configurations` (version 26 → 27). Backup de la config remota previa: `/mnt/data2tb/services/cloudflared/remote-config.bak-20260919T*.json`. El ingress local en `config.yml` se mantiene como espejo documental.
+- Smoke post-cutover: `unlockedacademy.co` 200, `www` 200, `n8n /healthz` 200 `{"status":"ok"}`, `/signin` 200; origen confirmado = contenedor local `n8n` (probe de webhook único visible en `docker logs n8n`). Regresión: school 200, crm 200, control 307, agentes 401 (auth, esperado). MX Mailgun y TXT `lw=` intactos.
+- Hostinger `72.61.7.174` sigue activo como rollback (recibe tráfico residual por TTL). Pausar tras 24 h; nunca eliminar.
+- Pendiente Jose: revocar en dashboard Cloudflare el token `Cloudflare Zone Create Token - 2026-09-19` (expuesto en salida de navegador; el token no tiene permiso para auto-revocarse).
