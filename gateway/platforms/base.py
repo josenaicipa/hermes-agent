@@ -1763,8 +1763,9 @@ _strip_media_directives = _strip_media_tag_directives
 
 
 class BasePlatformAdapter(ABC):
-    supports_durable_delivery_receipts = True
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
+
+    supports_durable_delivery_receipts = True
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).

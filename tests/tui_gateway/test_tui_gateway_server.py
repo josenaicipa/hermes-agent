@@ -16527,6 +16527,10 @@ def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
 def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch):
     from hermes_cli.inventory import ConfigContext
 
+    # Explicit OAuth is a separate affirmative configuration source; this
+    # test's contract is that no other provider is explicitly configured.
+    monkeypatch.setattr("hermes_cli.inventory._anthropic_oauth_credentials_present", lambda: False)
+
     class _Agent:
         provider = "custom"
         model = "qwen3.6:35b-65k"

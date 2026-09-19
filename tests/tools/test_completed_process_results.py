@@ -128,7 +128,7 @@ def test_headless_terminal_result_survives_cli_exit(tmp_path):
     assert observed[0].get("notify_on_complete") is True, observed
     # The owned notify_on_complete completion resumes in-process as a follow-up turn
     # (nested quiet-notify resume), carrying the child's real output to the model.
-    assert len(follow_ups) == 1, follow_ups
+    assert len(follow_ups) == 1, (follow_ups, producer.stdout, producer.stderr)
     assert process_id in follow_ups[0]
     assert "SYNTHETIC_REVIEW_COMPLETE" in follow_ups[0]
     assert "exit code 7" in follow_ups[0]

@@ -176,11 +176,11 @@ def test_names_only_skills_index_keeps_hermes_agent_help_guidance(monkeypatch):
         "DOCS_ONLY_HELP",
     )
     with (
-        patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_environment_hints", return_value=""),
-        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("agent.prompt_builder.load_soul_md", return_value=""),
+        patch("agent.prompt_builder.build_environment_hints", return_value=""),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
         patch(
-            "run_agent.build_skills_system_prompt",
+            "agent.prompt_builder.build_skills_system_prompt",
             return_value=(
                 "<available_skills>\n"
                 "  Autonomous AI Agents [names only]: hermes-agent, planner\n"

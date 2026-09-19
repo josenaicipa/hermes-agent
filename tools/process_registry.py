@@ -792,8 +792,12 @@ class ProcessRegistry(ProcessControlMixin, ProcessCheckpointMixin):
     def _new_session(command, task_id, owner_task_id, session_key, cwd, notification=None, **extra) -> ProcessSession:
         from gateway.session_context import get_session_env
 
-        fields = {"parent_session_id": get_session_env("HERMES_SESSION_ID", ""), **extra}
+        fields = dict(extra)
         fields.update(ProcessRegistry._notification_session_kwargs(notification))
+        # Notification routing may be empty on CLI/finite surfaces, but the
+        # durable result still belongs to the spawning session. Never erase it
+        # with the default empty notification configuration.
+        fields["parent_session_id"] = fields.get("parent_session_id") or get_session_env("HERMES_SESSION_ID", "")
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id or task_id, session_key=session_key, cwd=cwd,
@@ -895,6 +899,16 @@ class ProcessRegistry(ProcessControlMixin, ProcessCheckpointMixin):
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if session._pty is not None:
+                    # The child already started; a checkpoint/reader failure
+                    # must not execute the command a second time through pipes.
+                    with suppress(Exception):
+                        session._pty.terminate(force=True)
+                    with suppress(Exception):
+                        session._pty.close()
+                    if session.systemd_unit:
+                        _stop_systemd_unit(session.systemd_unit)
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if session.systemd_unit:
                     pty_scope_attempted = True

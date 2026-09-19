@@ -98,6 +98,20 @@ def _prepare_child_env(hermes_home: str, lock_root: str) -> None:
         sys.path.insert(0, REPO_ROOT)
 
 
+def _unlink_distinct_sidecar(path, request):
+    """Keep the old inode allocated while testing its replacement.
+
+    These tests exercise observed identity changes, not inode-allocation
+    policy. Some filesystems immediately recycle a closed, unlinked inode,
+    making the replacement indistinguishable by the documented (dev, ino)
+    contract and invalidating the test's distinct-identity precondition.
+    This read handle owns no lock and is closed at test teardown.
+    """
+    original = open(path, "rb")
+    request.addfinalizer(original.close)
+    os.unlink(path)
+
+
 def _child_init_and_append(
     db_path: str,
     hermes_home: str,
@@ -839,7 +853,7 @@ class TestSidecarInodeSubstitutionBypass:
     would perform after the hardlink swap is noticed."""
 
     def test_hardlink_substitution_does_not_grant_concurrent_admission(
-        self, tmp_path
+        self, tmp_path, request
     ):
         db_path = tmp_path / "state.db"
         started = threading.Event()
@@ -862,7 +876,7 @@ class TestSidecarInodeSubstitutionBypass:
             # flock on the original inode.
             victim = tmp_path / "victim.lock"
             victim.write_bytes(b"")
-            os.unlink(lock_path)
+            _unlink_distinct_sidecar(lock_path, request)
             os.link(victim, lock_path)
 
             t0 = time.monotonic()
@@ -1015,7 +1029,7 @@ class TestSidecarIdentityContinuity:
             assert admitted is True
         assert root_key in hermes_state_lock._known_sidecar_identity
 
-    def test_plain_unlink_and_recreate_between_cycles_is_rejected(self, tmp_path):
+    def test_plain_unlink_and_recreate_between_cycles_is_rejected(self, tmp_path, request):
         """RED before the continuity check existed: a plain unlink+recreate
         (no hardlink — ``st_nlink`` stays ``1`` throughout) between two
         non-overlapping acquires, with no concurrent holder at all, is
@@ -1031,7 +1045,7 @@ class TestSidecarIdentityContinuity:
 
         lock_path = write_lock_path()
         original = os.stat(lock_path)
-        os.unlink(lock_path)
+        _unlink_distinct_sidecar(lock_path, request)
         lock_path.write_bytes(b"")  # ordinary regular file, nlink == 1
         replacement = os.stat(lock_path)
         assert replacement.st_ino != original.st_ino or (
@@ -1126,7 +1140,7 @@ class TestSidecarContinuityIsPerLockRoot:
             assert admitted is True
 
     def test_swap_within_one_root_poisons_that_root_only(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, request
     ):
         """The C5 detection must survive the per-root split: an
         unlink+recreate inside root_a is still witnessed and still refuses
@@ -1140,7 +1154,7 @@ class TestSidecarContinuityIsPerLockRoot:
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
         sidecar_a = write_lock_path()
-        os.unlink(sidecar_a)
+        _unlink_distinct_sidecar(sidecar_a, request)
         sidecar_a.write_bytes(b"")  # ordinary regular file, nlink == 1
 
         with acquire_state_write_lock(db_path, timeout_s=0.5) as admitted:
@@ -1161,7 +1175,7 @@ class TestSidecarContinuityIsPerLockRoot:
 
     @pytest.mark.skipif(not _HAS_SYMLINK, reason="platform has no os.symlink")
     def test_root_reached_through_a_symlinked_parent_shares_one_baseline(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, request
     ):
         """The per-root key must be the root's *canonical* path: two
         spellings of the same physical root (here, via a symlinked parent
@@ -1180,7 +1194,7 @@ class TestSidecarContinuityIsPerLockRoot:
         with acquire_state_write_lock(db_path, timeout_s=1.0) as admitted:
             assert admitted is True
         sidecar = write_lock_path()
-        os.unlink(sidecar)
+        _unlink_distinct_sidecar(sidecar, request)
         sidecar.write_bytes(b"")
 
         monkeypatch.setenv(
