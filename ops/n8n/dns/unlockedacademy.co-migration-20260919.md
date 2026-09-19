@@ -72,3 +72,61 @@ escritura para esos dos archivos.
 
 No se cambiaron NS de GoDaddy, no se reinició `cloudflared-agentes`, ni se
 tocaron otras zonas Cloudflare.
+
+## Continuación Fase 3b — 2026-09-19
+
+Esta continuación revalidó el estado antes de escribir y creó la zona
+Cloudflare con `type=full`. La zona queda deliberadamente en `pending` hasta
+que el propietario sustituya la delegación en GoDaddy; esta ejecución no llamó
+la API de GoDaddy ni tocó el servidor Hostinger `72.61.7.174`.
+
+### Zona y DNS creados
+
+- Zone ID: `31dfec0fa584ae70e4556aee65d79170`.
+- Nameservers asignados: `maisie.ns.cloudflare.com` y
+  `troy.ns.cloudflare.com`.
+- La credencial de `cloudflared-agentes` fue comprobada contra la cuenta de la
+  zona y corresponde a la misma cuenta. El túnel usado es
+  `b1ea5480-4905-4522-9c45-529a64b56e66`.
+- Se crearon 8 registros: los 7 heredados del inventario sin el A legado de
+  `n8n`, más el CNAME proxied de `n8n` al túnel.
+
+| Nombre | Tipo | Destino/contenido | TTL | Proxy |
+| --- | --- | --- | --- | --- |
+| `unlockedacademy.co` | A | `162.159.142.17` | 60 | no |
+| `unlockedacademy.co` | A | `172.66.2.13` | 60 | no |
+| `unlockedacademy.co` | MX | `10 mxa.us.mailgun.org` | 3600 | no |
+| `unlockedacademy.co` | TXT | `lw=68dc04362e776ced248cac8e` | 3600 | no |
+| `unlockedacademy.co` | TXT | `unlockedacademy.co` | 3600 | no |
+| `_dmarc.unlockedacademy.co` | TXT | `v=DMARC1; p=none` | 3600 | no |
+| `www.unlockedacademy.co` | CNAME | `cname.learnworlds.com` | 3600 | no |
+| `n8n.unlockedacademy.co` | CNAME | `b1ea5480-4905-4522-9c45-529a64b56e66.cfargotunnel.com` | auto | sí |
+
+Cloudflare Free rechazó los TTL heredados de 30 segundos para los dos A del
+apex; la API impuso su mínimo de 60 segundos. Los TTL restantes son los del
+inventario. Un CNAME proxied usa obligatoriamente TTL `auto` (valor API `1`).
+
+### Host y preflight
+
+El volumen que contiene
+`/mnt/data2tb/services/cloudflared/config.yml` estaba montado de solo lectura
+para este ejecutor. La creación previa exigida de
+`config.yml.bak-20260919T125802Z` falló con `Read-only file system`, antes de
+cualquier cambio al archivo. Por ello **no existe backup nuevo**, no se añadió
+el ingress de n8n y no se reinició `cloudflared-agentes`.
+
+- La configuración actual sí valida con
+  `cloudflared tunnel --config /mnt/data2tb/services/cloudflared/config.yml ingress validate`.
+- La unidad continúa `active (running)` sin reinicio.
+- N8n local respondió `200` en `http://127.0.0.1:5678/healthz`.
+- Los hostnames existentes continuaron respondiendo: `school` 200, `crm` 200,
+  `control` 307.
+- El preflight contra un edge Cloudflare con `--resolve` no pudo completar TLS
+  (`curl` 35, alert de handshake). La zona aún es `pending` y no tiene
+  Universal SSL comprobable con este token, por lo que debe considerarse
+  Universal SSL pendiente hasta que se deleguen los nameservers y se emita el
+  certificado.
+
+`ops/n8n/docker-compose.yml` ya contenía los valores requeridos de
+`N8N_HOST`, `WEBHOOK_URL` y `N8N_EDITOR_BASE_URL`, todos apuntando a
+`https://n8n.unlockedacademy.co`; no necesitó modificación.
