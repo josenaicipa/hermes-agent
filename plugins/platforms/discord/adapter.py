@@ -5973,7 +5973,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
         # Only live plain text is batched: recovery candidates are complete; coalescing would replay IDs.
-        if (not recovered and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
+        # Un turno del dashboard tampoco se agrupa: el lote fusiona por clave de
+        # sesión y conserva el ``source`` del PRIMER evento, así que un mensaje
+        # humano llegado en la misma ventana se llevaría la autoría de un turno
+        # que viene firmado. La atribución es justo lo que este camino
+        # garantiza; no se negocia por 0,6 s de coalescencia.
+        if (not recovered and dashboard_ingest is None
+                and msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)

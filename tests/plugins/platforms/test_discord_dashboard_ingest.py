@@ -300,3 +300,24 @@ async def test_a_plain_channel_message_is_ingested_with_the_channel_id(adapter, 
     assert event.source.chat_id == str(PARENT_ID)
     assert event.source.thread_id is None
     assert event.source.user_name == "Jose (dashboard)"
+
+
+@pytest.mark.asyncio
+async def test_a_dashboard_turn_is_never_coalesced_into_another_author(adapter, inbox):
+    """El lote de texto fusiona por sesión y conserva el ``source`` del primero.
+
+    Un mensaje humano llegado en la misma ventana se llevaría la autoría de un
+    turno firmado. La atribución es justo lo que este camino garantiza, así que
+    un turno del dashboard se entrega solo.
+    """
+    adapter._text_batch_delay_seconds = 0.6
+    adapter.batched = []
+    adapter._enqueue_text_event = lambda event: adapter.batched.append(event)
+
+    text = "no me mezcles"
+    inbox.write(_record(text), body=_published(text))
+    message = _self_message(adapter, _published(text))
+
+    assert await adapter._handle_message(message) is True
+    assert adapter.batched == []
+    assert adapter.delivered[-1].source.user_name == "Jose (dashboard)"
