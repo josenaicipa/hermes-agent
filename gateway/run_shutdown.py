@@ -780,8 +780,60 @@ class GatewayShutdownMixin:
         from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
+    def _sessions_awaiting_control_wake(self) -> list[str]:
+        """Session keys whose live FABLE_WAKE watcher this shutdown is about to kill.
+
+        Jose, 2026-09-21. El caso que faltaba: una sesion que despacho trabajo,
+        instalo su vigia en background y CERRO su turno limpio. No esta en
+        ``_running_agents``, asi que no se marcaba -- y el reinicio mataba el
+        vigia. Nadie volvia a despertar a nadie: la mision seguia viva y muda
+        hasta que un humano escribia algo (el "sigue" de Jose ES ese turno).
+        Medido ese dia: 20 scopes de mision vivos y CERO vigias.
+
+        Este proceso SABE que los va a matar -- son sus hijos y estan en su
+        propio registro. Marcar esas sesiones deja que el auto-resume del
+        arranque, que ya existe, les de un turno para readoptar.
+
+        Solo el patron de control reliable (``FABLE_WAKE``) con
+        ``notify_on_failure``: es el contrato de "alguien espera un despertar".
+        Un proceso de fondo cualquiera no genera turnos al reiniciar.
+        """
+
+        try:
+            from tools.process_registry import process_registry
+            from tools.process_registry_checkpoint import (
+                RELIABLE_CONTROL_WATCH_PATTERN,
+            )
+        except Exception:
+            return []
+        claves: list[str] = []
+        vistas: set[str] = set()
+        try:
+            for sesion in process_registry.list_sessions():
+                # exit_code None = sigue corriendo. Uno ya terminado no debe
+                # nada: su notificacion salio (o saldra) por el camino normal.
+                if getattr(sesion, "exit_code", None) is not None:
+                    continue
+                if not getattr(sesion, "notify_on_failure", False):
+                    continue
+                patrones = list(getattr(sesion, "watch_patterns", []) or [])
+                if patrones != [RELIABLE_CONTROL_WATCH_PATTERN]:
+                    continue
+                clave = str(getattr(sesion, "session_key", "") or "").strip()
+                if clave and clave not in vistas:
+                    vistas.add(clave)
+                    claves.append(clave)
+        except Exception:
+            return []
+        return claves
+
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
-        """Mark every non-pending running session resume_pending; returns the keys marked."""
+        """Mark every non-pending running session resume_pending; returns the keys marked.
+
+        Tambien marca las sesiones que esperan un FABLE_WAKE de un vigia vivo
+        (ver ``_sessions_awaiting_control_wake``): cerraron su turno bien, pero
+        este apagado se lleva al observador que las iba a despertar.
+        """
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
@@ -794,6 +846,17 @@ class GatewayShutdownMixin:
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 await self.async_session_store.mark_resume_pending(_sk, reason)
                 marked.append(_sk)
+        # Las que esperan un despertar que este apagado va a matar. Van con su
+        # propio motivo para que el turno reanudado sepa que NO se cayo a mitad
+        # de trabajo -- cerro bien y lo que se perdio fue su observador.
+        ya_marcadas = set(marked)
+        for _sk in self._sessions_awaiting_control_wake():
+            if _sk in ya_marcadas:
+                continue
+            with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
+                await self.async_session_store.mark_resume_pending(_sk, "watcher_lost")
+                marked.append(_sk)
+                ya_marcadas.add(_sk)
         return marked
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:

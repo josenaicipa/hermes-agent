@@ -1007,7 +1007,14 @@ def build_resume_recovery_note(
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
-        else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
+        else "a gateway shutdown" if reason == "shutdown_timeout"
+        # El turno tiene que saber que NO se cayo a mitad de trabajo: cerro
+        # bien y lo que se perdio fue su observador. Sin esto leeria
+        # "interruption" y podria rehacer trabajo ya entregado.
+        else "a gateway restart that killed the background watcher this "
+             "session was waiting on (the work itself was not interrupted)"
+        if reason == "watcher_lost"
+        else "a gateway interruption")
     if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now.")
@@ -3894,7 +3901,16 @@ class GatewayRunner(
 
     # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by suspend_recently_active()
     # on crash recovery (no .clean_shutdown marker). All mean "killed mid-turn" -> startup auto-resume.
-    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
+    # Jose, 2026-09-21: "watcher_lost" es el caso que faltaba. Una sesion que
+    # cerro su turno limpio y quedo esperando un FABLE_WAKE de un vigia en
+    # background no entraba aqui: solo se marcaban las sesiones con turno
+    # CORRIENDO, asi que al reiniciar el gateway mataba el vigia y nadie
+    # despertaba nunca a nadie. La mision seguia viva y muda hasta que un
+    # humano escribia algo. Sin este motivo en la lista blanca, marcarla no
+    # serviria de nada: `_resume_pending_candidates` la descartaria.
+    _AUTO_RESUME_REASONS = frozenset(
+        {"restart_timeout", "shutdown_timeout", "restart_interrupted", "watcher_lost"}
+    )
 
     _MAX_SUPERVISED_RESTARTS = 5
     # Ran this long before crashing = HEALTHY (isolated crash, not a crash-loop); restart counter resets.
