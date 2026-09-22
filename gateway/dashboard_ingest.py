@@ -16,19 +16,27 @@ Por qué el registro se escribe ANTES de publicar, y por qué NO se indexa por
 ``message_id``: el id de Discord no existe hasta que el mensaje ya está
 publicado, y para entonces el websocket del gateway ya entregó el evento. Un
 registro indexado por id llegaría siempre tarde. El índice es, por eso, la
-**dirección de contenido** del mensaje —canal, hilo y hash del cuerpo
-publicado—, que el escritor conoce de antemano y el lector recalcula del
-mensaje vivo. El ``message_id`` sigue siendo un campo del registro: es
+**dirección de contenido** del mensaje —el canal de destino y el hash del
+cuerpo publicado—, que el escritor conoce de antemano y el lector recalcula
+del mensaje vivo. El ``message_id`` sigue siendo un campo del registro: es
 opcional, y si viene, DEBE coincidir con el mensaje real.
+
+El destino es UN solo id, el ``chat_id``: el canal o el hilo donde el mensaje
+vive de verdad (``message.channel.id`` aquí, ``thread_id or channel_id`` del
+otro lado). No entra el canal padre, y es a propósito: el directorio que el
+gateway publica NO siempre distingue un hilo de su padre —hay entradas con la
+forma ``<X>:<X>``, donde el "padre" es el propio hilo—, así que atar el
+registro a un padre derivado sería atarlo a un dato que los dos lados no
+calculan igual. El ``chat_id`` sí: es el mismo id que identifica la sesión.
 
 Propiedades que este contrato sostiene, todas fail-closed:
 
 - **Autenticidad.** HMAC-SHA256 con una clave de 32 bytes que vive en
   ``run/dashboard-ingest/.hmac-key`` con modo 0600. Sin clave, sin registro o
   con firma que no valide en tiempo constante, no hay inyección.
-- **Atadura al mensaje real.** El registro fija canal, hilo y el hash del
-  cuerpo publicado. Un registro no puede prestarle su firma a otro mensaje, ni
-  a otro canal, ni a otro hilo.
+- **Atadura al mensaje real.** El registro fija el canal de destino y el hash
+  del cuerpo publicado. Un registro no puede prestarle su firma a otro mensaje
+  ni a otro canal.
 - **Caducidad.** 5 minutos. Un registro viejo no revive.
 - **Un solo uso.** El consumo es un ``rename`` atómico dentro del directorio:
   quien gana la carrera se lleva el registro; el resto ve un registro ausente.
@@ -94,8 +102,7 @@ class DashboardIngestError(Exception):
 class DashboardIngestRecord:
     """Registro de origen ya validado: el turno que hay que construir."""
 
-    channel_id: str
-    thread_id: str
+    chat_id: str
     actor_id: str
     display_name: str
     text: str
@@ -108,23 +115,20 @@ def body_digest(body: str) -> str:
     return hashlib.sha256(str(body or "").strip().encode("utf-8")).hexdigest()
 
 
-def record_key(*, channel_id: str, thread_id: str, body: str) -> str:
+def record_key(*, chat_id: str, body: str) -> str:
     """Nombre (sin extensión) del registro: dirección de contenido del mensaje.
 
     Lo calculan por igual el escritor —antes de publicar— y el lector —al ver
     su propio mensaje—, sin que ninguno necesite el ``message_id``.
     """
-    canonical = _SEP.join(
-        [DOMAIN, str(channel_id or ""), str(thread_id or ""), body_digest(body)]
-    )
+    canonical = _SEP.join([DOMAIN, str(chat_id or ""), body_digest(body)])
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def signature(
     key: bytes,
     *,
-    channel_id: str,
-    thread_id: str,
+    chat_id: str,
     actor_id: str,
     display_name: str,
     text: str,
@@ -139,8 +143,7 @@ def signature(
     """
     fields = [
         DOMAIN,
-        str(channel_id or ""),
-        str(thread_id or ""),
+        str(chat_id or ""),
         str(actor_id or ""),
         str(display_name or ""),
         str(timestamp or ""),
@@ -307,8 +310,7 @@ class DashboardIngestInbox:
         digest = body_digest(body)
         payload = {
             "version": RECORD_VERSION,
-            "channel_id": record.channel_id,
-            "thread_id": record.thread_id,
+            "chat_id": record.chat_id,
             "actor": {"id": record.actor_id, "display_name": record.display_name},
             "text": record.text,
             "body_sha256": digest,
@@ -316,8 +318,7 @@ class DashboardIngestInbox:
             "message_id": record.message_id,
             "hmac": signature(
                 signing_key,
-                channel_id=record.channel_id,
-                thread_id=record.thread_id,
+                chat_id=record.chat_id,
                 actor_id=record.actor_id,
                 display_name=record.display_name,
                 text=record.text,
@@ -326,9 +327,7 @@ class DashboardIngestInbox:
                 message_id=record.message_id,
             ),
         }
-        name = record_key(
-            channel_id=record.channel_id, thread_id=record.thread_id, body=body
-        )
+        name = record_key(chat_id=record.chat_id, body=body)
         blob = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         dir_fd = self._open_dir_fd()
         if dir_fd is None:
@@ -360,8 +359,7 @@ class DashboardIngestInbox:
         payload: Any,
         key: bytes,
         *,
-        channel_id: str,
-        thread_id: str,
+        chat_id: str,
         body: str,
         message_id: str,
         now: float,
@@ -373,10 +371,9 @@ class DashboardIngestInbox:
         actor = payload.get("actor")
         if not isinstance(actor, dict):
             raise DashboardIngestError("actor ausente")
-        record_channel = _closed_id(payload.get("channel_id"), allow_empty=False)
-        record_thread = _closed_id(payload.get("thread_id"), allow_empty=True)
-        if record_channel != channel_id or record_thread != thread_id:
-            raise DashboardIngestError("el registro apunta a otro canal/hilo")
+        record_chat = _closed_id(payload.get("chat_id"), allow_empty=False)
+        if record_chat != chat_id:
+            raise DashboardIngestError("el registro apunta a otro canal")
         digest = str(payload.get("body_sha256") or "").strip().lower()
         if not _HEX64_RE.fullmatch(digest) or digest != body_digest(body):
             raise DashboardIngestError("el registro no describe este mensaje")
@@ -399,8 +396,7 @@ class DashboardIngestInbox:
             raise DashboardIngestError("registro fechado en el futuro")
         expected = signature(
             key,
-            channel_id=record_channel,
-            thread_id=record_thread,
+            chat_id=record_chat,
             actor_id=actor_id,
             display_name=display_name,
             text=text,
@@ -414,8 +410,7 @@ class DashboardIngestInbox:
         ):
             raise DashboardIngestError("firma inválida")
         return DashboardIngestRecord(
-            channel_id=record_channel,
-            thread_id=record_thread,
+            chat_id=record_chat,
             actor_id=actor_id,
             display_name=display_name,
             text=text,
@@ -440,8 +435,7 @@ class DashboardIngestInbox:
     def peek(
         self,
         *,
-        channel_id: str,
-        thread_id: str,
+        chat_id: str,
         body: str,
         message_id: str = "",
         now: Optional[float] = None,
@@ -453,8 +447,7 @@ class DashboardIngestInbox:
         posterior lo descarta por otra regla.
         """
         return self._lookup(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            chat_id=chat_id,
             body=body,
             message_id=message_id,
             now=now,
@@ -464,8 +457,7 @@ class DashboardIngestInbox:
     def consume(
         self,
         *,
-        channel_id: str,
-        thread_id: str,
+        chat_id: str,
         body: str,
         message_id: str = "",
         now: Optional[float] = None,
@@ -477,8 +469,7 @@ class DashboardIngestInbox:
         no, porque un registro que no valida tampoco debe quedarse esperando.
         """
         return self._lookup(
-            channel_id=channel_id,
-            thread_id=thread_id,
+            chat_id=chat_id,
             body=body,
             message_id=message_id,
             now=now,
@@ -488,16 +479,14 @@ class DashboardIngestInbox:
     def _lookup(
         self,
         *,
-        channel_id: str,
-        thread_id: str,
+        chat_id: str,
         body: str,
         message_id: str,
         now: Optional[float],
         claim: bool,
     ) -> Optional[DashboardIngestRecord]:
         try:
-            closed_channel = _closed_id(channel_id, allow_empty=False)
-            closed_thread = _closed_id(thread_id, allow_empty=True)
+            closed_chat = _closed_id(chat_id, allow_empty=False)
         except DashboardIngestError:
             return None
         text = str(body or "").strip()
@@ -507,7 +496,7 @@ class DashboardIngestInbox:
         if dir_fd is None:
             return None
         stamp = datetime.now(timezone.utc).timestamp() if now is None else float(now)
-        name = f"{record_key(channel_id=closed_channel, thread_id=closed_thread, body=text)}.json"
+        name = f"{record_key(chat_id=closed_chat, body=text)}.json"
         target = name
         try:
             key = self._read_key_fd(dir_fd)
@@ -519,8 +508,7 @@ class DashboardIngestInbox:
                 return self._validate(
                     payload,
                     key,
-                    channel_id=closed_channel,
-                    thread_id=closed_thread,
+                    chat_id=closed_chat,
                     body=text,
                     message_id=str(message_id or ""),
                     now=stamp,

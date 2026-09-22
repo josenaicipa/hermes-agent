@@ -1390,27 +1390,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         from hermes_constants import get_hermes_home
         return DashboardIngestInbox(get_hermes_home())
 
-    def _dashboard_ingest_coordinates(self, message: Any) -> Optional[tuple[str, str, str]]:
-        """``(channel_id, thread_id, cuerpo)`` en los términos del contrato.
+    def _dashboard_ingest_coordinates(self, message: Any) -> Optional[tuple[str, str]]:
+        """``(chat_id, cuerpo)`` en los términos del contrato.
 
-        ``channel_id`` es SIEMPRE el canal de texto padre y ``thread_id`` el
-        hilo (vacío si no lo hay): es el par que el dashboard conoce de su
-        propio directorio de canales. Los DM quedan fuera a propósito — el
-        panel solo escribe a canales/hilos que el gateway publica.
+        ``chat_id`` es el canal o el hilo donde el mensaje vive de verdad — el
+        mismo id que identifica la sesión, y el mismo que el dashboard resuelve
+        como destino. NO es el canal padre: el directorio que este gateway
+        publica no siempre lo distingue del hilo, así que derivarlo aquí sería
+        derivar un dato que los dos lados no calculan igual. Los DM quedan
+        fuera a propósito: el panel solo escribe a canales que el gateway
+        publica.
         """
         channel = getattr(message, "channel", None)
         if channel is None or isinstance(channel, discord.DMChannel):
             return None
+        chat_id = str(getattr(channel, "id", "") or "")
         body = str(getattr(message, "content", "") or "").strip()
-        if not body:
+        if not chat_id or not body:
             return None
-        if isinstance(channel, discord.Thread):
-            thread_id = str(getattr(channel, "id", "") or "")
-            parent_id = self._get_parent_channel_id(channel) or ""
-            if not thread_id or not parent_id:
-                return None
-            return parent_id, thread_id, body
-        return str(getattr(channel, "id", "") or ""), "", body
+        return chat_id, body
 
     def _dashboard_ingest_available(self, message: Any) -> bool:
         """¿Existe registro válido para este mensaje propio? No lo consume.
@@ -1422,10 +1420,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         coordinates = self._dashboard_ingest_coordinates(message)
         if coordinates is None:
             return False
-        channel_id, thread_id, body = coordinates
+        chat_id, body = coordinates
         try:
             return self._dashboard_ingest_inbox().peek(
-                channel_id=channel_id, thread_id=thread_id, body=body,
+                chat_id=chat_id, body=body,
                 message_id=str(getattr(message, "id", "") or ""),
             )
         except Exception:
@@ -1437,10 +1435,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         coordinates = self._dashboard_ingest_coordinates(message)
         if coordinates is None:
             return None
-        channel_id, thread_id, body = coordinates
+        chat_id, body = coordinates
         try:
             return self._dashboard_ingest_inbox().consume(
-                channel_id=channel_id, thread_id=thread_id, body=body,
+                chat_id=chat_id, body=body,
                 message_id=str(getattr(message, "id", "") or ""),
             )
         except Exception:

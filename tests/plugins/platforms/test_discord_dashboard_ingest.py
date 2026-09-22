@@ -146,8 +146,9 @@ def _self_message(adapter, text: str, *, message_id: int = MESSAGE_ID):
 
 def _record(text: str, **overrides) -> DashboardIngestRecord:
     fields = dict(
-        channel_id=str(PARENT_ID),
-        thread_id=str(THREAD_ID),
+        # El destino es el HILO: el id que el adaptador saca de
+        # ``message.channel.id`` y el mismo que el panel resuelve como destino.
+        chat_id=str(THREAD_ID),
         actor_id=JOSE_ID,
         display_name="Jose (dashboard)",
         text=text,
@@ -203,9 +204,7 @@ def test_admission_does_not_spend_the_record(adapter, inbox):
 
     assert adapter._discord_message_admission(message, claim=True)[0] is True
     # El registro sigue ahí para que ``_handle_message`` lo gaste una sola vez.
-    assert inbox.peek(
-        channel_id=str(PARENT_ID), thread_id=str(THREAD_ID), body=_published(text)
-    ) is True
+    assert inbox.peek(chat_id=str(THREAD_ID), body=_published(text)) is True
 
 
 # ── Construcción del turno ───────────────────────────────────────────────
@@ -262,3 +261,42 @@ async def test_record_without_actor_id_still_names_the_dashboard(adapter, inbox)
     assert event.source.user_name == "Jose (dashboard)"
     # Sin id de Discord conocido queda el del emisor real, nunca uno inventado.
     assert event.source.user_id == str(BOT_ID)
+
+
+@pytest.mark.asyncio
+async def test_a_plain_channel_message_is_ingested_with_the_channel_id(adapter, inbox):
+    """Sin hilo, el destino es el canal — y es el MISMO id que escribe el panel.
+
+    El directorio que el gateway publica no siempre distingue un hilo de su
+    padre (hay entradas con la forma ``<X>:<X>``), así que el contrato no
+    depende del padre: el único id que los dos lados calculan igual es el del
+    canal donde el mensaje vive.
+    """
+    # Un canal cualquiera que no es ni DM ni hilo: es todo lo que el adaptador
+    # comprueba. No se instancia ``discord.TextChannel`` porque otro módulo de
+    # esta carpeta lo sustituye por un mock y el orden de ejecución decidiría
+    # si este test pasa.
+    channel = SimpleNamespace(
+        id=PARENT_ID,
+        name="Dahsboard Agentes",
+        guild=SimpleNamespace(id=777, name="Hermes Agentes Test"),
+        topic=None,
+        parent_id=None,
+    )
+    # Canal sin auto-hilo: el mensaje se atiende en el canal, como lo haría uno
+    # humano en un canal de respuesta libre.
+    adapter._get_no_thread_channels = lambda: {str(PARENT_ID)}
+
+    text = "hola canal"
+    inbox.write(_record(text, chat_id=str(PARENT_ID)), body=_published(text))
+    message = _self_message(adapter, _published(text))
+    message.channel = channel
+
+    assert adapter._discord_message_admission(message, claim=True) == (True, False)
+    assert await adapter._handle_message(message) is True
+
+    event = adapter.delivered[-1]
+    assert event.text == text
+    assert event.source.chat_id == str(PARENT_ID)
+    assert event.source.thread_id is None
+    assert event.source.user_name == "Jose (dashboard)"
