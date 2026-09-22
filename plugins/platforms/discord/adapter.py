@@ -1375,6 +1375,78 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return ("discord_intents_required", guidance, False)
         return ("discord_connect_error", f"Discord startup failed: {error}", True)
 
+    # ── Inyección nativa desde el dashboard de agentes ───────────────
+    # El dashboard publica en el canal real con la identidad del bot, así que
+    # su mensaje entra por ``on_message`` como un mensaje propio. Lo que lo
+    # distingue de lo que el agente dice por su cuenta no es el texto: es un
+    # registro firmado que el dashboard deja en el home del perfil ANTES de
+    # publicar. Estos tres métodos son todo el acoplamiento del adaptador con
+    # ese contrato. Ver ``gateway.dashboard_ingest``.
+
+    def _dashboard_ingest_inbox(self):
+        """Inbox del perfil ACTIVO. Se resuelve por llamada, no se cachea:
+        bajo ``multiplex_profiles`` cada turno puede correr con otro home."""
+        from gateway.dashboard_ingest import DashboardIngestInbox
+        from hermes_constants import get_hermes_home
+        return DashboardIngestInbox(get_hermes_home())
+
+    def _dashboard_ingest_coordinates(self, message: Any) -> Optional[tuple[str, str, str]]:
+        """``(channel_id, thread_id, cuerpo)`` en los términos del contrato.
+
+        ``channel_id`` es SIEMPRE el canal de texto padre y ``thread_id`` el
+        hilo (vacío si no lo hay): es el par que el dashboard conoce de su
+        propio directorio de canales. Los DM quedan fuera a propósito — el
+        panel solo escribe a canales/hilos que el gateway publica.
+        """
+        channel = getattr(message, "channel", None)
+        if channel is None or isinstance(channel, discord.DMChannel):
+            return None
+        body = str(getattr(message, "content", "") or "").strip()
+        if not body:
+            return None
+        if isinstance(channel, discord.Thread):
+            thread_id = str(getattr(channel, "id", "") or "")
+            parent_id = self._get_parent_channel_id(channel) or ""
+            if not thread_id or not parent_id:
+                return None
+            return parent_id, thread_id, body
+        return str(getattr(channel, "id", "") or ""), "", body
+
+    def _dashboard_ingest_available(self, message: Any) -> bool:
+        """¿Existe registro válido para este mensaje propio? No lo consume.
+
+        La admisión solo necesita saber si merece seguir; gastar el registro
+        aquí lo perdería cuando una regla posterior (canal ignorado, etc.)
+        descarte el mensaje de todas formas.
+        """
+        coordinates = self._dashboard_ingest_coordinates(message)
+        if coordinates is None:
+            return False
+        channel_id, thread_id, body = coordinates
+        try:
+            return self._dashboard_ingest_inbox().peek(
+                channel_id=channel_id, thread_id=thread_id, body=body,
+                message_id=str(getattr(message, "id", "") or ""),
+            )
+        except Exception:
+            logger.debug("[%s] dashboard ingest peek failed", self.name, exc_info=True)
+            return False
+
+    def _dashboard_ingest_claim(self, message: Any):
+        """Reclama el registro (un solo uso) y devuelve el turno a construir."""
+        coordinates = self._dashboard_ingest_coordinates(message)
+        if coordinates is None:
+            return None
+        channel_id, thread_id, body = coordinates
+        try:
+            return self._dashboard_ingest_inbox().consume(
+                channel_id=channel_id, thread_id=thread_id, body=body,
+                message_id=str(getattr(message, "id", "") or ""),
+            )
+        except Exception:
+            logger.debug("[%s] dashboard ingest claim failed", self.name, exc_info=True)
+            return None
+
     def _discord_message_admission(self, message: Any, *, claim: bool) -> tuple[bool, bool]:
         """Return ``(admitted, role_authorized)`` for one Discord event."""
         message_id = str(getattr(message, "id", ""))
@@ -1384,7 +1456,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         elif self._dedup.contains(message_id):
             return False, False
         if message.author == self._client.user:
-            return False, False
+            # Un mensaje propio solo sigue vivo si el inbox del perfil guarda un
+            # registro de origen válido para EXACTAMENTE este canal/hilo/cuerpo:
+            # es un turno que Jose escribió desde el dashboard y que el gateway
+            # publicó con la identidad del bot. Sin registro se descarta igual
+            # que siempre, que es lo que impide que las respuestas del agente
+            # reentren en bucle. Ver ``gateway.dashboard_ingest``.
+            if not self._dashboard_ingest_available(message):
+                return False, False
+            if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+                return False, False
+            # Ni política de bots ni allowlist de usuarios: el autor Discord es
+            # el propio bot y la autorización de este turno la da el registro
+            # firmado, no la identidad de la cuenta que lo publicó.
+            return True, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
         role_authorized = False
@@ -5683,9 +5768,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Save stripped text now: create_thread() can clobber message.content (breaks /command detection).
         raw_content = message.content.strip()
         normalized_content = raw_content
+        # Turno inyectado desde el dashboard: el autor Discord es el propio bot,
+        # pero el turno es de Jose. El registro se reclama UNA vez (y desaparece
+        # del inbox), y de él salen el texto real y la identidad que verá la
+        # sesión. Sin registro el mensaje propio vuelve al descarte de siempre.
+        dashboard_ingest = None
+        if self._client is not None and message.author == self._client.user:
+            dashboard_ingest = self._dashboard_ingest_claim(message)
+            if dashboard_ingest is None:
+                return False
+            raw_content = dashboard_ingest.text.strip()
+            normalized_content = raw_content
         mention_prefix = False
         snapshot_attachments = []
-        if hasattr(message, "message_snapshots") and message.message_snapshots:
+        if dashboard_ingest is None and hasattr(message, "message_snapshots") and message.message_snapshots:
             snapshot_text_parts = []
             for snap in message.message_snapshots:
                 if getattr(snap, "content", None):
@@ -5726,7 +5822,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 or is_voice_linked_channel
             )
             in_bot_thread = self._in_bot_thread(message)
-            if require_mention and not is_free_channel and not in_bot_thread:
+            # Un turno del dashboard ya nombró su destino al elegir el canal en
+            # el panel; exigirle además una @mención sería pedir dos veces lo
+            # mismo y es justo lo que Jose pidió quitar.
+            if require_mention and not is_free_channel and not in_bot_thread and dashboard_ingest is None:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
@@ -5791,15 +5890,26 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Channel topic (TextChannels only); forum-parented threads inherit the parent topic.
         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
         guild = getattr(message, "guild", None)
+        # Identidad del turno. Para un mensaje normal es el autor de Discord;
+        # para uno inyectado es el actor que firmó el registro — el nombre
+        # visible lleva la procedencia («… (dashboard)») para que la sesión
+        # nunca confunda un turno del panel con uno escrito en el canal.
+        author_user_id = str(message.author.id)
+        author_user_name = message.author.display_name
+        author_is_bot = bool(getattr(message.author, "bot", False))
+        if dashboard_ingest is not None:
+            author_user_id = dashboard_ingest.actor_id or author_user_id
+            author_user_name = dashboard_ingest.display_name
+            author_is_bot = False
         source = self.build_source(
             chat_id=str(effective_channel.id),
             chat_name=chat_name,
             chat_type=chat_type,
-            user_id=str(message.author.id),
-            user_name=message.author.display_name,
+            user_id=author_user_id,
+            user_name=author_user_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
-            is_bot=getattr(message.author, "bot", False),
+            is_bot=author_is_bot,
             guild_id=str(guild.id) if guild else None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
