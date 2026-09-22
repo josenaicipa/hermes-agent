@@ -18,7 +18,6 @@ Lo que estas pruebas fijan:
 import datetime as dt
 from types import SimpleNamespace
 
-import discord
 import pytest
 
 import hermes_constants
@@ -28,7 +27,18 @@ from gateway.dashboard_ingest import (
     DashboardIngestRecord,
     RECORD_TTL_SECONDS,
 )
+from plugins.platforms.discord import adapter as discord_adapter
 from plugins.platforms.discord.adapter import DiscordAdapter
+
+# El MISMO objeto módulo que tiene ligado el adaptador, no el que resulte
+# estar en ``sys.modules`` cuando se importa esta prueba. Varios conftest
+# del repo (p. ej. ``tests/gateway/conftest.py``) sustituyen ``discord``
+# por un doble cuando la librería real aún no se ha importado, así que un
+# ``import discord`` propio puede quedarse con un módulo DISTINTO del que
+# usa el adaptador: los tipos y los miembros de ``MessageType`` dejarían de
+# ser los mismos objetos y las comparaciones del adaptador fallarían por el
+# orden de recolección, no por el código bajo prueba.
+discord = discord_adapter.discord
 
 
 BOT_ID = 900900900900900900
