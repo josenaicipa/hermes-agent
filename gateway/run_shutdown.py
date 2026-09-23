@@ -1721,8 +1721,13 @@ class GatewayShutdownMixin:
             return
         # Graceful drain: clear the pre-drain resume_pending markers so sessions that finished
         # during the drain window don't carry a stale flag.
+        # Jose, 2026-09-23: except "watcher_lost". Those sessions never ran a turn to drain:
+        # their FABLE_WAKE watcher dies in this same shutdown's final cleanup, so the mark is
+        # still owed. Clearing it here lost every readoption on a clean restart (06:42, 10:53
+        # and 11:59 that day); only restarts whose drain timed out resumed their sessions.
+        _awaiting_wake = set(self._sessions_awaiting_control_wake())
         for _sk in _pre_drain_keys:
-            if _sk not in self._running_agents:
+            if _sk not in self._running_agents and _sk not in _awaiting_wake:
                 try:
                     await self.async_session_store.clear_resume_pending(_sk)
                 except Exception as _e:

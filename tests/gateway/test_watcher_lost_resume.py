@@ -99,3 +99,53 @@ def test_el_turno_reanudado_sabe_que_no_se_cayo():
     fuente = (REPO / "gateway" / "run.py").read_text(encoding="utf-8")
     assert "watcher_lost" in fuente
     assert "the work itself was not interrupted" in fuente
+
+
+# Jose, 2026-09-23 ("por que pasa todo el tiempo eso?"): la marca watcher_lost se
+# ponia bien, pero un drenaje LIMPIO la borraba enseguida junto con las de los
+# turnos que ya habian terminado. Solo los reinicios cuyo drenaje vencia sus 60 s
+# reanudaban (08:53 y 12:29 de ese dia); los limpios (06:42, 10:53, 11:59)
+# dejaban las misiones mudas.
+def test_un_drenaje_limpio_no_borra_la_marca_de_vigia_perdido(monkeypatch):
+    import asyncio
+
+    import gateway.run_shutdown as RS
+    import tools.process_registry as PR
+
+    monkeypatch.setattr(
+        PR.process_registry, "list_sessions",
+        lambda **k: [_Sesion(session_key="discord:espera-despertar")], raising=False,
+    )
+
+    class _Store:
+        def __init__(self):
+            self.marcadas, self.borradas = {}, []
+
+        async def mark_resume_pending(self, clave, motivo):
+            self.marcadas[clave] = motivo
+
+        async def clear_resume_pending(self, clave):
+            self.borradas.append(clave)
+
+    cls = _mixin()
+    inst = cls.__new__(cls)
+    inst._restart_requested = True
+    inst._running_agents = {"discord:turno-que-termina": object()}
+    inst.async_session_store = _Store()
+    inst._active_cron_job_count = lambda: 0
+    inst._active_api_run_count = lambda: 0
+    inst._running_agent_count = lambda: len(inst._running_agents)
+
+    async def _drenar(timeout, cron_timeout):
+        inst._running_agents.clear()  # el turno termino durante el drenaje
+        return {}, False
+
+    inst._drain_active_agents = _drenar
+    ctx = RS.GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=0.0)
+
+    asyncio.run(inst._stop_drain_active_work(5.0, ctx))
+
+    store = inst.async_session_store
+    assert store.marcadas["discord:espera-despertar"] == "watcher_lost"
+    assert "discord:espera-despertar" not in store.borradas
+    assert store.borradas == ["discord:turno-que-termina"]
